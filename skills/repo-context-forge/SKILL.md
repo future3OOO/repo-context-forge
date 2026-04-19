@@ -10,13 +10,13 @@ debug, refactor, explain, or plan work in a git repository.
 
 ## Required Startup Flow
 
-1. Resolve this skill's directory, then run the bootstrap script at:
+1. Resolve this skill's directory, then run the bundled bootstrap wrapper:
 
 ```bash
-python3 ../../scripts/codex_context_bootstrap.py --repo "$PWD" --enforce-intake
+python3 "$SKILL_DIR/scripts/bootstrap.py" --repo "$PWD"
 ```
 
-The path is relative to this `SKILL.md`.
+`SKILL_DIR` is the directory containing this `SKILL.md`.
 
 2. Treat the script output as the initial repository context packet for the
 current task. The output begins with `REPO_CONTEXT_FORGE_REQUIRED_INTAKE`; that
@@ -66,7 +66,7 @@ git folder is the target.
 For a user-described implementation before edits, prefer:
 
 ```bash
-python3 ../../scripts/codex_context_bootstrap.py --repo "$PWD" --intent "<task>" --enforce-intake
+python3 "$SKILL_DIR/scripts/bootstrap.py" --repo "$PWD" --intent "<task>"
 ```
 
 ## GitNexus Follow-Up
