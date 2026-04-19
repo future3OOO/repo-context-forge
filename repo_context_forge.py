@@ -25,6 +25,8 @@ GitNexusMode = Literal["off", "check", "auto"]
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "repo-context-forge"
 GITNEXUS_REGISTRY = Path.home() / ".gitnexus" / "registry.json"
+TOOL_CACHE_DIRS = (".soulforge", ".codex", ".gitnexus")
+TOOL_CACHE_PREFIXES = tuple(f"{name}/" for name in TOOL_CACHE_DIRS)
 DEFAULT_TOKEN_BUDGET = 2500
 MIN_TOKEN_BUDGET = 1500
 MAX_TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
@@ -197,8 +199,8 @@ def filter_tool_cache_dirty_paths(paths: Iterable[str]) -> list[str]:
     return [
         path
         for path in paths
-        if path not in {".soulforge", ".codex"}
-        and not path.startswith((".soulforge/", ".codex/"))
+        if path not in TOOL_CACHE_DIRS
+        and not path.startswith(TOOL_CACHE_PREFIXES)
     ]
 
 
@@ -206,8 +208,8 @@ def tool_cache_dirty_paths(paths: Iterable[str]) -> list[str]:
     return [
         path
         for path in paths
-        if path in {".soulforge", ".codex"}
-        or path.startswith((".soulforge/", ".codex/"))
+        if path in TOOL_CACHE_DIRS
+        or path.startswith(TOOL_CACHE_PREFIXES)
     ]
 
 
@@ -235,7 +237,7 @@ def source_status_proof(before: str, after: str) -> dict[str, object]:
 
 def is_generated_or_cache_path(path: str) -> bool:
     parts = path.split("/")
-    if ".soulforge" in parts or ".codex" in parts or "__pycache__" in parts:
+    if any(part in TOOL_CACHE_DIRS for part in parts) or "__pycache__" in parts:
         return True
     return path.endswith((".pyc", ".pyo")) or path.startswith(".git/")
 
@@ -944,6 +946,210 @@ class SoulForgeMap:
             ).fetchone()
         return int(row[0] or 0) if row else 0
 
+    def file_links(
+        self,
+        path: str,
+        *,
+        direction: Literal["dependents", "dependencies"],
+        limit: int = 8,
+    ) -> list[dict[str, float | str]]:
+        if not self.available:
+            return []
+        if direction == "dependents":
+            source_join = "other.id = e.source_file_id"
+            edge_filter = "e.target_file_id = f.id"
+        else:
+            source_join = "other.id = e.target_file_id"
+            edge_filter = "e.source_file_id = f.id"
+        with self._connect() as conn:
+            if not self._has_table(conn, "edges"):
+                return []
+            rows = conn.execute(
+                f"""
+                SELECT other.path AS path, SUM(e.weight) AS weight
+                FROM files f
+                JOIN edges e ON {edge_filter}
+                JOIN files other ON {source_join}
+                WHERE f.path = ? AND other.path != f.path
+                GROUP BY other.path
+                ORDER BY weight DESC, other.path ASC
+                LIMIT ?
+                """,
+                (path, limit),
+            ).fetchall()
+        return [
+            {"path": str(row["path"]), "weight": float(row["weight"] or 0)}
+            for row in rows
+            if not is_generated_or_cache_path(str(row["path"]))
+        ]
+
+    def transitive_dependent_count_for_file(self, path: str, limit: int = 200) -> int:
+        if not self.available:
+            return 0
+        with self._connect() as conn:
+            if not self._has_table(conn, "edges"):
+                return 0
+            rows = conn.execute(
+                """
+                WITH RECURSIVE upstream(file_id, depth) AS (
+                  SELECT e.source_file_id, 1
+                  FROM edges e
+                  JOIN files f ON f.id = e.target_file_id
+                  WHERE f.path = ?
+                  UNION
+                  SELECT e.source_file_id, upstream.depth + 1
+                  FROM edges e
+                  JOIN upstream ON upstream.file_id = e.target_file_id
+                  WHERE upstream.depth < 4
+                )
+                SELECT DISTINCT f.path
+                FROM upstream
+                JOIN files f ON f.id = upstream.file_id
+                LIMIT ?
+                """,
+                (path, limit),
+            ).fetchall()
+        return sum(
+            1
+            for row in rows
+            if str(row["path"]) != path and not is_generated_or_cache_path(str(row["path"]))
+        )
+
+    def exported_symbols_at_risk(self, path: str, limit: int = 8) -> list[dict[str, object]]:
+        if not self.available:
+            return []
+        with self._connect() as conn:
+            if not self._has_table(conn, "symbols"):
+                return []
+            has_refs = self._has_table(conn, "refs")
+            has_calls = self._has_table(conn, "calls")
+            refs_select = (
+                """
+                (
+                  SELECT COUNT(DISTINCT rf.path)
+                  FROM refs r
+                  JOIN files rf ON rf.id = r.file_id
+                  WHERE r.source_file_id = f.id
+                    AND r.name = s.name
+                    AND rf.path != f.path
+                ) AS ref_files
+                """
+                if has_refs
+                else "0 AS ref_files"
+            )
+            calls_select = (
+                """
+                (
+                  SELECT COUNT(DISTINCT cf.path)
+                  FROM calls c
+                  JOIN symbols caller ON caller.id = c.caller_symbol_id
+                  JOIN files cf ON cf.id = caller.file_id
+                  WHERE c.callee_symbol_id = s.id
+                    AND cf.path != f.path
+                ) AS call_files
+                """
+                if has_calls
+                else "0 AS call_files"
+            )
+            if has_refs and has_calls:
+                usage_files_select = """
+                (
+                  SELECT COUNT(DISTINCT usage.path)
+                  FROM (
+                    SELECT rf.path AS path
+                    FROM refs r
+                    JOIN files rf ON rf.id = r.file_id
+                    WHERE r.source_file_id = f.id
+                      AND r.name = s.name
+                      AND rf.path != f.path
+                    UNION
+                    SELECT cf.path AS path
+                    FROM calls c
+                    JOIN symbols caller ON caller.id = c.caller_symbol_id
+                    JOIN files cf ON cf.id = caller.file_id
+                    WHERE c.callee_symbol_id = s.id
+                      AND cf.path != f.path
+                  ) usage
+                ) AS usage_files
+                """
+            elif has_refs:
+                usage_files_select = """
+                (
+                  SELECT COUNT(DISTINCT rf.path)
+                  FROM refs r
+                  JOIN files rf ON rf.id = r.file_id
+                  WHERE r.source_file_id = f.id
+                    AND r.name = s.name
+                    AND rf.path != f.path
+                ) AS usage_files
+                """
+            elif has_calls:
+                usage_files_select = """
+                (
+                  SELECT COUNT(DISTINCT cf.path)
+                  FROM calls c
+                  JOIN symbols caller ON caller.id = c.caller_symbol_id
+                  JOIN files cf ON cf.id = caller.file_id
+                  WHERE c.callee_symbol_id = s.id
+                    AND cf.path != f.path
+                ) AS usage_files
+                """
+            else:
+                usage_files_select = "0 AS usage_files"
+            rows = conn.execute(
+                f"""
+                SELECT s.name, s.kind, s.line, s.end_line, s.signature,
+                       {refs_select},
+                       {calls_select},
+                       {usage_files_select}
+                FROM symbols s
+                JOIN files f ON f.id = s.file_id
+                WHERE f.path = ? AND s.is_exported = 1
+                ORDER BY usage_files DESC, s.line ASC
+                LIMIT ?
+                """,
+                (path, limit),
+            ).fetchall()
+        return [
+            {
+                "name": str(row["name"]),
+                "kind": str(row["kind"]),
+                "line": int(row["line"] or 0),
+                "end_line": int(row["end_line"] or row["line"] or 0),
+                "signature": str(row["signature"]) if row["signature"] is not None else None,
+                "ref_files": int(row["ref_files"] or 0),
+                "call_files": int(row["call_files"] or 0),
+                "usage_files": int(row["usage_files"] or 0),
+            }
+            for row in rows
+        ]
+
+    def impact_summary_for_file(self, path: str) -> dict[str, object]:
+        dependents = self.file_links(path, direction="dependents")
+        dependencies = self.file_links(path, direction="dependencies")
+        cochanges = self.cochanges_for_file(path)
+        symbols = self.exported_symbols_at_risk(path)
+        direct = len(dependents)
+        transitive = self.transitive_dependent_count_for_file(path)
+        max_symbol_usage = max((int(symbol["usage_files"]) for symbol in symbols), default=0)
+        if direct >= 10 or transitive >= 25 or max_symbol_usage >= 10:
+            risk = "high"
+        elif direct >= 3 or transitive >= 8 or max_symbol_usage >= 3:
+            risk = "medium"
+        else:
+            risk = "low"
+        return {
+            "direct_dependents": direct,
+            "dependencies": len(dependencies),
+            "cochange_partners": len(cochanges),
+            "total_affected_scope": transitive,
+            "risk": risk,
+            "dependents": dependents,
+            "dependency_files": dependencies,
+            "cochanges": cochanges,
+            "exported_symbols_at_risk": symbols,
+        }
+
     def graph_neighbors_for_file(self, path: str, limit: int = 5) -> list[dict[str, float | str]]:
         if not self.available:
             return []
@@ -1270,6 +1476,7 @@ def make_target_entries(
             "dependent_count": soul_map.dependent_count_for_file(path),
             "graph_neighbors": soul_map.graph_neighbors_for_file(path),
             "cochanges": soul_map.cochanges_for_file(path),
+            "soulforge_impact": soul_map.impact_summary_for_file(path),
             "analysis_repo": str(analysis_repo),
         }
         target_entries.append(
@@ -1832,6 +2039,24 @@ def render_target_lines(target: dict[str, object], *, max_symbols: int = 8) -> l
         lines.append(f"- why selected: {'; '.join(str(item) for item in why_selected)}")
     if target.get("dependent_count") is not None:
         lines.append(f"- dependent count: {target['dependent_count']}")
+    impact = target.get("soulforge_impact")
+    if isinstance(impact, dict):
+        lines.append(
+            "- SoulForge impact: "
+            f"{impact.get('risk', 'unknown')} risk; "
+            f"{impact.get('direct_dependents', 0)} direct dependents; "
+            f"{impact.get('total_affected_scope', 0)} total affected; "
+            f"{impact.get('cochange_partners', 0)} co-change partners"
+        )
+        symbols_at_risk = impact.get("exported_symbols_at_risk")
+        if isinstance(symbols_at_risk, list) and symbols_at_risk:
+            lines.append("- exported symbols at risk:")
+            for symbol in symbols_at_risk[:5]:
+                if isinstance(symbol, dict):
+                    lines.append(
+                        f"  - `{symbol.get('name')}` "
+                        f"used by {symbol.get('usage_files', 0)} files"
+                    )
     dirty_kinds = target.get("dirty_kinds")
     if isinstance(dirty_kinds, list) and dirty_kinds:
         lines.append(f"- source dirty overlap: {', '.join(str(item) for item in dirty_kinds)}")
@@ -2107,6 +2332,7 @@ def render_prompt(packet: dict[str, object]) -> str:
         "  </gitnexus_status>",
         "  <scope_rules>",
         "    Use files under <targets> as the first-pass edit/review surface.",
+        "    Use <soulforge_impact> as native repo-map blast radius before file edits.",
         "    Treat source dirty overlaps as warnings, not PR target files, when mode is pr.",
         "    Trust GitNexus blast-radius claims only when <gitnexus_status> is fresh or reindexed and required checks resolve.",
         "  </scope_rules>",
@@ -2116,7 +2342,52 @@ def render_prompt(packet: dict[str, object]) -> str:
     if isinstance(warnings, list):
         for warning in warnings:
             lines.append(f"    <warning>{html.escape(str(warning))}</warning>")
-    lines.extend(["  </warnings>", "  <targets>"])
+    lines.extend(["  </warnings>", "  <soulforge_impact>"])
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        impact = target.get("soulforge_impact")
+        if not isinstance(impact, dict):
+            continue
+        lines.append(f"    <file path=\"{html.escape(str(target['path']))}\">")
+        lines.append(f"      <risk>{html.escape(str(impact.get('risk') or 'unknown'))}</risk>")
+        lines.append(f"      <direct_dependents>{html.escape(str(impact.get('direct_dependents') or 0))}</direct_dependents>")
+        lines.append(f"      <dependencies>{html.escape(str(impact.get('dependencies') or 0))}</dependencies>")
+        lines.append(f"      <cochange_partners>{html.escape(str(impact.get('cochange_partners') or 0))}</cochange_partners>")
+        lines.append(f"      <total_affected_scope>{html.escape(str(impact.get('total_affected_scope') or 0))}</total_affected_scope>")
+        lines.append("      <dependents>")
+        dependents = impact.get("dependents")
+        if isinstance(dependents, list):
+            for dependent in dependents[:5]:
+                if isinstance(dependent, dict):
+                    lines.append(
+                        f"        <file path=\"{html.escape(str(dependent.get('path') or ''))}\" "
+                        f"weight=\"{html.escape(str(dependent.get('weight') or 0))}\"/>"
+                    )
+        lines.append("      </dependents>")
+        lines.append("      <cochanges>")
+        cochanges = impact.get("cochanges")
+        if isinstance(cochanges, list):
+            for partner in cochanges[:5]:
+                if isinstance(partner, dict):
+                    lines.append(
+                        f"        <file path=\"{html.escape(str(partner.get('path') or ''))}\" "
+                        f"count=\"{html.escape(str(partner.get('count') or 0))}\"/>"
+                    )
+        lines.append("      </cochanges>")
+        lines.append("      <exported_symbols_at_risk>")
+        symbols_at_risk = impact.get("exported_symbols_at_risk")
+        if isinstance(symbols_at_risk, list):
+            for symbol in symbols_at_risk[:5]:
+                if isinstance(symbol, dict):
+                    lines.append(
+                        f"        <symbol name=\"{html.escape(str(symbol.get('name') or ''))}\" "
+                        f"kind=\"{html.escape(str(symbol.get('kind') or ''))}\" "
+                        f"usage_files=\"{html.escape(str(symbol.get('usage_files') or 0))}\"/>"
+                    )
+        lines.append("      </exported_symbols_at_risk>")
+        lines.append("    </file>")
+    lines.extend(["  </soulforge_impact>", "  <targets>"])
     for target in targets:
         if not isinstance(target, dict):
             continue

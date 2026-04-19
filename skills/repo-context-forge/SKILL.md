@@ -28,6 +28,8 @@ packet.
 3. Follow the packet's `<scope_rules>`:
 
 - use `<targets>` as the first-pass edit/review surface
+- use `<soulforge_impact>` as native SoulForge blast-radius context before
+  editing or reviewing selected files
 - in `pr` mode, do not treat dirty source-worktree files as PR targets
 - run the listed `<gitnexus_required_checks>` before editing production code
   when GitNexus MCP tools are available
@@ -64,6 +66,9 @@ For each `<check>` in `<gitnexus_required_checks>`:
 
 - `kind="symbol_context"` means call `gitnexus_context` for that symbol/file
 - `kind="symbol_impact"` means call `gitnexus_impact` upstream for that symbol
+- cite SoulForge impact separately from GitNexus impact when reporting review
+  evidence; SoulForge explains repo-map blast radius, while GitNexus validates
+  execution-flow impact
 - trust blast-radius claims only when `<gitnexus_status>` is `fresh` or
   `reindexed` and `required_checks_resolved` is true
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -393,7 +394,13 @@ class RepoContextForgeTests(unittest.TestCase):
     def test_dirty_paths_can_ignore_tool_cache(self) -> None:
         self.assertEqual(
             repo_context_forge.filter_tool_cache_dirty_paths(
-                [".soulforge/repomap.db", ".soulforge", ".codex", "src/app.py"]
+                [
+                    ".soulforge/repomap.db",
+                    ".soulforge",
+                    ".codex",
+                    ".gitnexus/meta.json",
+                    "src/app.py",
+                ]
             ),
             ["src/app.py"],
         )
@@ -513,6 +520,97 @@ class RepoContextForgeTests(unittest.TestCase):
             )
             self.assertFalse(packet["target_state"]["source_dirty"])
             self.assertTrue(packet["target_state"]["source_status_unchanged"])
+
+    def test_soulforge_impact_summary_uses_native_map_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            db_dir = repo / ".soulforge"
+            db_dir.mkdir()
+            db_path = db_dir / "repomap.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE files (
+                      id INTEGER PRIMARY KEY,
+                      path TEXT,
+                      pagerank REAL,
+                      symbol_count INTEGER,
+                      line_count INTEGER
+                    );
+                    CREATE TABLE edges (
+                      source_file_id INTEGER,
+                      target_file_id INTEGER,
+                      weight REAL,
+                      confidence INTEGER
+                    );
+                    CREATE TABLE cochanges (
+                      file_id_a INTEGER,
+                      file_id_b INTEGER,
+                      count INTEGER
+                    );
+                    CREATE TABLE symbols (
+                      id INTEGER PRIMARY KEY,
+                      file_id INTEGER,
+                      name TEXT,
+                      kind TEXT,
+                      line INTEGER,
+                      end_line INTEGER,
+                      is_exported INTEGER,
+                      signature TEXT
+                    );
+                    CREATE TABLE refs (
+                      file_id INTEGER,
+                      name TEXT,
+                      source_file_id INTEGER,
+                      import_source TEXT
+                    );
+                    CREATE TABLE calls (
+                      caller_symbol_id INTEGER,
+                      callee_name TEXT,
+                      callee_symbol_id INTEGER,
+                      callee_file_id INTEGER,
+                      line INTEGER
+                    );
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO files VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (1, "src/core.py", 0.5, 1, 20),
+                        (2, "src/app.py", 0.4, 1, 20),
+                        (3, "tests/test_core.py", 0.3, 1, 20),
+                        (4, "src/config.py", 0.2, 1, 20),
+                        (5, "src/worker.py", 0.1, 1, 20),
+                    ],
+                )
+                conn.executemany(
+                    "INSERT INTO edges VALUES (?, ?, ?, ?)",
+                    [(2, 1, 1.0, 1), (3, 2, 1.0, 1), (1, 4, 0.5, 1)],
+                )
+                conn.execute("INSERT INTO cochanges VALUES (1, 3, 4)")
+                conn.executemany(
+                    "INSERT INTO symbols VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (10, 1, "Handle", "function", 3, 8, 1, "def Handle()"),
+                        (20, 2, "caller", "function", 2, 4, 1, "def caller()"),
+                    ],
+                )
+                conn.executemany(
+                    "INSERT INTO refs VALUES (?, ?, ?, ?)",
+                    [(2, "Handle", 1, None), (3, "Handle", 1, None), (5, "Handle", 1, None)],
+                )
+                conn.execute("INSERT INTO calls VALUES (20, 'Handle', 10, 1, 3)")
+
+            impact = repo_context_forge.SoulForgeMap(repo).impact_summary_for_file("src/core.py")
+
+            self.assertEqual(impact["direct_dependents"], 1)
+            self.assertEqual(impact["dependencies"], 1)
+            self.assertEqual(impact["cochange_partners"], 1)
+            self.assertEqual(impact["total_affected_scope"], 2)
+            self.assertEqual(impact["risk"], "medium")
+            self.assertEqual(impact["dependents"][0]["path"], "src/app.py")
+            self.assertEqual(impact["exported_symbols_at_risk"][0]["name"], "Handle")
+            self.assertEqual(impact["exported_symbols_at_risk"][0]["usage_files"], 3)
 
     def test_soulforge_target_metadata_verifies_analysis_head(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
@@ -696,7 +794,7 @@ class RepoContextForgeTests(unittest.TestCase):
             pr_files=[],
             staged_files=[],
             unstaged_files=[],
-            untracked_files=[".soulforge/repomap.db", ".codex"],
+            untracked_files=[".soulforge/repomap.db", ".codex", ".gitnexus/meta.json"],
         )
         original_read_git_state = codex_context_bootstrap.forge.read_git_state
         original_is_detached = codex_context_bootstrap.forge.is_detached
@@ -768,6 +866,18 @@ class RepoContextForgeTests(unittest.TestCase):
                             "signature": "def handle() -> None",
                         }
                     ],
+                    "soulforge_impact": {
+                        "risk": "medium",
+                        "direct_dependents": 2,
+                        "dependencies": 1,
+                        "cochange_partners": 1,
+                        "total_affected_scope": 4,
+                        "dependents": [{"path": "src/caller.py", "weight": 1.0}],
+                        "cochanges": [{"path": "tests/test_a.py", "count": 3}],
+                        "exported_symbols_at_risk": [
+                            {"name": "handle", "kind": "function", "usage_files": 2}
+                        ],
+                    },
                 }
             ],
             "gitnexus": {
@@ -780,6 +890,9 @@ class RepoContextForgeTests(unittest.TestCase):
         rendered = repo_context_forge.render_prompt(packet)
 
         self.assertIn("<repo_context_packet", rendered)
+        self.assertIn("<soulforge_impact>", rendered)
+        self.assertIn("<risk>medium</risk>", rendered)
+        self.assertIn("src/caller.py", rendered)
         self.assertIn('path="src/a.py"', rendered)
         self.assertIn('target="handle"', rendered)
 
