@@ -193,6 +193,80 @@ class RepoContextForgeTests(unittest.TestCase):
             ["src/app.py", "src/worker.py"],
         )
 
+    def test_repo_mode_excludes_reference_only_agent_paths(self) -> None:
+        state = repo_context_forge.GitState(
+            branch="main",
+            head="abc123",
+            base_ref="origin/main",
+            merge_base="base",
+            pr_files=[],
+            staged_files=[],
+            unstaged_files=[],
+            untracked_files=[],
+        )
+
+        class FakeMap:
+            def top_files(self, _limit: int):
+                return [
+                    repo_context_forge.MapFile("plugin-baseline/a.py", 0.9, 1, 10, 1),
+                    repo_context_forge.MapFile("runtime/a.py", 0.8, 1, 10, 2),
+                    repo_context_forge.MapFile("src/app.py", 0.7, 1, 10, 3),
+                ]
+
+        self.assertEqual(
+            repo_context_forge.target_files_for_mode(
+                "repo",
+                state,
+                FakeMap(),
+                None,
+                3,
+                ["plugin-baseline/"],
+            ),
+            ["runtime/a.py", "src/app.py"],
+        )
+
+    def test_pr_mode_keeps_changed_reference_only_files_but_filters_related(self) -> None:
+        state = repo_context_forge.GitState(
+            branch="feature",
+            head="abc123",
+            base_ref="origin/main",
+            merge_base="base",
+            pr_files=["plugin-baseline/a.py"],
+            staged_files=[],
+            unstaged_files=[],
+            untracked_files=[],
+        )
+
+        class FakeMap:
+            def related_files_for_paths(self, _paths, _limit: int):
+                return ["plugin-baseline/b.py", "runtime/a.py"]
+
+        self.assertEqual(
+            repo_context_forge.target_files_for_mode(
+                "pr",
+                state,
+                FakeMap(),
+                None,
+                3,
+                ["plugin-baseline/"],
+            ),
+            ["plugin-baseline/a.py", "runtime/a.py"],
+        )
+
+    def test_reference_only_prefixes_are_read_from_agents(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            (repo / "AGENTS.md").write_text(
+                "- `plugin-baseline/` is reference-only unless approved.\n"
+                "- `runtime/` is active.\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                repo_context_forge.reference_only_prefixes(repo),
+                ["plugin-baseline/"],
+            )
+
     def test_task_state_boosts_edited_files(self) -> None:
         entries = [
             {

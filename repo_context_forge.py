@@ -240,6 +240,23 @@ def is_generated_or_cache_path(path: str) -> bool:
     return path.endswith((".pyc", ".pyo")) or path.startswith(".git/")
 
 
+def reference_only_prefixes(repo: Path) -> list[str]:
+    agents_path = repo / "AGENTS.md"
+    if not agents_path.exists():
+        return []
+    content = agents_path.read_text(encoding="utf-8", errors="replace")
+    prefixes = []
+    for match in re.finditer(r"`([^`]+/)`\s+is\s+reference[- ]only\b", content, re.IGNORECASE):
+        prefix = match.group(1).lstrip("/")
+        if not is_generated_or_cache_path(prefix):
+            prefixes.append(prefix)
+    return unique_ordered(prefixes)
+
+
+def is_reference_only_path(path: str, prefixes: Iterable[str]) -> bool:
+    return any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in prefixes)
+
+
 def is_test_path(path: str) -> bool:
     parts = path.split("/")
     name = Path(path).name.lower()
@@ -1047,14 +1064,21 @@ def target_files_for_mode(
     soul_map: SoulForgeMap,
     intent: str | None,
     top: int,
+    reference_only: Iterable[str] = (),
 ) -> list[str]:
+    reference_prefixes = tuple(reference_only)
     if mode == "pr":
         changed = [
             path
             for path in source_git_state.pr_files
             if not is_generated_or_cache_path(path)
         ]
-        related = soul_map.related_files_for_paths(changed, max(0, top - len(changed)))
+        related_limit = max(0, max(top * 3, top + 20) - len(changed))
+        related = [
+            path
+            for path in soul_map.related_files_for_paths(changed, related_limit)
+            if not is_reference_only_path(path, reference_prefixes)
+        ]
         return unique_ordered([*changed, *related])[:top]
     if mode == "local":
         return [
@@ -1065,15 +1089,17 @@ def target_files_for_mode(
     if mode == "repo":
         return [
             entry.path
-            for entry in soul_map.top_files(top)
+            for entry in soul_map.top_files(max(top * 3, top + 20))
             if not is_generated_or_cache_path(entry.path)
-        ]
+            and not is_reference_only_path(entry.path, reference_prefixes)
+        ][:top]
     tokens = tokenize_intent(intent or "")
     return [
         path
-        for path in soul_map.intent_files(tokens, top)
+        for path in soul_map.intent_files(tokens, max(top * 3, top + 20))
         if not is_generated_or_cache_path(path)
-    ]
+        and not is_reference_only_path(path, reference_prefixes)
+    ][:top]
 
 
 def rank_target_entry(
@@ -1687,7 +1713,15 @@ def make_packet(
     )
 
     source_git_state = read_git_state(target_state.source_repo, base_ref, head_ref)
-    targets = target_files_for_mode(mode, source_git_state, soul_map, intent, top)
+    reference_only = reference_only_prefixes(target_state.source_repo)
+    targets = target_files_for_mode(
+        mode,
+        source_git_state,
+        soul_map,
+        intent,
+        top,
+        reference_only,
+    )
     target_entries = make_target_entries(
         mode=mode,
         source_repo=target_state.source_repo,
@@ -1749,6 +1783,9 @@ def make_packet(
             "analysis_repo_is_cache_owned": soulforge_target["analysis_repo_is_cache_owned"],
             "analysis_head_matches_source_head": soulforge_target["analysis_head_matches_source_head"],
             "source_status_unchanged": source_status["unchanged"],
+        },
+        "policy": {
+            "reference_only_prefixes": reference_only,
         },
         "source_status": source_status,
         "git": {
@@ -1850,11 +1887,13 @@ def render_markdown(packet: dict[str, object]) -> str:
     target_state = packet["target_state"]
     gitnexus = packet["gitnexus"]
     source_status = packet.get("source_status") or {}
+    policy = packet.get("policy") or {}
     assert isinstance(git, dict)
     assert isinstance(soulforge, dict)
     assert isinstance(target_state, dict)
     assert isinstance(gitnexus, dict)
     assert isinstance(source_status, dict)
+    assert isinstance(policy, dict)
     lines = [
         "# Repo Context Packet",
         "",
@@ -1868,6 +1907,7 @@ def render_markdown(packet: dict[str, object]) -> str:
         f"- analysis head: `{target_state.get('analysis_head_sha', '')}`",
         f"- analysis cache-owned: `{target_state.get('analysis_repo_is_cache_owned', False)}`",
         f"- source status unchanged: `{source_status.get('unchanged', 'unknown')}`",
+        f"- reference-only prefixes: `{', '.join(str(item) for item in policy.get('reference_only_prefixes', []))}`",
         "",
         "## Warnings",
         "",
@@ -1953,10 +1993,12 @@ def render_prompt(packet: dict[str, object]) -> str:
     gitnexus = packet["gitnexus"]
     soulforge = packet.get("soulforge") or {}
     source_status = packet.get("source_status") or {}
+    policy = packet.get("policy") or {}
     assert isinstance(target_state, dict)
     assert isinstance(gitnexus, dict)
     assert isinstance(soulforge, dict)
     assert isinstance(source_status, dict)
+    assert isinstance(policy, dict)
     targets = packet["targets"]
     assert isinstance(targets, list)
 
@@ -2027,6 +2069,14 @@ def render_prompt(packet: dict[str, object]) -> str:
     lines.extend([
         "    </tool_cache_paths_created>",
         "  </source_status>",
+        "  <policy>",
+        "    <reference_only_prefixes>",
+    ])
+    for prefix in policy.get("reference_only_prefixes", []):
+        lines.append(f"      <prefix>{html.escape(str(prefix))}</prefix>")
+    lines.extend([
+        "    </reference_only_prefixes>",
+        "  </policy>",
         "  <soulforge_status>",
     ])
     soulforge_target = soulforge.get("target")
