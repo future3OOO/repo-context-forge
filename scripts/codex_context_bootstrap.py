@@ -39,6 +39,48 @@ def has_pr_changes(repo: Path, base_ref: str, head_ref: str) -> bool:
     return bool(git_output(repo, ["diff", "--name-only", f"{base_ref}...{head_ref}"]))
 
 
+def current_branch(repo: Path) -> str:
+    return git_output(repo, ["branch", "--show-current"])
+
+
+def upstream_ref(repo: Path, branch: str) -> str | None:
+    if not branch:
+        return None
+    upstream = git_output(repo, ["rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"])
+    return upstream or None
+
+
+def refresh_upstream_ref(repo: Path, upstream: str) -> None:
+    remote, _, branch = upstream.partition("/")
+    if remote and branch:
+        git_output(repo, ["fetch", "--quiet", remote, branch])
+
+
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    proc = forge.run_cmd(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=repo,
+        allow_fail=True,
+    )
+    return proc.returncode == 0
+
+
+def branch_is_behind_upstream(repo: Path, branch: str) -> tuple[str, str, str] | None:
+    upstream = upstream_ref(repo, branch)
+    if not upstream:
+        return None
+    refresh_upstream_ref(repo, upstream)
+    local_sha = git_output(repo, ["rev-parse", branch])
+    upstream_sha = git_output(repo, ["rev-parse", upstream])
+    if not local_sha or not upstream_sha or local_sha == upstream_sha:
+        return None
+    if is_ancestor(repo, upstream_sha, local_sha):
+        return None
+    if is_ancestor(repo, local_sha, upstream_sha):
+        return branch, local_sha, upstream_sha
+    return branch, local_sha, upstream_sha
+
+
 def context_surface_paths(git_state: forge.GitState) -> list[str]:
     return [
         path
@@ -98,6 +140,27 @@ def should_block_empty_checkout(
     return "no changed files, dirty files, or intent were available for context mapping"
 
 
+def should_block_stale_pr_checkout(
+    repo: Path,
+    mode: forge.Mode,
+    requested_head: str,
+    allow_stale: bool,
+) -> str | None:
+    if allow_stale or mode != "pr" or requested_head != "HEAD":
+        return None
+    branch = current_branch(repo)
+    if not branch:
+        return "detached PR checkout cannot be verified as latest; select the active PR branch/worktree"
+    stale = branch_is_behind_upstream(repo, branch)
+    if stale:
+        stale_branch, local_sha, upstream_sha = stale
+        return (
+            f"branch {stale_branch} is not at upstream head "
+            f"({local_sha[:12]} != {upstream_sha[:12]}); update the PR worktree before mapping"
+        )
+    return None
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="codex-context-bootstrap")
     parser.add_argument("--repo", type=Path, default=Path.cwd())
@@ -117,6 +180,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--gitnexus-repo")
     parser.add_argument("--gitnexus-mode", choices=["off", "check", "auto"], default="auto")
     parser.add_argument("--enforce-intake", action="store_true")
+    parser.add_argument("--allow-stale-pr-head", action="store_true")
     parser.add_argument("--out", type=Path)
     return parser.parse_args(argv)
 
@@ -142,6 +206,22 @@ def main(argv: list[str]) -> int:
         mode = "local"
     if mode == "intent" and not args.intent:
         mode = "repo"
+    stale_reason = should_block_stale_pr_checkout(root, mode, args.head, args.allow_stale_pr_head)
+    if stale_reason:
+        packet = forge.make_blocker_packet(
+            root,
+            reason=stale_reason,
+            base_ref=base_ref,
+            head_ref=args.head,
+            suggestions=[
+                item
+                for item in forge.worktree_suggestions(root)
+                if item.get("path") != str(root)
+                and is_user_worktree(item.get("path", ""), args.cache_dir)
+            ],
+        )
+        forge.output_text(render_bootstrap_output(packet, args.enforce_intake), args.out)
+        return 1
     if not args.allow_empty:
         blocker_reason = should_block_empty_checkout(root, mode, base_ref, args.head, args.intent)
         if blocker_reason:

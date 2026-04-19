@@ -908,6 +908,139 @@ class RepoContextForgeTests(unittest.TestCase):
             )
         )
 
+    def test_bootstrap_blocks_detached_pr_checkout_before_mapping(self) -> None:
+        original_current_branch = codex_context_bootstrap.current_branch
+        codex_context_bootstrap.current_branch = lambda _repo: ""
+        try:
+            reason = codex_context_bootstrap.should_block_stale_pr_checkout(
+                Path("/repo"),
+                "pr",
+                "HEAD",
+                False,
+            )
+        finally:
+            codex_context_bootstrap.current_branch = original_current_branch
+
+        self.assertEqual(
+            reason,
+            "detached PR checkout cannot be verified as latest; select the active PR branch/worktree",
+        )
+
+    def test_bootstrap_allows_explicit_non_head_pr_checkout(self) -> None:
+        reason = codex_context_bootstrap.should_block_stale_pr_checkout(
+            Path("/repo"),
+            "pr",
+            "origin/feature",
+            False,
+        )
+
+        self.assertIsNone(reason)
+
+    def test_bootstrap_blocks_branch_behind_upstream_before_mapping(self) -> None:
+        original_current_branch = codex_context_bootstrap.current_branch
+        original_branch_is_behind = codex_context_bootstrap.branch_is_behind_upstream
+        codex_context_bootstrap.current_branch = lambda _repo: "feature"
+        codex_context_bootstrap.branch_is_behind_upstream = (
+            lambda _repo, _branch: ("feature", "a" * 40, "b" * 40)
+        )
+        try:
+            reason = codex_context_bootstrap.should_block_stale_pr_checkout(
+                Path("/repo"),
+                "pr",
+                "HEAD",
+                False,
+            )
+        finally:
+            codex_context_bootstrap.current_branch = original_current_branch
+            codex_context_bootstrap.branch_is_behind_upstream = original_branch_is_behind
+
+        self.assertEqual(
+            reason,
+            "branch feature is not at upstream head (aaaaaaaaaaaa != bbbbbbbbbbbb); update the PR worktree before mapping",
+        )
+
+    def test_bootstrap_allows_current_branch_matching_upstream(self) -> None:
+        original_current_branch = codex_context_bootstrap.current_branch
+        original_branch_is_behind = codex_context_bootstrap.branch_is_behind_upstream
+        codex_context_bootstrap.current_branch = lambda _repo: "feature"
+        codex_context_bootstrap.branch_is_behind_upstream = lambda _repo, _branch: None
+        try:
+            reason = codex_context_bootstrap.should_block_stale_pr_checkout(
+                Path("/repo"),
+                "pr",
+                "HEAD",
+                False,
+            )
+        finally:
+            codex_context_bootstrap.current_branch = original_current_branch
+            codex_context_bootstrap.branch_is_behind_upstream = original_branch_is_behind
+
+        self.assertIsNone(reason)
+
+    def test_bootstrap_upstream_check_allows_local_ahead_branch(self) -> None:
+        original_upstream_ref = codex_context_bootstrap.upstream_ref
+        original_refresh = codex_context_bootstrap.refresh_upstream_ref
+        original_git_output = codex_context_bootstrap.git_output
+        original_is_ancestor = codex_context_bootstrap.is_ancestor
+        codex_context_bootstrap.upstream_ref = lambda _repo, _branch: "origin/feature"
+        codex_context_bootstrap.refresh_upstream_ref = lambda _repo, _upstream: None
+        codex_context_bootstrap.git_output = (
+            lambda _repo, args: "localsha" if args[-1] == "feature" else "upstreamsha"
+        )
+        codex_context_bootstrap.is_ancestor = (
+            lambda _repo, ancestor, descendant: ancestor == "upstreamsha"
+            and descendant == "localsha"
+        )
+        try:
+            stale = codex_context_bootstrap.branch_is_behind_upstream(
+                Path("/repo"),
+                "feature",
+            )
+        finally:
+            codex_context_bootstrap.upstream_ref = original_upstream_ref
+            codex_context_bootstrap.refresh_upstream_ref = original_refresh
+            codex_context_bootstrap.git_output = original_git_output
+            codex_context_bootstrap.is_ancestor = original_is_ancestor
+
+        self.assertIsNone(stale)
+
+    def test_bootstrap_upstream_check_blocks_local_behind_branch(self) -> None:
+        original_upstream_ref = codex_context_bootstrap.upstream_ref
+        original_refresh = codex_context_bootstrap.refresh_upstream_ref
+        original_git_output = codex_context_bootstrap.git_output
+        original_is_ancestor = codex_context_bootstrap.is_ancestor
+        codex_context_bootstrap.upstream_ref = lambda _repo, _branch: "origin/feature"
+        codex_context_bootstrap.refresh_upstream_ref = lambda _repo, _upstream: None
+        codex_context_bootstrap.git_output = (
+            lambda _repo, args: "localsha" if args[-1] == "feature" else "upstreamsha"
+        )
+        codex_context_bootstrap.is_ancestor = (
+            lambda _repo, ancestor, descendant: ancestor == "localsha"
+            and descendant == "upstreamsha"
+        )
+        try:
+            stale = codex_context_bootstrap.branch_is_behind_upstream(
+                Path("/repo"),
+                "feature",
+            )
+        finally:
+            codex_context_bootstrap.upstream_ref = original_upstream_ref
+            codex_context_bootstrap.refresh_upstream_ref = original_refresh
+            codex_context_bootstrap.git_output = original_git_output
+            codex_context_bootstrap.is_ancestor = original_is_ancestor
+
+        self.assertEqual(stale, ("feature", "localsha", "upstreamsha"))
+
+    def test_bootstrap_allows_stale_pr_when_explicitly_requested(self) -> None:
+        reason = codex_context_bootstrap.should_block_stale_pr_checkout(
+            Path("/repo"),
+            "pr",
+            "HEAD",
+            True,
+        )
+
+        self.assertIsNone(reason)
+
     def test_bootstrap_defaults_to_analysis_gitnexus_repo_and_large_budget(self) -> None:
         captured: dict[str, object] = {}
         originals = {

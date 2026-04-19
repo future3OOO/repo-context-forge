@@ -27,6 +27,10 @@ If the script exits non-zero and emits a `<blocker>`, stop normal repo analysis
 and surface the blocker. Do not continue with an empty or detached checkout
 packet.
 
+If the blocker says the PR checkout is detached or behind upstream head, stop
+before review or GitNexus work. Update or select the active PR worktree, then
+rerun the bootstrap.
+
 3. Follow the packet's `<scope_rules>`:
 
 - before code reasoning, review, or GitNexus calls, surface a short intake from
