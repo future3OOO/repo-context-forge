@@ -384,6 +384,7 @@ class RepoContextForgeTests(unittest.TestCase):
 
         self.assertGreater(early, late)
         self.assertGreaterEqual(late, repo_context_forge.MIN_TOKEN_BUDGET)
+        self.assertGreaterEqual(late, 16_000)
 
     def test_tokenize_intent_filters_common_words(self) -> None:
         self.assertEqual(
@@ -833,6 +834,45 @@ class RepoContextForgeTests(unittest.TestCase):
             )
         )
 
+    def test_bootstrap_defaults_to_analysis_gitnexus_repo_and_large_budget(self) -> None:
+        captured: dict[str, object] = {}
+        originals = {
+            "is_git_repo": codex_context_bootstrap.forge.is_git_repo,
+            "repo_root": codex_context_bootstrap.forge.repo_root,
+            "first_existing_base": codex_context_bootstrap.first_existing_base,
+            "find_soulforge_binary": codex_context_bootstrap.forge.find_soulforge_binary,
+            "make_packet": codex_context_bootstrap.forge.make_packet,
+            "render_prompt": codex_context_bootstrap.forge.render_prompt,
+            "output_text": codex_context_bootstrap.forge.output_text,
+        }
+
+        def fake_make_packet(*_args, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True}
+
+        codex_context_bootstrap.forge.is_git_repo = lambda _repo: True
+        codex_context_bootstrap.forge.repo_root = lambda _repo: Path("/repo")
+        codex_context_bootstrap.first_existing_base = lambda *_args, **_kwargs: "main"
+        codex_context_bootstrap.forge.find_soulforge_binary = lambda _bin: None
+        codex_context_bootstrap.forge.make_packet = fake_make_packet
+        codex_context_bootstrap.forge.render_prompt = lambda _packet: "packet"
+        codex_context_bootstrap.forge.output_text = lambda _text, _out: None
+        try:
+            result = codex_context_bootstrap.main(["--repo", "/repo", "--mode", "repo"])
+        finally:
+            codex_context_bootstrap.forge.is_git_repo = originals["is_git_repo"]
+            codex_context_bootstrap.forge.repo_root = originals["repo_root"]
+            codex_context_bootstrap.first_existing_base = originals["first_existing_base"]
+            codex_context_bootstrap.forge.find_soulforge_binary = originals["find_soulforge_binary"]
+            codex_context_bootstrap.forge.make_packet = originals["make_packet"]
+            codex_context_bootstrap.forge.render_prompt = originals["render_prompt"]
+            codex_context_bootstrap.forge.output_text = originals["output_text"]
+
+        self.assertEqual(result, 0)
+        self.assertIsNone(captured["gitnexus_repo"])
+        self.assertEqual(captured["token_budget"], repo_context_forge.DEFAULT_TOKEN_BUDGET)
+        self.assertGreaterEqual(captured["token_budget"], 16_000)
+
     def test_cache_key_is_stable(self) -> None:
         key = repo_context_forge.cache_key_for(Path("/tmp/example"), "abc123")
 
@@ -890,6 +930,7 @@ class RepoContextForgeTests(unittest.TestCase):
         rendered = repo_context_forge.render_prompt(packet)
 
         self.assertIn("<repo_context_packet", rendered)
+        self.assertIn("<token_budget>32000</token_budget>", rendered)
         self.assertIn("<soulforge_impact>", rendered)
         self.assertIn("<risk>medium</risk>", rendered)
         self.assertIn("src/caller.py", rendered)

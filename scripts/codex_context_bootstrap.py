@@ -106,6 +106,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--intent")
     parser.add_argument("--top", type=int, default=20)
+    parser.add_argument("--token-budget", type=int)
+    parser.add_argument("--conversation-tokens", type=int)
     parser.add_argument("--cache-dir", type=Path, default=forge.DEFAULT_CACHE_DIR)
     parser.add_argument("--soulforge-bin")
     parser.add_argument("--map-build", choices=["auto", "always", "never"], default="auto")
@@ -150,6 +152,7 @@ def main(argv: list[str]) -> int:
             forge.output_text(forge.render_prompt(packet), args.out)
             return 1
 
+    token_budget = forge.compute_token_budget(args.conversation_tokens, args.token_budget)
     packet = forge.make_packet(
         root,
         mode=mode,
@@ -157,13 +160,13 @@ def main(argv: list[str]) -> int:
         head_ref=args.head,
         intent=args.intent,
         top=args.top,
-        token_budget=forge.DEFAULT_TOKEN_BUDGET,
+        token_budget=token_budget,
         cache_dir=args.cache_dir.resolve(),
         soulforge_bin=forge.find_soulforge_binary(args.soulforge_bin),
         map_build=args.map_build,
         map_timeout_ms=args.map_timeout_ms,
         allow_missing_map=not args.require_map,
-        gitnexus_repo=args.gitnexus_repo or root.name,
+        gitnexus_repo=args.gitnexus_repo,
         gitnexus_mode=args.gitnexus_mode,
     )
     rendered = forge.render_prompt(packet)

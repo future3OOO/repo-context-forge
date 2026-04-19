@@ -27,9 +27,9 @@ DEFAULT_CACHE_DIR = Path.home() / ".cache" / "repo-context-forge"
 GITNEXUS_REGISTRY = Path.home() / ".gitnexus" / "registry.json"
 TOOL_CACHE_DIRS = (".soulforge", ".codex", ".gitnexus")
 TOOL_CACHE_PREFIXES = tuple(f"{name}/" for name in TOOL_CACHE_DIRS)
-DEFAULT_TOKEN_BUDGET = 2500
-MIN_TOKEN_BUDGET = 1500
-MAX_TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
+MIN_TOKEN_BUDGET = 16_000
+MAX_TOKEN_BUDGET = 32_000
+DEFAULT_TOKEN_BUDGET = MAX_TOKEN_BUDGET
 TaskEvent = Literal["read", "search", "edit", "mention"]
 
 
@@ -2269,6 +2269,7 @@ def render_prompt(packet: dict[str, object]) -> str:
         f"    <source_dirty>{str(target_state['source_dirty']).lower()}</source_dirty>",
         f"    <target_dirty>{str(target_state['target_dirty']).lower()}</target_dirty>",
         f"    <source_status_unchanged>{str(source_status.get('unchanged', False)).lower()}</source_status_unchanged>",
+        f"    <token_budget>{html.escape(str(packet.get('token_budget') or DEFAULT_TOKEN_BUDGET))}</token_budget>",
         "  </target_state>",
         "  <source_status>",
         f"    <before_hash>{html.escape(str(source_status.get('before_hash') or ''))}</before_hash>",
@@ -2333,6 +2334,7 @@ def render_prompt(packet: dict[str, object]) -> str:
         "  <scope_rules>",
         "    Use files under <targets> as the first-pass edit/review surface.",
         "    Use <soulforge_impact> as native repo-map blast radius before file edits.",
+        "    Use <gitnexus_status><repo> for every GitNexus MCP call for this packet.",
         "    Treat source dirty overlaps as warnings, not PR target files, when mode is pr.",
         "    Trust GitNexus blast-radius claims only when <gitnexus_status> is fresh or reindexed and required checks resolve.",
         "  </scope_rules>",

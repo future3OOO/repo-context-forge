@@ -30,6 +30,7 @@ packet.
 - use `<targets>` as the first-pass edit/review surface
 - use `<soulforge_impact>` as native SoulForge blast-radius context before
   editing or reviewing selected files
+- use `<gitnexus_status><repo>` as the repo value for every GitNexus MCP call
 - in `pr` mode, do not treat dirty source-worktree files as PR targets
 - run the listed `<gitnexus_required_checks>` before editing production code
   when GitNexus MCP tools are available
@@ -66,6 +67,10 @@ For each `<check>` in `<gitnexus_required_checks>`:
 
 - `kind="symbol_context"` means call `gitnexus_context` for that symbol/file
 - `kind="symbol_impact"` means call `gitnexus_impact` upstream for that symbol
+- if a GitNexus MCP call says the repo is missing or stale, rerun the bootstrap
+  with `--gitnexus-mode auto`, then retry using the new `<gitnexus_status><repo>`
+- do not call `gitnexus_list_repos` during normal recovery; the packet repo is
+  authoritative
 - cite SoulForge impact separately from GitNexus impact when reporting review
   evidence; SoulForge explains repo-map blast radius, while GitNexus validates
   execution-flow impact
