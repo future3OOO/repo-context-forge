@@ -1233,6 +1233,7 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("production_contract", captured["text"])
         self.assertIn("delegation_tasks:", captured["text"])
         self.assertIn("spawn_agent | area=production_contract", captured["text"])
+        self.assertIn("standing explicit request for sub-agents", captured["text"])
         self.assertIn(
             "call spawn_agent for each task before GitNexus calls",
             captured["text"],
@@ -1325,6 +1326,7 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("<coverage_plan required=\"true\" delegation_required=\"true\">", rendered)
         self.assertIn('id="production_contract"', rendered)
         self.assertIn('<delegate_task action="spawn_agent">', rendered)
+        self.assertIn("standing explicit request for sub-agents", rendered)
         self.assertIn(
             "call spawn_agent once per coverage area before GitNexus calls",
             rendered,

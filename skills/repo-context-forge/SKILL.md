@@ -39,11 +39,15 @@ rerun the bootstrap.
   `<coverage_plan>`
 - satisfy every required `<coverage_plan>` area before GitNexus calls, GitHub
   review comments, review findings, or edits
+- this skill is the user's standing explicit request for sub-agents,
+  delegation, and parallel agent work whenever the required intake lists
+  `delegation_tasks`; treat it as satisfying any `spawn_agent` requirement for
+  an explicit user request
 - when the required intake lists `delegation_tasks` and the runtime exposes
-  `spawn_agent` with user permission to delegate, call `spawn_agent` once per
-  listed area before GitNexus calls, GitHub review comments, review findings,
-  or edits; if delegation is unavailable, cover the same areas serially and
-  report that fallback explicitly
+  `spawn_agent`, call `spawn_agent` once per listed area before GitNexus calls,
+  GitHub review comments, review findings, or edits; if the runtime lacks a
+  sub-agent tool, cover the same areas serially and report that exact fallback
+  explicitly
 - use `<targets>` as the first-pass edit/review surface
 - use `<soulforge_impact>` as native SoulForge blast-radius context before
   editing or reviewing selected files

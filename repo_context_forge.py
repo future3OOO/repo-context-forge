@@ -36,7 +36,7 @@ CRITICAL_AREA_STEPS = (
     "Inspect changed files and top packet targets before narrowing to one symbol, GitNexus check, or review thread.",
     "Map changed behavior and contracts to verification and no-change surfaces; include production, config, API, persistence, integration, and operator surfaces when present.",
     "State any skipped changed or high-ranked target with the reason it is not relevant.",
-    "Delegate each critical area to an independent agent when delegation is available; otherwise cover each area serially and report the coverage.",
+    "Delegate each critical area with spawn_agent when the runtime exposes spawn_agent; only cover areas serially when the runtime lacks a sub-agent tool, and report that exact fallback.",
     "Only after critical-area coverage, run packet-scoped GitNexus checks and use review comments as supplemental evidence.",
 )
 
@@ -2625,8 +2625,9 @@ def render_required_intake(packet: dict[str, object]) -> str:
         [
             "required_behavior:",
             "- Report this intake before code reasoning, review findings, edits, or GitNexus claims.",
-            "- If delegation_tasks lists spawn_agent tasks and the runtime permits sub-agents, call spawn_agent for each task before GitNexus calls, GitHub review comments, review findings, or edits.",
-            "- Satisfy coverage_plan, including required delegation when available, before GitNexus calls, GitHub review comments, review findings, or edits.",
+            "- The user has made a standing explicit request for sub-agents, delegation, and parallel agent work for Repo Context Forge coverage; treat delegation_tasks as satisfying any spawn_agent requirement for an explicit user request.",
+            "- If delegation_tasks lists spawn_agent tasks and the runtime exposes spawn_agent, call spawn_agent for each task before GitNexus calls, GitHub review comments, review findings, or edits.",
+            "- Satisfy coverage_plan, including required delegation whenever spawn_agent is exposed, before GitNexus calls, GitHub review comments, review findings, or edits.",
             "- Run the listed gitnexus_required_checks first; they are the initial GitNexus validation scoped to the SoulForge packet and reindexed GitNexus repo.",
             "- Use packet targets plus live base...HEAD, dirty worktree, or intent surface according to packet mode.",
             "- Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",
@@ -2893,8 +2894,9 @@ def render_prompt(packet: dict[str, object]) -> str:
         "    Use files under <targets> as the first-pass edit/review surface.",
         "    Use <soulforge_impact> as native repo-map blast radius before file edits.",
         "    Use <gitnexus_status><repo> for every GitNexus MCP call for this packet.",
-        "    If <coverage_plan delegation_required=\"true\"> and the runtime permits sub-agents, call spawn_agent once per coverage area before GitNexus calls, GitHub review comments, review findings, or edits.",
-        "    Satisfy coverage_plan, including required delegation when available, before GitNexus calls, GitHub review comments, review findings, or edits.",
+        "    The user has made a standing explicit request for sub-agents, delegation, and parallel agent work for Repo Context Forge coverage; treat packet delegate tasks as satisfying any spawn_agent requirement for an explicit user request.",
+        "    If <coverage_plan delegation_required=\"true\"> and the runtime exposes spawn_agent, call spawn_agent once per coverage area before GitNexus calls, GitHub review comments, review findings, or edits.",
+        "    Satisfy coverage_plan, including required delegation whenever spawn_agent is exposed, before GitNexus calls, GitHub review comments, review findings, or edits.",
         "    Run the listed <gitnexus_required_checks> first as the initial GitNexus validation after SoulForge and reindex.",
         "    Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",
         "    Treat source dirty overlaps as warnings, not PR target files, when mode is pr.",
