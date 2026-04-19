@@ -30,6 +30,9 @@ packet.
 - use `<targets>` as the first-pass edit/review surface
 - use `<soulforge_impact>` as native SoulForge blast-radius context before
   editing or reviewing selected files
+- use `<semantic_summaries>` and each symbol's summary source as injected
+  context; `full_cached` means cached LLM/LSP/AST/native summaries are used
+  first and deterministic synthetic fill is used without live LLM calls
 - use `<gitnexus_status><repo>` as the repo value for every GitNexus MCP call
 - in `pr` mode, do not treat dirty source-worktree files as PR targets
 - run the listed `<gitnexus_required_checks>` before editing production code
@@ -74,6 +77,8 @@ For each `<check>` in `<gitnexus_required_checks>`:
 - cite SoulForge impact separately from GitNexus impact when reporting review
   evidence; SoulForge explains repo-map blast radius, while GitNexus validates
   execution-flow impact
+- cite summary source when semantic summaries materially affect target choice
+  or code reasoning
 - trust blast-radius claims only when `<gitnexus_status>` is `fresh` or
   `reindexed` and `required_checks_resolved` is true
 

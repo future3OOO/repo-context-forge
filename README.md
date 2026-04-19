@@ -46,7 +46,13 @@ silently switch to sibling worktrees.
 - native ranking combines changed hunks, production/test role, PageRank,
   SoulForge graph neighbors, co-change partners, semantic summaries, and task
   refresh signals.
+- semantic summaries run in `full_cached` mode during bootstrap: cached
+  LLM/LSP/AST/native summaries are used first, deterministic synthetic summaries
+  fill missing symbols, and live LLM generation is not performed on routine
+  prompt injection.
 - output can be Markdown, JSON, or an XML prompt packet for upstream injection.
+- prompt packets default to a 16k token budget and compact optional symbol
+  detail before dropping required status, target identity, or GitNexus checks.
 - packets include GitNexus required-check entries for context and impact calls.
 - packets include SoulForge target-head proof and GitNexus exact-head freshness
   status.

@@ -614,6 +614,79 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertEqual(impact["exported_symbols_at_risk"][0]["name"], "Handle")
             self.assertEqual(impact["exported_symbols_at_risk"][0]["usage_files"], 3)
 
+    def test_symbols_prefer_cached_llm_summary_and_fill_synthetic(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            db_dir = repo / ".soulforge"
+            db_dir.mkdir()
+            with sqlite3.connect(db_dir / "repomap.db") as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE files (
+                      id INTEGER PRIMARY KEY,
+                      path TEXT,
+                      pagerank REAL,
+                      symbol_count INTEGER,
+                      line_count INTEGER
+                    );
+                    CREATE TABLE symbols (
+                      id INTEGER PRIMARY KEY,
+                      file_id INTEGER,
+                      name TEXT,
+                      kind TEXT,
+                      line INTEGER,
+                      end_line INTEGER,
+                      is_exported INTEGER,
+                      signature TEXT
+                    );
+                    CREATE TABLE semantic_summaries (
+                      symbol_id INTEGER,
+                      source TEXT,
+                      summary TEXT
+                    );
+                    """
+                )
+                conn.execute("INSERT INTO files VALUES (1, 'src/core.py', 1.0, 2, 20)")
+                conn.executemany(
+                    "INSERT INTO symbols VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (10, 1, "HandleDraft", "function", 2, 8, 1, "def HandleDraft()"),
+                        (20, 1, "missingSummary", "method", 10, 12, 0, None),
+                    ],
+                )
+                conn.executemany(
+                    "INSERT INTO semantic_summaries VALUES (?, ?, ?)",
+                    [
+                        (10, "synthetic", "synthetic cached"),
+                        (10, "ast", "docstring cached"),
+                        (10, "llm", "LLM cached behavior"),
+                    ],
+                )
+
+            symbols = repo_context_forge.SoulForgeMap(repo).symbols_for_file("src/core.py")
+
+            self.assertEqual(symbols[0].summary, "LLM cached behavior")
+            self.assertEqual(symbols[0].summary_source, "llm")
+            self.assertEqual(symbols[1].summary, "method in src: missing summary")
+            self.assertEqual(symbols[1].summary_source, "synthetic_fallback")
+
+    def test_semantic_summary_section_counts_sources(self) -> None:
+        section = repo_context_forge.semantic_summary_section(
+            [
+                {
+                    "symbols": [
+                        {"summary_source": "llm"},
+                        {"summary_source": "synthetic_fallback"},
+                    ]
+                },
+                {"symbols": [{"summary_source": "llm"}]},
+            ]
+        )
+
+        self.assertEqual(section["mode"], "full_cached")
+        self.assertFalse(section["live_llm_generation"])
+        self.assertEqual(section["source_counts"], {"llm": 2, "synthetic_fallback": 1})
+
     def test_soulforge_target_metadata_verifies_analysis_head(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
             repo = Path(repo_dir)
@@ -905,6 +978,8 @@ class RepoContextForgeTests(unittest.TestCase):
                             "line": 10,
                             "end_line": 20,
                             "signature": "def handle() -> None",
+                            "summary": "Handles the selected packet target",
+                            "summary_source": "llm",
                         }
                     ],
                     "soulforge_impact": {
@@ -921,6 +996,12 @@ class RepoContextForgeTests(unittest.TestCase):
                     },
                 }
             ],
+            "semantic_summaries": {
+                "mode": "full_cached",
+                "synthetic_fill": True,
+                "live_llm_generation": False,
+                "source_counts": {"llm": 1},
+            },
             "gitnexus": {
                 "plan": [
                     {"kind": "symbol_context", "target": "handle", "file": "src/a.py"}
@@ -932,11 +1013,81 @@ class RepoContextForgeTests(unittest.TestCase):
 
         self.assertIn("<repo_context_packet", rendered)
         self.assertIn("<token_budget>16000</token_budget>", rendered)
+        self.assertIn("<semantic_summaries>", rendered)
+        self.assertIn('<summary source="llm">Handles the selected packet target</summary>', rendered)
+        self.assertIn('<source name="llm" count="1"/>', rendered)
         self.assertIn("<soulforge_impact>", rendered)
         self.assertIn("<risk>medium</risk>", rendered)
         self.assertIn("src/caller.py", rendered)
         self.assertIn('path="src/a.py"', rendered)
         self.assertIn('target="handle"', rendered)
+
+    def test_render_prompt_compacts_to_budget_and_preserves_gitnexus_checks(self) -> None:
+        long_summary = "x" * 5000
+        packet = {
+            "schema_version": 1,
+            "mode": "pr",
+            "token_budget": 1000,
+            "warnings": [],
+            "target_state": {
+                "source_repo": "/repo",
+                "analysis_repo": "/cache/repo",
+                "base_ref": "main",
+                "head_ref": "HEAD",
+                "head_sha": "abc123",
+                "analysis_head_sha": "abc123",
+                "analysis_repo_is_cache_owned": True,
+                "analysis_head_matches_source_head": True,
+                "source_dirty": False,
+                "target_dirty": False,
+            },
+            "source_status": {"unchanged": True},
+            "soulforge": {
+                "target": {"status": "fresh", "target_head_verified": True, "db_exists": True}
+            },
+            "semantic_summaries": {
+                "mode": "full_cached",
+                "synthetic_fill": True,
+                "live_llm_generation": False,
+                "source_counts": {"llm": 1},
+            },
+            "targets": [
+                {
+                    "path": "src/a.py",
+                    "rank": 1,
+                    "surface_role": "production",
+                    "priority_score": 1000,
+                    "rank_signals": ["changed_file"],
+                    "why_selected": ["changed"],
+                    "symbols": [
+                        {
+                            "name": "handle",
+                            "kind": "function",
+                            "line": 1,
+                            "end_line": 3,
+                            "signature": "def handle()",
+                            "summary": long_summary,
+                            "summary_source": "llm",
+                        }
+                    ],
+                }
+            ],
+            "gitnexus": {
+                "status": "fresh",
+                "repo": "example",
+                "expected_head_sha": "abc123",
+                "indexed_head_sha": "abc123",
+                "required_checks_resolved": True,
+                "plan": [{"kind": "symbol_context", "target": "handle", "file": "src/a.py"}],
+            },
+        }
+
+        rendered = repo_context_forge.render_prompt(packet)
+
+        self.assertLessEqual(repo_context_forge.estimate_tokens(rendered), 1000)
+        self.assertIn('target="handle"', rendered)
+        self.assertIn('path="src/a.py"', rendered)
+        self.assertNotIn(long_summary, rendered)
 
     def test_wrapper_env_exposes_packet_and_target_metadata(self) -> None:
         packet = {

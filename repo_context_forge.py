@@ -76,6 +76,7 @@ class Symbol:
     signature: str | None
     is_exported: bool
     summary: str | None = None
+    summary_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -426,6 +427,26 @@ def tokenize_intent(intent: str) -> list[str]:
         for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]+", intent.lower())
         if len(token) > 2 and token not in stop
     ]
+
+
+def identifier_words(value: str) -> list[str]:
+    words: list[str] = []
+    for chunk in re.split(r"[^A-Za-z0-9]+", value):
+        if not chunk:
+            continue
+        words.extend(
+            word.lower()
+            for word in re.findall(r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+", chunk)
+        )
+    return words
+
+
+def synthetic_symbol_summary(path: str, name: str, kind: str) -> str:
+    words = " ".join(identifier_words(name)) or name
+    parent = Path(path).parent.name.replace("_", " ").replace("-", " ")
+    if parent and parent != ".":
+        return f"{kind} in {parent}: {words}"
+    return f"{kind}: {words}"
 
 
 def compute_token_budget(conversation_tokens: int | None, explicit_budget: int | None) -> int:
@@ -891,6 +912,7 @@ class SoulForgeMap:
         with self._connect() as conn:
             summary_join = ""
             summary_select = "NULL AS summary"
+            source_select = "NULL AS summary_source"
             if self._has_table(conn, "semantic_summaries"):
                 summary_join = """
                 LEFT JOIN semantic_summaries ss ON ss.symbol_id = s.id
@@ -898,15 +920,22 @@ class SoulForgeMap:
                     SELECT source
                     FROM semantic_summaries
                     WHERE symbol_id = s.id
-                    ORDER BY source = 'llm' DESC, source ASC
+                    ORDER BY CASE source
+                      WHEN 'llm' THEN 0
+                      WHEN 'lsp' THEN 1
+                      WHEN 'ast' THEN 2
+                      WHEN 'synthetic' THEN 3
+                      ELSE 4
+                    END, source ASC
                     LIMIT 1
                   )
                 """
                 summary_select = "ss.summary AS summary"
+                source_select = "ss.source AS summary_source"
             rows = conn.execute(
                 f"""
                 SELECT s.name, s.kind, s.line, s.end_line, s.signature, s.is_exported,
-                       {summary_select}
+                       {summary_select}, {source_select}
                 FROM symbols s
                 JOIN files f ON f.id = s.file_id
                 {summary_join}
@@ -916,18 +945,25 @@ class SoulForgeMap:
                 """,
                 (path, limit),
             ).fetchall()
-        return [
-            Symbol(
-                name=str(row["name"]),
-                kind=str(row["kind"]),
-                line=int(row["line"] or 0),
-                end_line=int(row["end_line"] or row["line"] or 0),
-                signature=str(row["signature"]) if row["signature"] is not None else None,
-                is_exported=bool(row["is_exported"]),
-                summary=str(row["summary"]) if row["summary"] is not None else None,
+        symbols: list[Symbol] = []
+        for row in rows:
+            name = str(row["name"])
+            kind = str(row["kind"])
+            summary = str(row["summary"]) if row["summary"] is not None else None
+            source = str(row["summary_source"]) if row["summary_source"] is not None else None
+            symbols.append(
+                Symbol(
+                    name=name,
+                    kind=kind,
+                    line=int(row["line"] or 0),
+                    end_line=int(row["end_line"] or row["line"] or 0),
+                    signature=str(row["signature"]) if row["signature"] is not None else None,
+                    is_exported=bool(row["is_exported"]),
+                    summary=summary or synthetic_symbol_summary(path, name, kind),
+                    summary_source=source or "synthetic_fallback",
+                )
             )
-            for row in rows
-        ]
+        return symbols
 
     def dependent_count_for_file(self, path: str) -> int:
         if not self.available:
@@ -1531,6 +1567,25 @@ def build_gitnexus_plan(
     return plan
 
 
+def semantic_summary_section(target_entries: list[dict[str, object]]) -> dict[str, object]:
+    counts: dict[str, int] = {}
+    for entry in target_entries:
+        symbols = entry.get("symbols")
+        if not isinstance(symbols, list):
+            continue
+        for symbol in symbols:
+            if not isinstance(symbol, dict):
+                continue
+            source = str(symbol.get("summary_source") or "none")
+            counts[source] = counts.get(source, 0) + 1
+    return {
+        "mode": "full_cached",
+        "synthetic_fill": True,
+        "live_llm_generation": False,
+        "source_counts": dict(sorted(counts.items())),
+    }
+
+
 def build_gitnexus_section(
     plan: list[dict[str, str]],
     target_state: TargetState,
@@ -2016,6 +2071,7 @@ def make_packet(
             "top_files": [entry.__dict__ for entry in soul_map.top_files(top)],
             "target": soulforge_target,
         },
+        "semantic_summaries": semantic_summary_section(target_entries),
         "targets": target_entries,
         "gitnexus": build_gitnexus_section(plan, target_state, gitnexus_repo_name, gitnexus_status),
         "gitnexus_plan": plan,
@@ -2090,7 +2146,8 @@ def render_target_lines(target: dict[str, object], *, max_symbols: int = 8) -> l
             signature = symbol.get("signature") or f"{symbol.get('kind')} {symbol.get('name')}"
             lines.append(f"  - `{prefix}{signature}` line {symbol.get('line')}")
             if symbol.get("summary"):
-                lines.append(f"    - summary: {symbol['summary']}")
+                source = symbol.get("summary_source") or "unknown"
+                lines.append(f"    - summary ({source}): {symbol['summary']}")
     graph_neighbors = target.get("graph_neighbors")
     if isinstance(graph_neighbors, list) and graph_neighbors:
         lines.append("- graph neighbors:")
@@ -2111,12 +2168,14 @@ def render_markdown(packet: dict[str, object]) -> str:
     soulforge = packet["soulforge"]
     target_state = packet["target_state"]
     gitnexus = packet["gitnexus"]
+    semantic = packet.get("semantic_summaries") or {}
     source_status = packet.get("source_status") or {}
     policy = packet.get("policy") or {}
     assert isinstance(git, dict)
     assert isinstance(soulforge, dict)
     assert isinstance(target_state, dict)
     assert isinstance(gitnexus, dict)
+    assert isinstance(semantic, dict)
     assert isinstance(source_status, dict)
     assert isinstance(policy, dict)
     lines = [
@@ -2175,6 +2234,13 @@ def render_markdown(packet: dict[str, object]) -> str:
                 lines.append(f"- {key}: {stats[key]}")
     else:
         lines.append(f"- unavailable: `{stats['path']}`")
+    lines.extend(
+        [
+            f"- semantic mode: `{semantic.get('mode', 'unknown')}`",
+            f"- semantic synthetic fill: `{semantic.get('synthetic_fill', False)}`",
+            f"- semantic live LLM generation: `{semantic.get('live_llm_generation', False)}`",
+        ]
+    )
 
     lines.extend(["", "## Targets", ""])
     targets = packet["targets"]
@@ -2213,15 +2279,131 @@ def render_markdown(packet: dict[str, object]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def trim_prompt_lines(lines: list[str], token_budget: int) -> list[str] | None:
+    if estimate_tokens("\n".join(lines)) <= token_budget:
+        return lines
+    predicates = [
+        lambda line: line.lstrip().startswith("<summary "),
+        lambda line: line.lstrip().startswith("<symbol ")
+        and " kind=" in line
+        and "</symbol>" in line,
+        lambda line: line.lstrip().startswith("<file ")
+        and line.rstrip().endswith("/>")
+        and (" weight=" in line or " count=" in line),
+        lambda line: line.lstrip().startswith("<reason>"),
+        lambda line: line.lstrip().startswith("<signal>"),
+    ]
+    trimmed = list(lines)
+    for predicate in predicates:
+        trimmed = [line for line in trimmed if not predicate(line)]
+        if estimate_tokens("\n".join(trimmed)) <= token_budget:
+            return trimmed
+    return None
+
+
+def render_compact_prompt(packet: dict[str, object]) -> str:
+    target_state = packet["target_state"]
+    gitnexus = packet["gitnexus"]
+    source_status = packet.get("source_status") or {}
+    soulforge = packet.get("soulforge") or {}
+    semantic = packet.get("semantic_summaries") or {}
+    assert isinstance(target_state, dict)
+    assert isinstance(gitnexus, dict)
+    assert isinstance(source_status, dict)
+    assert isinstance(soulforge, dict)
+    assert isinstance(semantic, dict)
+    targets = packet["targets"]
+    assert isinstance(targets, list)
+    lines = [
+        '<repo_context_packet schema_version="1" compacted="true">',
+        "  <target_state>",
+        f"    <mode>{html.escape(str(packet['mode']))}</mode>",
+        f"    <source_repo>{html.escape(str(target_state['source_repo']))}</source_repo>",
+        f"    <analysis_repo>{html.escape(str(target_state['analysis_repo']))}</analysis_repo>",
+        f"    <base_ref>{html.escape(str(target_state['base_ref']))}</base_ref>",
+        f"    <head_ref>{html.escape(str(target_state['head_ref']))}</head_ref>",
+        f"    <head_sha>{html.escape(str(target_state['head_sha']))}</head_sha>",
+        f"    <analysis_head_sha>{html.escape(str(target_state.get('analysis_head_sha') or ''))}</analysis_head_sha>",
+        f"    <analysis_repo_is_cache_owned>{str(target_state.get('analysis_repo_is_cache_owned', False)).lower()}</analysis_repo_is_cache_owned>",
+        f"    <analysis_head_matches_source_head>{str(target_state.get('analysis_head_matches_source_head', False)).lower()}</analysis_head_matches_source_head>",
+        f"    <source_status_unchanged>{str(source_status.get('unchanged', False)).lower()}</source_status_unchanged>",
+        f"    <token_budget>{html.escape(str(packet.get('token_budget') or DEFAULT_TOKEN_BUDGET))}</token_budget>",
+        "  </target_state>",
+        "  <soulforge_status>",
+    ]
+    soulforge_target = soulforge.get("target")
+    if isinstance(soulforge_target, dict):
+        lines.extend([
+            f"    <status>{html.escape(str(soulforge_target.get('status') or 'unknown'))}</status>",
+            f"    <target_head_verified>{str(soulforge_target.get('target_head_verified', False)).lower()}</target_head_verified>",
+            f"    <db_exists>{str(soulforge_target.get('db_exists', False)).lower()}</db_exists>",
+        ])
+    lines.extend([
+        "  </soulforge_status>",
+        "  <semantic_summaries>",
+        f"    <mode>{html.escape(str(semantic.get('mode') or 'unknown'))}</mode>",
+        f"    <synthetic_fill>{str(semantic.get('synthetic_fill', False)).lower()}</synthetic_fill>",
+        f"    <live_llm_generation>{str(semantic.get('live_llm_generation', False)).lower()}</live_llm_generation>",
+        "    <source_counts>",
+    ])
+    source_counts = semantic.get("source_counts")
+    if isinstance(source_counts, dict):
+        for source, count in source_counts.items():
+            lines.append(
+                f"      <source name=\"{html.escape(str(source))}\" count=\"{html.escape(str(count))}\"/>"
+            )
+    lines.extend([
+        "    </source_counts>",
+        "  </semantic_summaries>",
+        "  <gitnexus_status>",
+        f"    <status>{html.escape(str(gitnexus.get('status') or 'unknown'))}</status>",
+        f"    <repo>{html.escape(str(gitnexus.get('repo') or ''))}</repo>",
+        f"    <expected_head_sha>{html.escape(str(gitnexus.get('expected_head_sha') or ''))}</expected_head_sha>",
+        f"    <indexed_head_sha>{html.escape(str(gitnexus.get('indexed_head_sha') or ''))}</indexed_head_sha>",
+        f"    <reindex_attempted>{str(gitnexus.get('reindex_attempted', False)).lower()}</reindex_attempted>",
+        f"    <required_checks_resolved>{str(gitnexus.get('required_checks_resolved', False)).lower()}</required_checks_resolved>",
+        "  </gitnexus_status>",
+        "  <warnings>",
+        "    <warning>prompt compacted to fit token budget; rerun with a larger budget for symbol details</warning>",
+    ])
+    warnings = packet.get("warnings")
+    if isinstance(warnings, list):
+        for warning in warnings:
+            lines.append(f"    <warning>{html.escape(str(warning))}</warning>")
+    lines.extend(["  </warnings>", "  <targets>"])
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        lines.append(f"    <file path=\"{html.escape(str(target['path']))}\">")
+        lines.append(f"      <rank>{html.escape(str(target.get('rank')))}</rank>")
+        lines.append(f"      <role>{html.escape(str(target.get('surface_role') or 'unknown'))}</role>")
+        lines.append(f"      <priority_score>{html.escape(str(target.get('priority_score') or 0))}</priority_score>")
+        lines.append("    </file>")
+    lines.extend(["  </targets>", "  <gitnexus_required_checks>"])
+    plan = gitnexus.get("plan")
+    if isinstance(plan, list):
+        for item in plan[:20]:
+            if isinstance(item, dict):
+                attrs = " ".join(
+                    f'{html.escape(str(key))}="{html.escape(str(value))}"'
+                    for key, value in item.items()
+                )
+                lines.append(f"    <check {attrs}/>")
+    lines.extend(["  </gitnexus_required_checks>", "</repo_context_packet>"])
+    return "\n".join(lines) + "\n"
+
+
 def render_prompt(packet: dict[str, object]) -> str:
     target_state = packet["target_state"]
     gitnexus = packet["gitnexus"]
     soulforge = packet.get("soulforge") or {}
+    semantic = packet.get("semantic_summaries") or {}
     source_status = packet.get("source_status") or {}
     policy = packet.get("policy") or {}
     assert isinstance(target_state, dict)
     assert isinstance(gitnexus, dict)
     assert isinstance(soulforge, dict)
+    assert isinstance(semantic, dict)
     assert isinstance(source_status, dict)
     assert isinstance(policy, dict)
     targets = packet["targets"]
@@ -2315,6 +2497,21 @@ def render_prompt(packet: dict[str, object]) -> str:
         ])
     lines.extend([
         "  </soulforge_status>",
+        "  <semantic_summaries>",
+        f"    <mode>{html.escape(str(semantic.get('mode') or 'unknown'))}</mode>",
+        f"    <synthetic_fill>{str(semantic.get('synthetic_fill', False)).lower()}</synthetic_fill>",
+        f"    <live_llm_generation>{str(semantic.get('live_llm_generation', False)).lower()}</live_llm_generation>",
+        "    <source_counts>",
+    ])
+    source_counts = semantic.get("source_counts")
+    if isinstance(source_counts, dict):
+        for source, count in source_counts.items():
+            lines.append(
+                f"      <source name=\"{html.escape(str(source))}\" count=\"{html.escape(str(count))}\"/>"
+            )
+    lines.extend([
+        "    </source_counts>",
+        "  </semantic_summaries>",
         "  <gitnexus_status>",
         f"    <status>{html.escape(str(gitnexus.get('status') or 'unknown'))}</status>",
         f"    <repo>{html.escape(str(gitnexus.get('repo') or ''))}</repo>",
@@ -2427,7 +2624,10 @@ def render_prompt(packet: dict[str, object]) -> str:
                     f"        <symbol name=\"{name}\" kind=\"{kind}\" line=\"{start}\" end_line=\"{end}\">{signature}</symbol>"
                 )
                 if symbol.get("summary"):
-                    lines.append(f"        <summary>{html.escape(str(symbol['summary']))}</summary>")
+                    source = html.escape(str(symbol.get("summary_source") or "unknown"))
+                    lines.append(
+                        f"        <summary source=\"{source}\">{html.escape(str(symbol['summary']))}</summary>"
+                    )
             lines.append("      </symbols>")
         lines.append("    </file>")
     lines.extend(["  </targets>", "  <gitnexus_required_checks>"])
@@ -2441,7 +2641,11 @@ def render_prompt(packet: dict[str, object]) -> str:
                 )
                 lines.append(f"    <check {attrs}/>")
     lines.extend(["  </gitnexus_required_checks>", "</repo_context_packet>"])
-    return "\n".join(lines) + "\n"
+    token_budget = int(packet.get("token_budget") or DEFAULT_TOKEN_BUDGET)
+    trimmed = trim_prompt_lines(lines, token_budget)
+    if trimmed is not None:
+        return "\n".join(trimmed) + "\n"
+    return render_compact_prompt(packet)
 
 
 def render_packet(packet: dict[str, object], output_format: OutputFormat) -> str:
