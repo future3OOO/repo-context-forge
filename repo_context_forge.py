@@ -29,7 +29,7 @@ TOOL_CACHE_DIRS = (".soulforge", ".codex", ".gitnexus")
 TOOL_CACHE_PREFIXES = tuple(f"{name}/" for name in TOOL_CACHE_DIRS)
 MIN_TOKEN_BUDGET = 16_000
 MAX_TOKEN_BUDGET = 32_000
-DEFAULT_TOKEN_BUDGET = MAX_TOKEN_BUDGET
+DEFAULT_TOKEN_BUDGET = MIN_TOKEN_BUDGET
 TaskEvent = Literal["read", "search", "edit", "mention"]
 
 
@@ -433,7 +433,7 @@ def compute_token_budget(conversation_tokens: int | None, explicit_budget: int |
         return explicit_budget
     if not conversation_tokens or conversation_tokens < 1000:
         return DEFAULT_TOKEN_BUDGET
-    scale = max(0.6, 1 - (conversation_tokens / 100_000) * 0.4)
+    scale = min(1.0, conversation_tokens / 100_000)
     return round(MIN_TOKEN_BUDGET + (MAX_TOKEN_BUDGET - MIN_TOKEN_BUDGET) * scale)
 
 

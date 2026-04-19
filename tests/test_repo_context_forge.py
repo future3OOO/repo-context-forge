@@ -378,13 +378,14 @@ class RepoContextForgeTests(unittest.TestCase):
     def test_compute_token_budget_respects_explicit_value(self) -> None:
         self.assertEqual(repo_context_forge.compute_token_budget(100_000, 1234), 1234)
 
-    def test_compute_token_budget_decays_for_long_context(self) -> None:
+    def test_compute_token_budget_expands_for_long_context(self) -> None:
         early = repo_context_forge.compute_token_budget(0, None)
         late = repo_context_forge.compute_token_budget(100_000, None)
 
-        self.assertGreater(early, late)
+        self.assertEqual(early, repo_context_forge.DEFAULT_TOKEN_BUDGET)
+        self.assertGreater(late, early)
         self.assertGreaterEqual(late, repo_context_forge.MIN_TOKEN_BUDGET)
-        self.assertGreaterEqual(late, 16_000)
+        self.assertLessEqual(late, repo_context_forge.MAX_TOKEN_BUDGET)
 
     def test_tokenize_intent_filters_common_words(self) -> None:
         self.assertEqual(
@@ -930,7 +931,7 @@ class RepoContextForgeTests(unittest.TestCase):
         rendered = repo_context_forge.render_prompt(packet)
 
         self.assertIn("<repo_context_packet", rendered)
-        self.assertIn("<token_budget>32000</token_budget>", rendered)
+        self.assertIn("<token_budget>16000</token_budget>", rendered)
         self.assertIn("<soulforge_impact>", rendered)
         self.assertIn("<risk>medium</risk>", rendered)
         self.assertIn("src/caller.py", rendered)
