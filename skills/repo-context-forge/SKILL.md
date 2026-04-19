@@ -40,10 +40,13 @@ packet.
   first and deterministic synthetic fill is used without live LLM calls
 - use `<gitnexus_status><repo>` as the repo value for every GitNexus MCP call
 - in `pr` mode, do not treat dirty source-worktree files as PR targets
-- run the listed `<gitnexus_required_checks>` before editing production code
-  when GitNexus MCP tools are available
-- do not run `gitnexus_detect_changes(compare)` as the initial PR analysis;
-  the packet already reindexed GitNexus and scoped the required checks
+- run the listed `<gitnexus_required_checks>` as the first GitNexus validation
+  step before editing production code; these checks are scoped to the
+  SoulForge packet and the freshly indexed analysis repo
+- for `pr`, use the live `base...HEAD` packet surface; for `local`, use dirty
+  worktree packet targets; for `intent`, use the intent-ranked packet targets
+- do not let unscoped `gitnexus_detect_changes(compare)` choose the target
+  surface
 
 4. If the packet says SoulForge is unavailable, continue only with the explicit
 fallback surface in the packet and say that symbol-level map data was missing.
@@ -86,9 +89,10 @@ For each `<check>` in `<gitnexus_required_checks>`:
   execution-flow impact
 - cite summary source when semantic summaries materially affect target choice
   or code reasoning
-- do not use `gitnexus_detect_changes(compare)` for initial PR scoping; it is
-  not packet-scoped and can overreport unrelated historical surfaces
-- use `gitnexus_detect_changes` only after local edits, before commit, or as
+- do not use unscoped `gitnexus_detect_changes(compare)` for initial target
+  selection; it is not packet-scoped and can overreport unrelated historical
+  surfaces
+- use `gitnexus_detect_changes` after local edits, before commit, or as
   supplemental graph evidence after the packet target surface is fixed
 - trust blast-radius claims only when `<gitnexus_status>` is `fresh` or
   `reindexed` and `required_checks_resolved` is true

@@ -1014,10 +1014,10 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("gitnexus: repo=example-index; status=fresh", captured["text"])
         self.assertIn("src/a.py", captured["text"])
         self.assertIn(
-            "Do not run gitnexus_detect_changes(compare) as the initial PR analysis",
+            "Run the listed gitnexus_required_checks first; they are the initial GitNexus validation",
             captured["text"],
         )
-        self.assertIn("Run the listed gitnexus_required_checks first", captured["text"])
+        self.assertIn("Do not let unscoped gitnexus_detect_changes(compare)", captured["text"])
         self.assertIn("END_REPO_CONTEXT_FORGE_REQUIRED_INTAKE\n<repo_context_packet/>", captured["text"])
 
     def test_cache_key_is_stable(self) -> None:
@@ -1089,7 +1089,7 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("<context_digest>", rendered)
         self.assertIn("<required_agent_intake>", rendered)
         self.assertIn(
-            "Do not run gitnexus_detect_changes(compare) as initial PR analysis",
+            "Run the listed <gitnexus_required_checks> first as the initial GitNexus validation",
             rendered,
         )
         self.assertIn("<semantic_sources>", rendered)
