@@ -35,7 +35,14 @@ rerun the bootstrap.
 
 - before code reasoning, review, or GitNexus calls, surface a short intake from
   `<context_digest>`: mode, head SHA, token budget, semantic source counts, top
-  targets, SoulForge impact headline, and GitNexus repo/status
+  targets, SoulForge impact headline, GitNexus repo/status, and the generated
+  `<coverage_plan>`
+- satisfy every required `<coverage_plan>` area before GitNexus calls, GitHub
+  review comments, review findings, or edits
+- when `<coverage_plan delegation_required="true">` and sub-agents are
+  available and permitted, dispatch independent area reviews before final
+  conclusions; if delegation is unavailable, cover the same areas serially and
+  report each result
 - use `<targets>` as the first-pass edit/review surface
 - use `<soulforge_impact>` as native SoulForge blast-radius context before
   editing or reviewing selected files

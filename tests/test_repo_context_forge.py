@@ -143,6 +143,71 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("production_file", production["rank_signals"])
         self.assertIn("broad_test_container", broad_test["rank_signals"])
 
+    def test_coverage_plan_groups_changed_production_and_verification(self) -> None:
+        plan = repo_context_forge.build_coverage_plan(
+            [
+                {
+                    "path": "src/service.py",
+                    "surface_role": "production",
+                    "rank_signals": ["changed_file"],
+                    "soulforge_impact": {"risk": "low", "direct_dependents": 0},
+                },
+                {
+                    "path": "tests/test_service.py",
+                    "surface_role": "test",
+                    "rank_signals": ["changed_file"],
+                    "soulforge_impact": {"risk": "low", "direct_dependents": 0},
+                },
+            ]
+        )
+
+        area_ids = [area["id"] for area in plan["areas"]]
+        self.assertTrue(plan["required"])
+        self.assertTrue(plan["delegation_required"])
+        self.assertIn("production_contract", area_ids)
+        self.assertIn("verification_contract", area_ids)
+
+    def test_coverage_plan_includes_all_matching_files_without_truncation(self) -> None:
+        entries = [
+            {
+                "path": f"src/service_{index}.py",
+                "surface_role": "production",
+                "rank_signals": ["changed_file"],
+                "soulforge_impact": {"risk": "low", "direct_dependents": 0},
+            }
+            for index in range(8)
+        ]
+        plan = repo_context_forge.build_coverage_plan(entries)
+
+        production = next(area for area in plan["areas"] if area["id"] == "production_contract")
+        self.assertEqual([entry["path"] for entry in entries], production["files"])
+
+    def test_coverage_plan_includes_blast_radius_and_related_surfaces(self) -> None:
+        plan = repo_context_forge.build_coverage_plan(
+            [
+                {
+                    "path": "src/service.py",
+                    "surface_role": "production",
+                    "rank_signals": ["changed_file"],
+                    "soulforge_impact": {
+                        "risk": "medium",
+                        "direct_dependents": 4,
+                        "total_affected_scope": 12,
+                    },
+                },
+                {
+                    "path": "src/client.py",
+                    "surface_role": "production",
+                    "rank_signals": ["graph_neighbor", "cochange_partner"],
+                    "soulforge_impact": {"risk": "low", "direct_dependents": 0},
+                },
+            ]
+        )
+
+        area_ids = [area["id"] for area in plan["areas"]]
+        self.assertIn("blast_radius", area_ids)
+        self.assertIn("related_map_surface", area_ids)
+
     def test_pr_ranking_does_not_boost_source_dirty_overlap(self) -> None:
         state = repo_context_forge.GitState(
             branch="feature",
@@ -1106,6 +1171,20 @@ class RepoContextForgeTests(unittest.TestCase):
                 "status": "fresh",
                 "required_checks_resolved": True,
             },
+            "coverage_plan": {
+                "required": True,
+                "delegation_required": True,
+                "areas": [
+                    {
+                        "id": "production_contract",
+                        "kind": "production",
+                        "required": True,
+                        "files": ["src/a.py"],
+                        "why": "changed production surface from the packet",
+                        "must_answer": "What changed?",
+                    }
+                ],
+            },
             "targets": [
                 {
                     "path": "src/a.py",
@@ -1148,6 +1227,12 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("src/a.py", captured["text"])
         self.assertIn(
             "Run the listed gitnexus_required_checks first; they are the initial GitNexus validation",
+            captured["text"],
+        )
+        self.assertIn("coverage_plan: required=true delegation_required=true", captured["text"])
+        self.assertIn("production_contract", captured["text"])
+        self.assertIn(
+            "Satisfy coverage_plan, including required delegation when available",
             captured["text"],
         )
         self.assertIn("Do not let unscoped gitnexus_detect_changes(compare)", captured["text"])
@@ -1213,6 +1298,20 @@ class RepoContextForgeTests(unittest.TestCase):
                     {"kind": "symbol_context", "target": "handle", "file": "src/a.py"}
                 ]
             },
+            "coverage_plan": {
+                "required": True,
+                "delegation_required": True,
+                "areas": [
+                    {
+                        "id": "production_contract",
+                        "kind": "production",
+                        "required": True,
+                        "files": ["src/a.py"],
+                        "why": "changed production surface from the packet",
+                        "must_answer": "What changed?",
+                    }
+                ],
+            },
         }
 
         rendered = repo_context_forge.render_prompt(packet)
@@ -1221,6 +1320,12 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("<token_budget>16000</token_budget>", rendered)
         self.assertIn("<context_digest>", rendered)
         self.assertIn("<required_agent_intake>", rendered)
+        self.assertIn("<coverage_plan required=\"true\" delegation_required=\"true\">", rendered)
+        self.assertIn('id="production_contract"', rendered)
+        self.assertIn(
+            "Satisfy coverage_plan, including required delegation when available",
+            rendered,
+        )
         self.assertIn(
             "Run the listed <gitnexus_required_checks> first as the initial GitNexus validation",
             rendered,
@@ -1293,6 +1398,20 @@ class RepoContextForgeTests(unittest.TestCase):
                 "required_checks_resolved": True,
                 "plan": [{"kind": "symbol_context", "target": "handle", "file": "src/a.py"}],
             },
+            "coverage_plan": {
+                "required": True,
+                "delegation_required": True,
+                "areas": [
+                    {
+                        "id": "production_contract",
+                        "kind": "production",
+                        "required": True,
+                        "files": ["src/a.py"],
+                        "why": "changed production surface from the packet",
+                        "must_answer": "What changed?",
+                    }
+                ],
+            },
         }
 
         rendered = repo_context_forge.render_prompt(packet)
@@ -1300,6 +1419,8 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertLessEqual(repo_context_forge.estimate_tokens(rendered), 1000)
         self.assertIn("<context_digest>", rendered)
         self.assertIn("<required_agent_intake>", rendered)
+        self.assertIn("<coverage_plan required=\"true\" delegation_required=\"true\">", rendered)
+        self.assertIn('id="production_contract"', rendered)
         self.assertIn('target="handle"', rendered)
         self.assertIn('path="src/a.py"', rendered)
         self.assertNotIn(long_summary, rendered)

@@ -31,6 +31,14 @@ MIN_TOKEN_BUDGET = 16_000
 MAX_TOKEN_BUDGET = 32_000
 DEFAULT_TOKEN_BUDGET = MIN_TOKEN_BUDGET
 TaskEvent = Literal["read", "search", "edit", "mention"]
+CRITICAL_AREA_STEPS = (
+    "State the task or PR contract from the user request, PR title/body when available, and packet targets.",
+    "Inspect changed files and top packet targets before narrowing to one symbol, GitNexus check, or review thread.",
+    "Map changed behavior and contracts to verification and no-change surfaces; include production, config, API, persistence, integration, and operator surfaces when present.",
+    "State any skipped changed or high-ranked target with the reason it is not relevant.",
+    "Delegate each critical area to an independent agent when delegation is available; otherwise cover each area serially and report the coverage.",
+    "Only after critical-area coverage, run packet-scoped GitNexus checks and use review comments as supplemental evidence.",
+)
 
 
 @dataclass(frozen=True)
@@ -1463,6 +1471,135 @@ def apply_task_state_to_entries(
     )
 
 
+def is_changed_target(entry: dict[str, object]) -> bool:
+    signals = entry.get("rank_signals")
+    return isinstance(signals, list) and any(
+        signal in signals
+        for signal in ("changed_file", "dirty_file", "edited_file")
+    )
+
+
+def is_doc_path(path: str) -> bool:
+    name = Path(path).name.lower()
+    return (
+        name.endswith((".md", ".rst", ".txt"))
+        or path.startswith(("docs/", "doc/"))
+        or name in {"readme", "readme.md"}
+    )
+
+
+def target_paths_for_area(
+    target_entries: list[dict[str, object]],
+    predicate,
+) -> list[str]:
+    paths: list[str] = []
+    for entry in target_entries:
+        path = str(entry.get("path") or "")
+        if path and predicate(entry, path):
+            paths.append(path)
+    return unique_ordered(paths)
+
+
+def make_coverage_area(
+    area_id: str,
+    kind: str,
+    files: list[str],
+    why: str,
+    must_answer: str,
+) -> dict[str, object] | None:
+    if not files:
+        return None
+    return {
+        "id": area_id,
+        "kind": kind,
+        "required": True,
+        "files": files,
+        "why": why,
+        "must_answer": must_answer,
+    }
+
+
+def build_coverage_plan(target_entries: list[dict[str, object]]) -> dict[str, object]:
+    areas: list[dict[str, object]] = []
+
+    def add(area: dict[str, object] | None) -> None:
+        if area:
+            areas.append(area)
+
+    add(make_coverage_area(
+        "production_contract",
+        "production",
+        target_paths_for_area(
+            target_entries,
+            lambda entry, path: is_changed_target(entry)
+            and entry.get("surface_role") == "production"
+            and not is_doc_path(path),
+        ),
+        "changed production surface from the packet",
+        "What behavior or contract changed, and which consumers or no-change paths could regress?",
+    ))
+    add(make_coverage_area(
+        "verification_contract",
+        "verification",
+        target_paths_for_area(
+            target_entries,
+            lambda entry, _path: entry.get("surface_role") == "test"
+            and (
+                is_changed_target(entry)
+                or "broad_test_container" in [str(item) for item in entry.get("rank_signals", [])]
+            ),
+        ),
+        "changed or broad verification surface from the packet",
+        "Do the tests prove the changed contract, and can they pass for the wrong reason?",
+    ))
+    add(make_coverage_area(
+        "operator_contract",
+        "operator",
+        target_paths_for_area(
+            target_entries,
+            lambda entry, path: is_changed_target(entry) and is_doc_path(path),
+        ),
+        "changed docs or operator-facing contract surface",
+        "Does the operator contract match runtime behavior, configuration, and failure modes?",
+    ))
+    add(make_coverage_area(
+        "blast_radius",
+        "impact",
+        target_paths_for_area(
+            target_entries,
+            lambda entry, _path: isinstance(entry.get("soulforge_impact"), dict)
+            and (
+                str(entry["soulforge_impact"].get("risk") or "low") != "low"
+                or int(entry["soulforge_impact"].get("direct_dependents") or 0) > 0
+                or int(entry["soulforge_impact"].get("total_affected_scope") or 0) > 0
+            ),
+        ),
+        "SoulForge impact marks dependents, affected scope, or elevated risk",
+        "Which dependents, co-change partners, and unchanged flows must remain safe?",
+    ))
+    add(make_coverage_area(
+        "related_map_surface",
+        "related",
+        target_paths_for_area(
+            target_entries,
+            lambda entry, _path: not is_changed_target(entry)
+            and (
+                "graph_neighbor" in [str(item) for item in entry.get("rank_signals", [])]
+                or "cochange_partner" in [str(item) for item in entry.get("rank_signals", [])]
+            ),
+        ),
+        "repo-map related surface selected by graph or co-change signals",
+        "Why is this related surface safe or relevant, despite not being directly changed?",
+    ))
+
+    delegation_required = len(areas) > 1
+    return {
+        "required": bool(areas),
+        "delegation_required": delegation_required,
+        "areas": areas,
+    }
+
+
 def make_target_entries(
     *,
     mode: Mode,
@@ -1594,6 +1731,39 @@ def render_source_counts_lines(semantic: dict[str, object], indent: str) -> list
             lines.append(
                 f'{indent}<source name="{html.escape(str(source))}" count="{html.escape(str(count))}"/>'
             )
+    return lines
+
+
+def render_coverage_plan_lines(plan: object, indent: str) -> list[str]:
+    plan = plan if isinstance(plan, dict) else {}
+    areas = plan.get("areas")
+    areas = areas if isinstance(areas, list) else []
+    lines = [
+        f"{indent}<coverage_plan required=\"{str(bool(plan.get('required'))).lower()}\" "
+        f"delegation_required=\"{str(bool(plan.get('delegation_required'))).lower()}\">"
+    ]
+    for step in CRITICAL_AREA_STEPS:
+        lines.append(f"{indent}  <step>{html.escape(step)}</step>")
+    for area in areas:
+        if not isinstance(area, dict):
+            continue
+        lines.append(
+            f"{indent}  <area id=\"{html.escape(str(area.get('id') or ''))}\" "
+            f"kind=\"{html.escape(str(area.get('kind') or ''))}\" "
+            f"required=\"{str(bool(area.get('required'))).lower()}\">"
+        )
+        lines.append(f"{indent}    <why>{html.escape(str(area.get('why') or ''))}</why>")
+        lines.append(
+            f"{indent}    <must_answer>{html.escape(str(area.get('must_answer') or ''))}</must_answer>"
+        )
+        lines.append(f"{indent}    <files>")
+        files = area.get("files")
+        if isinstance(files, list):
+            for path in files:
+                lines.append(f"{indent}      <file path=\"{html.escape(str(path))}\"/>")
+        lines.append(f"{indent}    </files>")
+        lines.append(f"{indent}  </area>")
+    lines.append(f"{indent}</coverage_plan>")
     return lines
 
 
@@ -2006,6 +2176,7 @@ def make_packet(
         targets=targets,
     )
     target_entries = apply_task_state_to_entries(target_entries, task_state)
+    coverage_plan = build_coverage_plan(target_entries)
     gitnexus_status = ensure_gitnexus_index(target_state, gitnexus_repo, gitnexus_mode)
     gitnexus_repo_name = str(gitnexus_status.get("repo") or gitnexus_repo or target_state.analysis_repo.name)
     plan = build_gitnexus_plan(target_entries, gitnexus_repo_name)
@@ -2083,6 +2254,7 @@ def make_packet(
             "target": soulforge_target,
         },
         "semantic_summaries": semantic_summary_section(target_entries),
+        "coverage_plan": coverage_plan,
         "targets": target_entries,
         "gitnexus": build_gitnexus_section(plan, target_state, gitnexus_repo_name, gitnexus_status),
         "gitnexus_plan": plan,
@@ -2180,6 +2352,7 @@ def render_markdown(packet: dict[str, object]) -> str:
     target_state = packet["target_state"]
     gitnexus = packet["gitnexus"]
     semantic = packet.get("semantic_summaries") or {}
+    coverage_plan = packet.get("coverage_plan") or {}
     source_status = packet.get("source_status") or {}
     policy = packet.get("policy") or {}
     assert isinstance(git, dict)
@@ -2253,6 +2426,20 @@ def render_markdown(packet: dict[str, object]) -> str:
         ]
     )
 
+    lines.extend(["", "## Coverage Plan", ""])
+    if isinstance(coverage_plan, dict):
+        lines.append(f"- required: `{coverage_plan.get('required', False)}`")
+        lines.append(f"- delegation required: `{coverage_plan.get('delegation_required', False)}`")
+        areas = coverage_plan.get("areas")
+        if isinstance(areas, list) and areas:
+            for area in areas:
+                if isinstance(area, dict):
+                    files = area.get("files")
+                    file_text = ", ".join(str(path) for path in files) if isinstance(files, list) else ""
+                    lines.append(f"- {area.get('id')}: {file_text}")
+        else:
+            lines.append("- areas: none")
+
     lines.extend(["", "## Targets", ""])
     targets = packet["targets"]
     assert isinstance(targets, list)
@@ -2301,7 +2488,7 @@ def render_context_digest_lines(packet: dict[str, object], *, indent: str = "  "
     assert isinstance(targets, list)
     lines = [
         f"{indent}<context_digest>",
-        f"{indent}  <required_agent_intake>State this packet's mode, head_sha, token_budget, semantic source counts, top targets, SoulForge impact headlines, and GitNexus repo/status before code reasoning.</required_agent_intake>",
+        f"{indent}  <required_agent_intake>State this packet's mode, head_sha, token_budget, semantic source counts, top targets, SoulForge impact headlines, GitNexus repo/status, and coverage_plan before code reasoning.</required_agent_intake>",
         f"{indent}  <mode>{html.escape(str(packet['mode']))}</mode>",
         f"{indent}  <head_sha>{html.escape(str(target_state.get('head_sha') or ''))}</head_sha>",
         f"{indent}  <token_budget>{html.escape(str(packet.get('token_budget') or DEFAULT_TOKEN_BUDGET))}</token_budget>",
@@ -2387,10 +2574,37 @@ def render_required_intake(packet: dict[str, object]) -> str:
         )
     if not any(isinstance(target, dict) for target in targets[:5]):
         lines.append("- none")
+    coverage_plan = packet.get("coverage_plan")
+    coverage_plan = coverage_plan if isinstance(coverage_plan, dict) else {}
+    areas = coverage_plan.get("areas")
+    areas = areas if isinstance(areas, list) else []
+    lines.append(
+        "coverage_plan: "
+        f"required={str(bool(coverage_plan.get('required'))).lower()} "
+        f"delegation_required={str(bool(coverage_plan.get('delegation_required'))).lower()}"
+    )
+    for area in areas[:6]:
+        if not isinstance(area, dict):
+            continue
+        files = area.get("files")
+        file_text = ",".join(str(path) for path in files[:4]) if isinstance(files, list) else ""
+        lines.append(
+            "- "
+            f"{area.get('id') or 'area'} | "
+            f"kind={area.get('kind') or 'unknown'} | "
+            f"files={file_text} | "
+            f"must_answer={area.get('must_answer') or ''}"
+        )
+    if not areas:
+        lines.append("- none")
+    lines.append("critical_area_steps:")
+    for step in CRITICAL_AREA_STEPS:
+        lines.append(f"- {step}")
     lines.extend(
         [
             "required_behavior:",
             "- Report this intake before code reasoning, review findings, edits, or GitNexus claims.",
+            "- Satisfy coverage_plan, including required delegation when available, before GitNexus calls, GitHub review comments, review findings, or edits.",
             "- Run the listed gitnexus_required_checks first; they are the initial GitNexus validation scoped to the SoulForge packet and reindexed GitNexus repo.",
             "- Use packet targets plus live base...HEAD, dirty worktree, or intent surface according to packet mode.",
             "- Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",
@@ -2430,6 +2644,7 @@ def render_compact_prompt(packet: dict[str, object]) -> str:
     source_status = packet.get("source_status") or {}
     soulforge = packet.get("soulforge") or {}
     semantic = packet.get("semantic_summaries") or {}
+    coverage_plan = packet.get("coverage_plan") or {}
     assert isinstance(target_state, dict)
     assert isinstance(gitnexus, dict)
     assert isinstance(source_status, dict)
@@ -2474,6 +2689,9 @@ def render_compact_prompt(packet: dict[str, object]) -> str:
     lines.extend([
         "    </source_counts>",
         "  </semantic_summaries>",
+    ])
+    lines.extend(render_coverage_plan_lines(coverage_plan, "  "))
+    lines.extend([
         "  <gitnexus_status>",
         f"    <status>{html.escape(str(gitnexus.get('status') or 'unknown'))}</status>",
         f"    <repo>{html.escape(str(gitnexus.get('repo') or ''))}</repo>",
@@ -2519,6 +2737,7 @@ def render_prompt(packet: dict[str, object]) -> str:
     semantic = packet.get("semantic_summaries") or {}
     source_status = packet.get("source_status") or {}
     policy = packet.get("policy") or {}
+    coverage_plan = packet.get("coverage_plan") or {}
     assert isinstance(target_state, dict)
     assert isinstance(gitnexus, dict)
     assert isinstance(soulforge, dict)
@@ -2629,6 +2848,9 @@ def render_prompt(packet: dict[str, object]) -> str:
     lines.extend([
         "    </source_counts>",
         "  </semantic_summaries>",
+    ])
+    lines.extend(render_coverage_plan_lines(coverage_plan, "  "))
+    lines.extend([
         "  <gitnexus_status>",
         f"    <status>{html.escape(str(gitnexus.get('status') or 'unknown'))}</status>",
         f"    <repo>{html.escape(str(gitnexus.get('repo') or ''))}</repo>",
@@ -2649,6 +2871,7 @@ def render_prompt(packet: dict[str, object]) -> str:
         "    Use files under <targets> as the first-pass edit/review surface.",
         "    Use <soulforge_impact> as native repo-map blast radius before file edits.",
         "    Use <gitnexus_status><repo> for every GitNexus MCP call for this packet.",
+        "    Satisfy coverage_plan, including required delegation when available, before GitNexus calls, GitHub review comments, review findings, or edits.",
         "    Run the listed <gitnexus_required_checks> first as the initial GitNexus validation after SoulForge and reindex.",
         "    Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",
         "    Treat source dirty overlaps as warnings, not PR target files, when mode is pr.",
