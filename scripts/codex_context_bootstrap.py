@@ -39,6 +39,27 @@ def has_pr_changes(repo: Path, base_ref: str, head_ref: str) -> bool:
     return bool(git_output(repo, ["diff", "--name-only", f"{base_ref}...{head_ref}"]))
 
 
+def context_surface_paths(git_state: forge.GitState) -> list[str]:
+    return [
+        path
+        for path in forge.unique_ordered(
+            [
+                *git_state.pr_files,
+                *git_state.staged_files,
+                *git_state.unstaged_files,
+                *git_state.untracked_files,
+            ]
+        )
+        if not forge.is_generated_or_cache_path(path)
+    ]
+
+
+def is_user_worktree(path: str, cache_dir: Path) -> bool:
+    resolved = Path(path).resolve()
+    cache_root = cache_dir.resolve()
+    return resolved != cache_root and cache_root not in resolved.parents
+
+
 def choose_mode(
     repo: Path,
     requested_mode: str,
@@ -50,7 +71,7 @@ def choose_mode(
         return requested_mode  # type: ignore[return-value]
     if base_ref and has_pr_changes(repo, base_ref, head_ref):
         return "pr"
-    if forge.is_dirty(repo):
+    if forge.is_dirty(repo, ignore_tool_cache=True):
         return "local"
     if intent:
         return "intent"
@@ -67,15 +88,7 @@ def should_block_empty_checkout(
     if mode == "pr":
         return None
     git_state = forge.read_git_state(repo, base_ref or head_ref, head_ref)
-    has_any_surface = any(
-        [
-            git_state.pr_files,
-            git_state.staged_files,
-            git_state.unstaged_files,
-            git_state.untracked_files,
-            intent,
-        ]
-    )
+    has_any_surface = bool(context_surface_paths(git_state) or intent)
     if has_any_surface:
         return None
     if forge.is_detached(repo):
@@ -128,6 +141,7 @@ def main(argv: list[str]) -> int:
                     item
                     for item in forge.worktree_suggestions(root)
                     if item.get("path") != str(root)
+                    and is_user_worktree(item.get("path", ""), args.cache_dir)
                 ],
             )
             forge.output_text(forge.render_prompt(packet), args.out)

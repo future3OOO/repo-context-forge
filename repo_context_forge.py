@@ -191,13 +191,14 @@ def filter_tool_cache_dirty_paths(paths: Iterable[str]) -> list[str]:
     return [
         path
         for path in paths
-        if path != ".soulforge" and not path.startswith(".soulforge/")
+        if path not in {".soulforge", ".codex"}
+        and not path.startswith((".soulforge/", ".codex/"))
     ]
 
 
 def is_generated_or_cache_path(path: str) -> bool:
     parts = path.split("/")
-    if ".soulforge" in parts or "__pycache__" in parts:
+    if ".soulforge" in parts or ".codex" in parts or "__pycache__" in parts:
         return True
     return path.endswith((".pyc", ".pyo")) or path.startswith(".git/")
 
@@ -462,22 +463,121 @@ def safe_rmtree(path: Path, cache_root: Path) -> None:
     shutil.rmtree(resolved)
 
 
+def require_cache_path(path: Path, cache_root: Path) -> Path:
+    resolved = path.resolve()
+    root = cache_root.resolve()
+    if root not in resolved.parents and resolved != root:
+        raise RuntimeError(f"refusing cache operation outside cache root: {resolved}")
+    return resolved
+
+
+def repo_relative_path(path: str) -> Path:
+    relative = Path(path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise RuntimeError(f"unsafe repository path: {path}")
+    return relative
+
+
+def source_worktree_files(repo: Path) -> list[str]:
+    tracked = split_lines(run_git(repo, ["ls-files"], allow_fail=True))
+    untracked = split_lines(
+        run_git(repo, ["ls-files", "--others", "--exclude-standard"], allow_fail=True)
+    )
+    return [
+        path
+        for path in unique_ordered([*tracked, *untracked])
+        if not is_generated_or_cache_path(path)
+    ]
+
+
+def locally_deleted_files(repo: Path) -> list[str]:
+    unstaged = split_lines(
+        run_git(repo, ["diff", "--name-only", "--diff-filter=D"], allow_fail=True)
+    )
+    staged = split_lines(
+        run_git(repo, ["diff", "--name-only", "--cached", "--diff-filter=D"], allow_fail=True)
+    )
+    return [
+        path
+        for path in unique_ordered([*unstaged, *staged])
+        if not is_generated_or_cache_path(path)
+    ]
+
+
+def remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        path.unlink()
+
+
+def reset_cached_worktree(worktree: Path, cache_dir: Path) -> None:
+    require_cache_path(worktree, cache_dir)
+    run_git(worktree, ["reset", "--hard", "HEAD"])
+    run_git(worktree, ["clean", "-fd"])
+    soulforge_cache = worktree / ".soulforge"
+    if os.path.lexists(soulforge_cache):
+        require_cache_path(soulforge_cache, cache_dir)
+        remove_path(soulforge_cache)
+
+
+def overlay_source_worktree(source_repo: Path, analysis_repo: Path) -> None:
+    for path in locally_deleted_files(source_repo):
+        target = analysis_repo / repo_relative_path(path)
+        remove_path(target)
+
+    for path in source_worktree_files(source_repo):
+        relative = repo_relative_path(path)
+        source = source_repo / relative
+        target = analysis_repo / relative
+        if not os.path.lexists(source):
+            remove_path(target)
+            continue
+        if source.is_dir() and not source.is_symlink():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        remove_path(target)
+        shutil.copy2(source, target, follow_symlinks=False)
+
+
+def checkout_uses_external_git_dir(checkout: Path) -> bool:
+    raw = run_git(checkout, ["rev-parse", "--git-common-dir"], allow_fail=True)
+    if not raw:
+        return True
+    common_dir = Path(raw)
+    if not common_dir.is_absolute():
+        common_dir = checkout / common_dir
+    common_dir = common_dir.resolve()
+    checkout = checkout.resolve()
+    return checkout not in common_dir.parents and common_dir != checkout
+
+
+def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cache_dir: Path) -> None:
+    require_cache_path(checkout.parent, cache_dir)
+    if checkout.exists():
+        remove_checkout = True
+        if is_git_repo(checkout) and not checkout_uses_external_git_dir(checkout):
+            existing_sha = run_git(checkout, ["rev-parse", "HEAD"], allow_fail=True)
+            remove_checkout = existing_sha != head_sha
+        if remove_checkout:
+            safe_rmtree(checkout, cache_dir)
+
+    if not checkout.exists():
+        checkout.parent.mkdir(parents=True, exist_ok=True)
+        run_cmd(
+            ["git", "clone", "--no-checkout", "--shared", str(source_repo), str(checkout)]
+        )
+
+    run_git(checkout, ["reset", "--hard", "HEAD"], allow_fail=True)
+    run_git(checkout, ["checkout", "--detach", head_sha])
+
+
 def ensure_pr_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
     head_sha = run_git(source_repo, ["rev-parse", head_ref])
     key = cache_key_for(source_repo, head_sha)
     worktree = (cache_dir / "worktrees" / f"{source_repo.name}-{head_sha[:12]}-{key}").resolve()
 
-    if worktree.exists():
-        existing_sha = run_git(worktree, ["rev-parse", "HEAD"], allow_fail=True)
-        if existing_sha != head_sha:
-            run_git(source_repo, ["worktree", "remove", "--force", str(worktree)], allow_fail=True)
-            if worktree.exists():
-                safe_rmtree(worktree, cache_dir)
-
-    if not worktree.exists():
-        worktree.parent.mkdir(parents=True, exist_ok=True)
-        run_git(source_repo, ["worktree", "add", "--detach", str(worktree), head_sha])
-
+    ensure_cached_checkout(source_repo, head_sha, worktree, cache_dir)
     cleanup_soulforge_gitignore_change(worktree)
     target_dirty = is_dirty(worktree, ignore_tool_cache=True)
     if target_dirty:
@@ -490,8 +590,34 @@ def ensure_pr_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> Tar
         base_ref="",
         head_ref=head_ref,
         head_sha=head_sha,
-        source_dirty=is_dirty(source_repo),
+        source_dirty=is_dirty(source_repo, ignore_tool_cache=True),
         target_dirty=target_dirty,
+        cache_key=key,
+    )
+
+
+def ensure_local_analysis_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
+    head_sha = run_git(source_repo, ["rev-parse", head_ref])
+    key = cache_key_for(source_repo, head_sha, "local-analysis")
+    worktree = (
+        cache_dir / "analysis-worktrees" / f"{source_repo.name}-{head_sha[:12]}-{key}"
+    ).resolve()
+
+    ensure_cached_checkout(source_repo, head_sha, worktree, cache_dir)
+    reset_cached_worktree(worktree, cache_dir)
+    overlay_source_worktree(source_repo, worktree)
+    cleanup_soulforge_gitignore_change(worktree)
+
+    source_dirty = is_dirty(source_repo, ignore_tool_cache=True)
+    return TargetState(
+        mode="local",
+        source_repo=source_repo,
+        analysis_repo=worktree,
+        base_ref="",
+        head_ref=head_ref,
+        head_sha=head_sha,
+        source_dirty=source_dirty,
+        target_dirty=source_dirty,
         cache_key=key,
     )
 
@@ -518,17 +644,17 @@ def resolve_target_state(
             cache_key=target.cache_key,
         )
 
-    head_sha = run_git(source_repo, ["rev-parse", head_ref])
+    target = ensure_local_analysis_worktree(source_repo, head_ref, cache_dir)
     return TargetState(
         mode=mode,
-        source_repo=source_repo,
-        analysis_repo=source_repo,
+        source_repo=target.source_repo,
+        analysis_repo=target.analysis_repo,
         base_ref=base_ref,
         head_ref=head_ref,
-        head_sha=head_sha,
-        source_dirty=is_dirty(source_repo),
-        target_dirty=is_dirty(source_repo),
-        cache_key=None,
+        head_sha=target.head_sha,
+        source_dirty=target.source_dirty,
+        target_dirty=target.target_dirty,
+        cache_key=target.cache_key,
     )
 
 
@@ -1194,8 +1320,8 @@ def make_blocker_packet(
             "base_ref": base_ref or "",
             "head_ref": head_ref,
             "head_sha": head_sha,
-            "source_dirty": is_dirty(source_repo),
-            "target_dirty": is_dirty(source_repo),
+            "source_dirty": is_dirty(source_repo, ignore_tool_cache=True),
+            "target_dirty": is_dirty(source_repo, ignore_tool_cache=True),
             "cache_key": None,
             "detached": is_detached(source_repo),
         },
@@ -1227,8 +1353,8 @@ def make_blocker_packet(
             base_ref=base_ref or "",
             head_ref=head_ref,
             head_sha=head_sha,
-            source_dirty=is_dirty(source_repo),
-            target_dirty=is_dirty(source_repo),
+            source_dirty=is_dirty(source_repo, ignore_tool_cache=True),
+            target_dirty=is_dirty(source_repo, ignore_tool_cache=True),
             cache_key=None,
         ), source_repo.name),
         "gitnexus_plan": [],
@@ -1260,7 +1386,8 @@ def make_packet(
         map_build,
         map_timeout_ms,
     )
-    if mode == "pr" or not gitignore_dirty_before_build:
+    can_cleanup_analysis = target_state.analysis_repo.resolve() != target_state.source_repo.resolve()
+    if can_cleanup_analysis and (mode == "pr" or not gitignore_dirty_before_build):
         cleanup_soulforge_gitignore_change(target_state.analysis_repo)
     soul_map = SoulForgeMap(target_state.analysis_repo)
     if not soul_map.available and not allow_missing_map:
@@ -1288,9 +1415,9 @@ def make_packet(
     if build_result.warning:
         warnings.append(build_result.warning)
     if mode == "pr" and target_state.source_dirty:
-        warnings.append("source worktree is dirty; PR target map was built from clean cached worktree")
+        warnings.append("source worktree is dirty; PR target map was built from clean cached checkout")
     if mode != "pr" and target_state.target_dirty:
-        warnings.append("analysis uses dirty local worktree by design")
+        warnings.append("analysis uses dirty local files copied into cached checkout by design")
     if mode == "intent" and not targets:
         warnings.append("intent mode found no targets; refine --intent or build a map")
 

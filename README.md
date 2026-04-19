@@ -36,9 +36,11 @@ worktree suggestions instead of pretending there is useful local context.
 
 ## What It Does
 
-- `pr` mode creates or reuses a clean cached git worktree at the target head.
-- `local` mode analyzes the current dirty worktree and marks dirty state.
-- `intent` mode searches the ambient map from a user-described change request.
+- `pr` mode creates or reuses a clean cached git checkout at the target head.
+- `local` mode copies dirty local files into a cached analysis checkout and
+  marks dirty state.
+- `intent` mode searches a cached analysis map from a user-described change
+  request.
 - native ranking combines changed hunks, production/test role, PageRank,
   SoulForge graph neighbors, co-change partners, semantic summaries, and task
   refresh signals.
@@ -137,11 +139,13 @@ when testing failure paths or no-map baselines.
 ## Production Contract
 
 For PR review, use `mode=pr`. It builds/reads the map from a clean cached target
-worktree, not the dirty root checkout.
+checkout, not the dirty root checkout.
 
 For active implementation before a PR exists, use `mode=local` or `mode=intent`.
-These modes intentionally use ambient current-worktree context and mark dirty
-state in the packet.
+These modes intentionally use ambient current-worktree context, but SoulForge
+runs against a cached analysis checkout. The target repository is an input only:
+Repo Context Forge must not add `.soulforge`, edit `.gitignore`, or run cleanup
+checkouts in the source checkout.
 
 GitNexus is not replaced by this tool. The packet tells the agent which GitNexus
 context and impact checks must run after the target map has been injected.

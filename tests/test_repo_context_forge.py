@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -32,6 +33,16 @@ install_local_plugin = load_module(
 
 
 class RepoContextForgeTests(unittest.TestCase):
+    def make_git_repo(self, root: Path) -> None:
+        repo_context_forge.run_cmd(["git", "init"], cwd=root)
+        repo_context_forge.run_cmd(["git", "config", "user.email", "test@example.com"], cwd=root)
+        repo_context_forge.run_cmd(["git", "config", "user.name", "Test User"], cwd=root)
+        (root / ".gitignore").write_text("*.log\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "a.py").write_text("print('clean')\n", encoding="utf-8")
+        repo_context_forge.run_cmd(["git", "add", ".gitignore", "src/a.py"], cwd=root)
+        repo_context_forge.run_cmd(["git", "commit", "-m", "initial"], cwd=root)
+
     def test_unique_sorted_deduplicates_and_sorts(self) -> None:
         self.assertEqual(
             repo_context_forge.unique_sorted(["b.py", "a.py", "b.py", ""]),
@@ -283,7 +294,7 @@ class RepoContextForgeTests(unittest.TestCase):
     def test_dirty_paths_can_ignore_tool_cache(self) -> None:
         self.assertEqual(
             repo_context_forge.filter_tool_cache_dirty_paths(
-                [".soulforge/repomap.db", ".soulforge", "src/app.py"]
+                [".soulforge/repomap.db", ".soulforge", ".codex", "src/app.py"]
             ),
             ["src/app.py"],
         )
@@ -293,6 +304,81 @@ class RepoContextForgeTests(unittest.TestCase):
             repo_context_forge.parse_porcelain_paths(" M .gitignore\n?? .soulforge/repomap.db\n"),
             [".gitignore", ".soulforge/repomap.db"],
         )
+
+    def test_local_analysis_worktree_overlays_dirty_files_without_tool_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "a.py").write_text("print('dirty')\n", encoding="utf-8")
+            (repo / "src" / "b.py").write_text("print('untracked')\n", encoding="utf-8")
+            (repo / ".soulforge").mkdir()
+            (repo / ".soulforge" / "repomap.db").write_text("cache", encoding="utf-8")
+
+            state = repo_context_forge.ensure_local_analysis_worktree(
+                repo,
+                "HEAD",
+                Path(cache_dir),
+            )
+
+            self.assertNotEqual(state.analysis_repo, repo)
+            self.assertEqual(
+                (state.analysis_repo / "src" / "a.py").read_text(encoding="utf-8"),
+                "print('dirty')\n",
+            )
+            self.assertEqual(
+                (state.analysis_repo / "src" / "b.py").read_text(encoding="utf-8"),
+                "print('untracked')\n",
+            )
+            self.assertFalse((state.analysis_repo / ".soulforge" / "repomap.db").exists())
+            self.assertTrue(state.source_dirty)
+            self.assertTrue(state.target_dirty)
+            worktrees = repo_context_forge.run_git(repo, ["worktree", "list", "--porcelain"])
+            self.assertNotIn(str(state.analysis_repo), worktrees)
+            common_dir = repo_context_forge.run_git(
+                state.analysis_repo,
+                ["rev-parse", "--git-common-dir"],
+            )
+            self.assertEqual(common_dir, ".git")
+
+    def test_make_packet_runs_soulforge_build_outside_source_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "a.py").write_text("print('dirty')\n", encoding="utf-8")
+            original_builder = repo_context_forge.build_soulforge_map
+
+            def fake_builder(
+                analysis_repo: Path,
+                _soulforge_bin: str | None,
+                _build_mode: repo_context_forge.MapBuildMode,
+                _timeout_ms: int,
+            ) -> repo_context_forge.MapBuildResult:
+                with (analysis_repo / ".gitignore").open("a", encoding="utf-8") as gitignore:
+                    gitignore.write(".soulforge\n")
+                return repo_context_forge.MapBuildResult(True, [], 0, "", "", None)
+
+            repo_context_forge.build_soulforge_map = fake_builder
+            try:
+                packet = repo_context_forge.make_packet(
+                    repo,
+                    mode="local",
+                    base_ref="HEAD",
+                    head_ref="HEAD",
+                    intent=None,
+                    top=5,
+                    token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET,
+                    cache_dir=Path(cache_dir),
+                    soulforge_bin=None,
+                    map_build="always",
+                    map_timeout_ms=1,
+                    allow_missing_map=True,
+                    gitnexus_repo=None,
+                )
+            finally:
+                repo_context_forge.build_soulforge_map = original_builder
+
+            self.assertEqual((repo / ".gitignore").read_text(encoding="utf-8"), "*.log\n")
+            self.assertNotEqual(packet["target_state"]["analysis_repo"], str(repo))
 
     def test_blocker_prompt_renders_worktree_suggestions(self) -> None:
         packet = {
@@ -354,6 +440,54 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertEqual(
             reason,
             "detached checkout has no target surface; select the active PR worktree",
+        )
+
+    def test_bootstrap_ignores_tool_cache_as_context_surface(self) -> None:
+        state = repo_context_forge.GitState(
+            branch="(detached)",
+            head="abc123",
+            base_ref="origin/main",
+            merge_base="base",
+            pr_files=[],
+            staged_files=[],
+            unstaged_files=[],
+            untracked_files=[".soulforge/repomap.db", ".codex"],
+        )
+        original_read_git_state = codex_context_bootstrap.forge.read_git_state
+        original_is_detached = codex_context_bootstrap.forge.is_detached
+        codex_context_bootstrap.forge.read_git_state = lambda *_args, **_kwargs: state
+        codex_context_bootstrap.forge.is_detached = lambda _repo: True
+        try:
+            reason = codex_context_bootstrap.should_block_empty_checkout(
+                Path("/repo"),
+                "local",
+                "origin/main",
+                "HEAD",
+                None,
+            )
+        finally:
+            codex_context_bootstrap.forge.read_git_state = original_read_git_state
+            codex_context_bootstrap.forge.is_detached = original_is_detached
+
+        self.assertEqual(
+            reason,
+            "detached checkout has no target surface; select the active PR worktree",
+        )
+
+    def test_bootstrap_filters_cache_worktree_suggestions(self) -> None:
+        cache_dir = Path("/home/user/.cache/repo-context-forge")
+
+        self.assertFalse(
+            codex_context_bootstrap.is_user_worktree(
+                "/home/user/.cache/repo-context-forge/worktrees/repo-head",
+                cache_dir,
+            )
+        )
+        self.assertTrue(
+            codex_context_bootstrap.is_user_worktree(
+                "/home/user/worktrees/repo-feature",
+                cache_dir,
+            )
         )
 
     def test_cache_key_is_stable(self) -> None:
@@ -432,7 +566,27 @@ class RepoContextForgeTests(unittest.TestCase):
 
     def test_bootstrap_auto_mode_prefers_intent_when_clean_without_base(self) -> None:
         original_is_dirty = codex_context_bootstrap.forge.is_dirty
-        codex_context_bootstrap.forge.is_dirty = lambda _repo: False
+        codex_context_bootstrap.forge.is_dirty = lambda _repo, **_kwargs: False
+        try:
+            mode = codex_context_bootstrap.choose_mode(
+                Path("/repo"),
+                "auto",
+                None,
+                "HEAD",
+                "add draft preservation",
+            )
+        finally:
+            codex_context_bootstrap.forge.is_dirty = original_is_dirty
+
+        self.assertEqual(mode, "intent")
+
+    def test_bootstrap_auto_mode_ignores_tool_cache_dirty_for_intent(self) -> None:
+        original_is_dirty = codex_context_bootstrap.forge.is_dirty
+
+        def fake_is_dirty(_repo: Path, *, ignore_tool_cache: bool = False) -> bool:
+            return not ignore_tool_cache
+
+        codex_context_bootstrap.forge.is_dirty = fake_is_dirty
         try:
             mode = codex_context_bootstrap.choose_mode(
                 Path("/repo"),

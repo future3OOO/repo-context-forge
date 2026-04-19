@@ -44,6 +44,10 @@ The bootstrap script auto-selects the mode:
 - `intent`: pass `--intent "<user request>"` when there are no changes yet and
   the user's request describes planned work
 
+Local and intent packets are generated from a cached analysis checkout. Treat
+the user's checkout as read-only input; Repo Context Forge must not leave
+`.soulforge` or `.gitignore` changes in it.
+
 Detached clean checkouts with no target surface are blockers in production mode.
 Use the packet's worktree suggestions or an explicit user-provided checkout
 instead of guessing.

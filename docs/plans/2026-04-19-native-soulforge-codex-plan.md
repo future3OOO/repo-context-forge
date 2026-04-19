@@ -138,7 +138,7 @@ Required behavior:
   packet and exit non-zero
 - if sibling git worktrees exist for the same repo, list likely active branches
   and paths in the blocker packet
-- PR mode must always map a clean cached target worktree
+- PR mode must always map a clean cached target checkout
 - local/intent mode must clearly mark dirty state
 - `.soulforge` files must never appear in targets
 - the bootstrap must write a packet file and print a short context summary for
@@ -476,7 +476,7 @@ Rules:
 - no fake semantic summaries
 - no generic plugin framework abstraction
 - no second package manager
-- no database writes outside cache or selected analysis worktree
+- no database writes outside cache or selected analysis checkout
 - keep each module below the point where tests become harder to read; extract
   only when behavior has a real boundary
 
@@ -586,5 +586,7 @@ General production:
 - packet generation is deterministic for the same repo state and task state
 - strict mode fails closed on ambiguous target state
 - generated caches are excluded from target files
+- SoulForge indexing and cleanup run in cache-owned analysis checkouts, never in
+  the user's source checkout
 - all touched behavior has unit tests and fixture smoke tests
 - no hidden manual command requirement remains in normal user workflow
