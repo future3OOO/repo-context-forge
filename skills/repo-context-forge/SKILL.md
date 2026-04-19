@@ -43,14 +43,14 @@ The bootstrap script auto-selects the mode:
 - `local`: dirty local work exists before a PR is pushed
 - `intent`: pass `--intent "<user request>"` when there are no changes yet and
   the user's request describes planned work
+- `repo`: clean current folder with no diff or intent; use whole-repo context
 
-Local and intent packets are generated from a cached analysis checkout. Treat
-the user's checkout as read-only input; Repo Context Forge must not leave
-`.soulforge` or `.gitignore` changes in it.
+Packets are generated from a cache-owned analysis checkout. Treat the user's
+checkout as read-only input; Repo Context Forge must not leave `.soulforge` or
+`.gitignore` changes in it.
 
-Detached clean checkouts with no target surface are blockers in production mode.
-Use the packet's worktree suggestions or an explicit user-provided checkout
-instead of guessing.
+Do not switch to a sibling worktree unless the user explicitly asks. The current
+git folder is the target.
 
 For a user-described implementation before edits, prefer:
 
@@ -64,8 +64,8 @@ For each `<check>` in `<gitnexus_required_checks>`:
 
 - `kind="symbol_context"` means call `gitnexus_context` for that symbol/file
 - `kind="symbol_impact"` means call `gitnexus_impact` upstream for that symbol
-- if GitNexus reports a stale or missing index, reindex or state the blocker
-  before trusting blast-radius claims
+- trust blast-radius claims only when `<gitnexus_status>` is `fresh` or
+  `reindexed` and `required_checks_resolved` is true
 
 ## Turn Refresh
 

@@ -25,14 +25,14 @@ The plugin startup path is:
 1. Codex loads `repo-context-forge`.
 2. The plugin skill runs `scripts/codex_context_bootstrap.py` for the current
    git repo.
-3. The bootstrap script auto-selects `pr`, `local`, or `intent` mode.
+3. The bootstrap script auto-selects `pr`, `local`, `intent`, or `repo` mode.
 4. The generated XML packet becomes the initial repo context for the task.
-5. Codex runs the packet's GitNexus checks before editing when GitNexus MCP is
-   available.
+5. GitNexus freshness is checked for the exact target head before blast-radius
+   claims are trusted.
 
-In production plugin mode, an ambiguous checkout fails closed. For example, a
-detached clean checkout with no PR diff emits a blocker packet with sibling
-worktree suggestions instead of pretending there is useful local context.
+In production plugin mode, the current git folder is the target. Clean folders
+with no diff use `repo` mode for whole-repo context. Repo Context Forge does not
+silently switch to sibling worktrees.
 
 ## What It Does
 
@@ -41,11 +41,15 @@ worktree suggestions instead of pretending there is useful local context.
   marks dirty state.
 - `intent` mode searches a cached analysis map from a user-described change
   request.
+- `repo` mode maps a clean current project folder for ambient whole-repo
+  context.
 - native ranking combines changed hunks, production/test role, PageRank,
   SoulForge graph neighbors, co-change partners, semantic summaries, and task
   refresh signals.
 - output can be Markdown, JSON, or an XML prompt packet for upstream injection.
 - packets include GitNexus required-check entries for context and impact calls.
+- packets include SoulForge target-head proof and GitNexus exact-head freshness
+  status.
 - `gitnexus-merge` merges real GitNexus findings and blocks stale blast-radius
   claims.
 - `wrap` writes the prompt packet and can pass it to another command before
@@ -130,6 +134,7 @@ python3 repo_context_forge.py wrap \
 --cache-dir ~/.cache/repo-context-forge
 --soulforge-bin /path/to/soulforge
 --gitnexus-repo fork_google_workspace_mcp
+--gitnexus-mode off|check|auto
 --format markdown|json|prompt
 ```
 
@@ -147,5 +152,10 @@ runs against a cached analysis checkout. The target repository is an input only:
 Repo Context Forge must not add `.soulforge`, edit `.gitignore`, or run cleanup
 checkouts in the source checkout.
 
-GitNexus is not replaced by this tool. The packet tells the agent which GitNexus
-context and impact checks must run after the target map has been injected.
+For clean exploration, use `mode=repo` or let the plugin bootstrap select it.
+
+GitNexus is not replaced by this tool. In `auto` mode, Repo Context Forge checks
+whether the GitNexus index matches the packet target head and reindexes the
+cache-owned analysis checkout when it is missing or stale. If GitNexus is still
+stale, unavailable, or missing required symbols, the packet blocks blast-radius
+confidence.

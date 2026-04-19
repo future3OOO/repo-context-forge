@@ -16,13 +16,15 @@ from pathlib import Path
 from typing import Iterable, Literal
 
 
-Mode = Literal["pr", "local", "intent"]
+Mode = Literal["pr", "local", "intent", "repo"]
 Scope = Literal["pr", "dirty", "all"]
 OutputFormat = Literal["markdown", "json", "prompt"]
 MapBuildMode = Literal["auto", "always", "never"]
+GitNexusMode = Literal["off", "check", "auto"]
 
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "repo-context-forge"
+GITNEXUS_REGISTRY = Path.home() / ".gitnexus" / "registry.json"
 DEFAULT_TOKEN_BUDGET = 2500
 MIN_TOKEN_BUDGET = 1500
 MAX_TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
@@ -569,7 +571,7 @@ def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cac
         )
 
     run_git(checkout, ["reset", "--hard", "HEAD"], allow_fail=True)
-    run_git(checkout, ["checkout", "--detach", head_sha])
+    run_git(checkout, ["checkout", "-B", "repo-context-forge-target", head_sha])
 
 
 def ensure_pr_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
@@ -587,6 +589,32 @@ def ensure_pr_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> Tar
         mode="pr",
         source_repo=source_repo,
         analysis_repo=worktree,
+        base_ref="",
+        head_ref=head_ref,
+        head_sha=head_sha,
+        source_dirty=is_dirty(source_repo, ignore_tool_cache=True),
+        target_dirty=target_dirty,
+        cache_key=key,
+    )
+
+
+def ensure_repo_analysis_checkout(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
+    head_sha = run_git(source_repo, ["rev-parse", head_ref])
+    key = cache_key_for(source_repo, head_sha, "repo-analysis")
+    checkout = (
+        cache_dir / "analysis-checkouts" / f"{source_repo.name}-{head_sha[:12]}-{key}"
+    ).resolve()
+
+    ensure_cached_checkout(source_repo, head_sha, checkout, cache_dir)
+    cleanup_soulforge_gitignore_change(checkout)
+    target_dirty = is_dirty(checkout, ignore_tool_cache=True)
+    if target_dirty:
+        raise RuntimeError(f"repo target checkout is dirty: {checkout}")
+
+    return TargetState(
+        mode="repo",
+        source_repo=source_repo,
+        analysis_repo=checkout,
         base_ref="",
         head_ref=head_ref,
         head_sha=head_sha,
@@ -632,6 +660,20 @@ def resolve_target_state(
     source_repo = repo_root(repo)
     if mode == "pr":
         target = ensure_pr_worktree(source_repo, head_ref, cache_dir)
+        return TargetState(
+            mode=target.mode,
+            source_repo=target.source_repo,
+            analysis_repo=target.analysis_repo,
+            base_ref=base_ref,
+            head_ref=head_ref,
+            head_sha=target.head_sha,
+            source_dirty=target.source_dirty,
+            target_dirty=target.target_dirty,
+            cache_key=target.cache_key,
+        )
+
+    if mode == "repo":
+        target = ensure_repo_analysis_checkout(source_repo, head_ref, cache_dir)
         return TargetState(
             mode=target.mode,
             source_repo=target.source_repo,
@@ -985,6 +1027,12 @@ def target_files_for_mode(
             for path in selected_files(source_git_state, "all")
             if not is_generated_or_cache_path(path)
         ][:top]
+    if mode == "repo":
+        return [
+            entry.path
+            for entry in soul_map.top_files(top)
+            if not is_generated_or_cache_path(entry.path)
+        ]
     tokens = tokenize_intent(intent or "")
     return [
         path
@@ -1130,7 +1178,7 @@ def make_target_entries(
         scope: Scope = "pr" if mode == "pr" else "dirty"
         ranges = (
             diff_ranges_for_file(source_repo, base_ref, scope, path, head_ref=head_ref)
-            if mode != "intent"
+            if mode not in {"intent", "repo"}
             else []
         )
         symbols = soul_map.symbols_for_file(path, limit=80)
@@ -1219,8 +1267,9 @@ def build_gitnexus_section(
     plan: list[dict[str, str]],
     target_state: TargetState,
     repo_name: str | None,
+    status: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    section = {
         "status": "planned",
         "repo": repo_name or target_state.source_repo.name,
         "expected_repo_path": str(target_state.analysis_repo),
@@ -1228,6 +1277,203 @@ def build_gitnexus_section(
         "stale_index_policy": "block_or_reindex_before_trusting_impact",
         "plan": plan,
     }
+    if status:
+        section.update(status)
+    return section
+
+
+def analysis_repo_is_cache_owned(path: Path, cache_dir: Path) -> bool:
+    resolved = path.resolve()
+    cache_root = cache_dir.resolve()
+    return resolved == cache_root or cache_root in resolved.parents
+
+
+def soulforge_target_metadata(
+    target_state: TargetState,
+    build_result: MapBuildResult,
+    soul_map: SoulForgeMap,
+    cache_dir: Path,
+) -> dict[str, object]:
+    analysis_head = run_git(target_state.analysis_repo, ["rev-parse", "HEAD"], allow_fail=True)
+    db_exists = soul_map.db_path.exists()
+    db_mtime = soul_map.db_path.stat().st_mtime if db_exists else None
+    head_matches = analysis_head == target_state.head_sha
+    if build_result.warning:
+        status = "failed" if build_result.attempted else "missing"
+    elif db_exists and head_matches:
+        status = "fresh"
+    elif not db_exists:
+        status = "missing"
+    else:
+        status = "unknown"
+    return {
+        "status": status,
+        "target_head_verified": status == "fresh",
+        "source_head_sha": target_state.head_sha,
+        "analysis_head_sha": analysis_head,
+        "analysis_repo_is_cache_owned": analysis_repo_is_cache_owned(
+            target_state.analysis_repo,
+            cache_dir,
+        ),
+        "analysis_head_matches_source_head": head_matches,
+        "db_path": str(soul_map.db_path),
+        "db_exists": db_exists,
+        "db_mtime": db_mtime,
+        "build_attempted": build_result.attempted,
+        "build_returncode": build_result.returncode,
+    }
+
+
+def read_gitnexus_registry(registry_path: Path = GITNEXUS_REGISTRY) -> list[dict[str, object]]:
+    if not registry_path.exists():
+        return []
+    try:
+        raw = json.loads(registry_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"GitNexus registry is not valid JSON: {registry_path}") from exc
+    if not isinstance(raw, list):
+        raise RuntimeError(f"GitNexus registry must contain a list: {registry_path}")
+    return [entry for entry in raw if isinstance(entry, dict)]
+
+
+def find_gitnexus_entry(
+    analysis_repo: Path,
+    repo_name: str | None,
+    *,
+    registry_path: Path = GITNEXUS_REGISTRY,
+) -> dict[str, object] | None:
+    entries = read_gitnexus_registry(registry_path)
+    resolved = str(analysis_repo.resolve())
+    for entry in entries:
+        if str(entry.get("path") or "") == resolved:
+            return entry
+    if repo_name:
+        for entry in entries:
+            if entry.get("name") == repo_name and str(entry.get("path") or "") == resolved:
+                return entry
+    return None
+
+
+def gitnexus_status_from_entry(
+    entry: dict[str, object] | None,
+    target_state: TargetState,
+    repo_name: str,
+) -> dict[str, object]:
+    indexed_head = str(entry.get("lastCommit") or "") if entry else ""
+    if entry and not indexed_head:
+        indexed_path = Path(str(entry.get("path") or ""))
+        if indexed_path.resolve() == target_state.analysis_repo.resolve():
+            indexed_head = run_git(indexed_path, ["rev-parse", "HEAD"], allow_fail=True)
+    return {
+        "repo": str(entry.get("name") or repo_name) if entry else repo_name,
+        "expected_repo_path": str(target_state.analysis_repo),
+        "expected_head_sha": target_state.head_sha,
+        "indexed_head_sha": indexed_head,
+        "indexed_at": str(entry.get("indexedAt") or "") if entry else "",
+        "index_path": str(entry.get("storagePath") or "") if entry else "",
+        "index_fresh": indexed_head == target_state.head_sha,
+    }
+
+
+def ensure_gitnexus_index(
+    target_state: TargetState,
+    repo_name: str | None,
+    mode: GitNexusMode,
+    *,
+    registry_path: Path = GITNEXUS_REGISTRY,
+    gitnexus_bin: str | None = None,
+) -> dict[str, object]:
+    chosen_repo_name = repo_name or target_state.analysis_repo.name
+    if mode == "off":
+        return {
+            "status": "disabled",
+            "repo": chosen_repo_name,
+            "expected_repo_path": str(target_state.analysis_repo),
+            "expected_head_sha": target_state.head_sha,
+            "reindex_attempted": False,
+            "required_checks_resolved": False,
+        }
+
+    binary = gitnexus_bin or shutil.which("gitnexus")
+    if not binary:
+        return {
+            "status": "unavailable",
+            "repo": chosen_repo_name,
+            "expected_repo_path": str(target_state.analysis_repo),
+            "expected_head_sha": target_state.head_sha,
+            "reindex_attempted": False,
+            "required_checks_resolved": False,
+            "warning": "GitNexus binary not found; blast-radius claims are blocked",
+        }
+
+    entry = find_gitnexus_entry(target_state.analysis_repo, chosen_repo_name, registry_path=registry_path)
+    status = gitnexus_status_from_entry(entry, target_state, chosen_repo_name)
+    if status["index_fresh"]:
+        status.update({"status": "fresh", "reindex_attempted": False})
+        return status
+
+    if mode != "auto":
+        status.update({"status": "blocked", "reindex_attempted": False})
+        return status
+
+    proc = run_cmd(
+        [binary, "analyze", "--force", "--skip-agents-md", str(target_state.analysis_repo)],
+        allow_fail=True,
+    )
+    entry = find_gitnexus_entry(target_state.analysis_repo, chosen_repo_name, registry_path=registry_path)
+    status = gitnexus_status_from_entry(entry, target_state, chosen_repo_name)
+    status["reindex_attempted"] = True
+    status["reindex_returncode"] = proc.returncode
+    if proc.returncode != 0:
+        status["status"] = "blocked"
+        status["warning"] = "GitNexus reindex failed; blast-radius claims are blocked"
+        status["stderr"] = proc.stderr[-2000:]
+        return status
+    if status["index_fresh"]:
+        status["status"] = "reindexed"
+        return status
+    status["status"] = "blocked"
+    status["warning"] = "GitNexus index is still stale after reindex; blast-radius claims are blocked"
+    return status
+
+
+def verify_gitnexus_required_checks(
+    plan: list[dict[str, str]],
+    gitnexus_status: dict[str, object],
+    *,
+    gitnexus_bin: str | None = None,
+) -> dict[str, object]:
+    if gitnexus_status.get("status") not in {"fresh", "reindexed"}:
+        gitnexus_status["required_checks_resolved"] = False
+        return gitnexus_status
+
+    binary = gitnexus_bin or shutil.which("gitnexus")
+    if not binary:
+        gitnexus_status["status"] = "unavailable"
+        gitnexus_status["required_checks_resolved"] = False
+        return gitnexus_status
+
+    repo_name = str(gitnexus_status["repo"])
+    missing: list[str] = []
+    checked: list[str] = []
+    for item in plan:
+        if item.get("kind") != "symbol_context":
+            continue
+        symbol = item.get("target")
+        if not symbol or symbol in checked:
+            continue
+        checked.append(symbol)
+        proc = run_cmd([binary, "context", "-r", repo_name, symbol], allow_fail=True)
+        if proc.returncode != 0:
+            missing.append(symbol)
+
+    gitnexus_status["checked_required_symbols"] = checked
+    gitnexus_status["missing_required_symbols"] = missing
+    gitnexus_status["required_checks_resolved"] = not missing
+    if missing:
+        gitnexus_status["status"] = "blocked"
+        gitnexus_status["warning"] = "GitNexus could not resolve required symbols; blast-radius claims are blocked"
+    return gitnexus_status
 
 
 def apply_gitnexus_findings(
@@ -1377,6 +1623,7 @@ def make_packet(
     allow_missing_map: bool,
     gitnexus_repo: str | None,
     task_state: dict[str, object] | None = None,
+    gitnexus_mode: GitNexusMode = "off",
 ) -> dict[str, object]:
     target_state = resolve_target_state(repo, mode, base_ref, head_ref, cache_dir)
     gitignore_dirty_before_build = ".gitignore" in dirty_paths(target_state.analysis_repo)
@@ -1395,6 +1642,12 @@ def make_packet(
             "SoulForge map is required but unavailable for "
             f"{target_state.analysis_repo}. Use --allow-missing-map to continue without it."
         )
+    soulforge_target = soulforge_target_metadata(
+        target_state,
+        build_result,
+        soul_map,
+        cache_dir,
+    )
 
     source_git_state = read_git_state(target_state.source_repo, base_ref, head_ref)
     targets = target_files_for_mode(mode, source_git_state, soul_map, intent, top)
@@ -1409,23 +1662,33 @@ def make_packet(
         targets=targets,
     )
     target_entries = apply_task_state_to_entries(target_entries, task_state)
-    plan = build_gitnexus_plan(target_entries, gitnexus_repo)
+    gitnexus_status = ensure_gitnexus_index(target_state, gitnexus_repo, gitnexus_mode)
+    gitnexus_repo_name = str(gitnexus_status.get("repo") or gitnexus_repo or target_state.analysis_repo.name)
+    plan = build_gitnexus_plan(target_entries, gitnexus_repo_name)
+    gitnexus_status = verify_gitnexus_required_checks(plan, gitnexus_status)
 
     warnings = []
     if build_result.warning:
         warnings.append(build_result.warning)
+    if not soulforge_target.get("target_head_verified"):
+        warnings.append("SoulForge target head could not be verified")
+    gitnexus_warning = gitnexus_status.get("warning")
+    if gitnexus_warning:
+        warnings.append(str(gitnexus_warning))
     if mode == "pr" and target_state.source_dirty:
         warnings.append("source worktree is dirty; PR target map was built from clean cached checkout")
     if mode != "pr" and target_state.target_dirty:
         warnings.append("analysis uses dirty local files copied into cached checkout by design")
     if mode == "intent" and not targets:
         warnings.append("intent mode found no targets; refine --intent or build a map")
+    if mode == "repo" and not targets:
+        warnings.append("repo mode found no targets; build a SoulForge map or allow map fallback")
 
     return {
         "schema_version": 1,
         "repo": str(target_state.source_repo),
         "mode": mode,
-        "scope": "pr" if mode == "pr" else ("dirty" if mode == "local" else "intent"),
+        "scope": "pr" if mode == "pr" else ("dirty" if mode == "local" else mode),
         "intent": intent,
         "task_state": task_state,
         "token_budget": token_budget,
@@ -1439,6 +1702,9 @@ def make_packet(
             "source_dirty": target_state.source_dirty,
             "target_dirty": target_state.target_dirty,
             "cache_key": target_state.cache_key,
+            "analysis_head_sha": soulforge_target["analysis_head_sha"],
+            "analysis_repo_is_cache_owned": soulforge_target["analysis_repo_is_cache_owned"],
+            "analysis_head_matches_source_head": soulforge_target["analysis_head_matches_source_head"],
         },
         "git": {
             "branch": source_git_state.branch,
@@ -1459,9 +1725,10 @@ def make_packet(
             },
             "stats": soul_map.stats(),
             "top_files": [entry.__dict__ for entry in soul_map.top_files(top)],
+            "target": soulforge_target,
         },
         "targets": target_entries,
-        "gitnexus": build_gitnexus_section(plan, target_state, gitnexus_repo),
+        "gitnexus": build_gitnexus_section(plan, target_state, gitnexus_repo_name, gitnexus_status),
         "gitnexus_plan": plan,
     }
 
@@ -1551,6 +1818,8 @@ def render_markdown(packet: dict[str, object]) -> str:
         f"- target head sha: `{target_state['head_sha']}`",
         f"- base: `{git['base_ref']}`",
         f"- analysis repo: `{target_state['analysis_repo']}`",
+        f"- analysis head: `{target_state.get('analysis_head_sha', '')}`",
+        f"- analysis cache-owned: `{target_state.get('analysis_repo_is_cache_owned', False)}`",
         "",
         "## Warnings",
         "",
@@ -1576,9 +1845,13 @@ def render_markdown(packet: dict[str, object]) -> str:
         ]
     )
     stats = soulforge["stats"]
+    soulforge_target = soulforge.get("target")
     assert isinstance(stats, dict)
+    if isinstance(soulforge_target, dict):
+        lines.append(f"- status: `{soulforge_target.get('status')}`")
+        lines.append(f"- target head verified: `{soulforge_target.get('target_head_verified')}`")
+        lines.append(f"- db: `{soulforge_target.get('db_path')}`")
     if stats.get("available"):
-        lines.append(f"- db: `{stats['path']}`")
         for key in ("files", "symbols", "edges", "refs", "cochanges", "calls", "summaries"):
             if key in stats:
                 lines.append(f"- {key}: {stats[key]}")
@@ -1594,6 +1867,19 @@ def render_markdown(packet: dict[str, object]) -> str:
         lines.append("")
 
     lines.extend(["## GitNexus Required Checks", ""])
+    lines.append(f"- status: `{gitnexus.get('status')}`")
+    lines.append(f"- repo: `{gitnexus.get('repo')}`")
+    lines.append(f"- expected head: `{gitnexus.get('expected_head_sha')}`")
+    if gitnexus.get("indexed_head_sha") is not None:
+        lines.append(f"- indexed head: `{gitnexus.get('indexed_head_sha')}`")
+    if gitnexus.get("reindex_attempted") is not None:
+        lines.append(f"- reindex attempted: `{gitnexus.get('reindex_attempted')}`")
+    if gitnexus.get("required_checks_resolved") is not None:
+        lines.append(f"- required checks resolved: `{gitnexus.get('required_checks_resolved')}`")
+    missing_symbols = gitnexus.get("missing_required_symbols")
+    if isinstance(missing_symbols, list) and missing_symbols:
+        lines.append(f"- missing required symbols: {', '.join(str(item) for item in missing_symbols)}")
+    lines.append("")
     plan = gitnexus.get("plan")
     assert isinstance(plan, list)
     if not plan:
@@ -1612,8 +1898,10 @@ def render_markdown(packet: dict[str, object]) -> str:
 def render_prompt(packet: dict[str, object]) -> str:
     target_state = packet["target_state"]
     gitnexus = packet["gitnexus"]
+    soulforge = packet.get("soulforge") or {}
     assert isinstance(target_state, dict)
     assert isinstance(gitnexus, dict)
+    assert isinstance(soulforge, dict)
     targets = packet["targets"]
     assert isinstance(targets, list)
 
@@ -1653,13 +1941,44 @@ def render_prompt(packet: dict[str, object]) -> str:
         f"    <base_ref>{html.escape(str(target_state['base_ref']))}</base_ref>",
         f"    <head_ref>{html.escape(str(target_state['head_ref']))}</head_ref>",
         f"    <head_sha>{html.escape(str(target_state['head_sha']))}</head_sha>",
+        f"    <analysis_head_sha>{html.escape(str(target_state.get('analysis_head_sha') or ''))}</analysis_head_sha>",
+        f"    <analysis_repo_is_cache_owned>{str(target_state.get('analysis_repo_is_cache_owned', False)).lower()}</analysis_repo_is_cache_owned>",
+        f"    <analysis_head_matches_source_head>{str(target_state.get('analysis_head_matches_source_head', False)).lower()}</analysis_head_matches_source_head>",
         f"    <source_dirty>{str(target_state['source_dirty']).lower()}</source_dirty>",
         f"    <target_dirty>{str(target_state['target_dirty']).lower()}</target_dirty>",
         "  </target_state>",
+        "  <soulforge_status>",
+    ])
+    soulforge_target = soulforge.get("target")
+    if isinstance(soulforge_target, dict):
+        lines.extend([
+            f"    <status>{html.escape(str(soulforge_target.get('status') or 'unknown'))}</status>",
+            f"    <target_head_verified>{str(soulforge_target.get('target_head_verified', False)).lower()}</target_head_verified>",
+            f"    <db_path>{html.escape(str(soulforge_target.get('db_path') or ''))}</db_path>",
+            f"    <db_exists>{str(soulforge_target.get('db_exists', False)).lower()}</db_exists>",
+        ])
+    lines.extend([
+        "  </soulforge_status>",
+        "  <gitnexus_status>",
+        f"    <status>{html.escape(str(gitnexus.get('status') or 'unknown'))}</status>",
+        f"    <repo>{html.escape(str(gitnexus.get('repo') or ''))}</repo>",
+        f"    <expected_head_sha>{html.escape(str(gitnexus.get('expected_head_sha') or ''))}</expected_head_sha>",
+        f"    <indexed_head_sha>{html.escape(str(gitnexus.get('indexed_head_sha') or ''))}</indexed_head_sha>",
+        f"    <reindex_attempted>{str(gitnexus.get('reindex_attempted', False)).lower()}</reindex_attempted>",
+        f"    <required_checks_resolved>{str(gitnexus.get('required_checks_resolved', False)).lower()}</required_checks_resolved>",
+        "    <missing_required_symbols>",
+    ])
+    missing_symbols = gitnexus.get("missing_required_symbols")
+    if isinstance(missing_symbols, list):
+        for symbol in missing_symbols:
+            lines.append(f"      <symbol>{html.escape(str(symbol))}</symbol>")
+    lines.extend([
+        "    </missing_required_symbols>",
+        "  </gitnexus_status>",
         "  <scope_rules>",
         "    Use files under <targets> as the first-pass edit/review surface.",
         "    Treat source dirty overlaps as warnings, not PR target files, when mode is pr.",
-        "    Run the GitNexus required checks before editing production code.",
+        "    Trust GitNexus blast-radius claims only when <gitnexus_status> is fresh or reindexed and required checks resolve.",
         "  </scope_rules>",
         "  <warnings>",
     ])
@@ -1831,7 +2150,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     analyze = subcommands.add_parser("analyze", help="Generate a production context packet")
     analyze.add_argument("--repo", required=True, type=Path)
-    analyze.add_argument("--mode", choices=["pr", "local", "intent"], default="pr")
+    analyze.add_argument("--mode", choices=["pr", "local", "intent", "repo"], default="pr")
     analyze.add_argument("--base", default="main")
     analyze.add_argument("--head", default="HEAD")
     analyze.add_argument("--intent")
@@ -1845,6 +2164,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     analyze.add_argument("--map-timeout-ms", type=int, default=120_000)
     analyze.add_argument("--allow-missing-map", action="store_true")
     analyze.add_argument("--gitnexus-repo")
+    analyze.add_argument("--gitnexus-mode", choices=["off", "check", "auto"], default="auto")
     analyze.add_argument("--out", type=Path)
 
     packet = subcommands.add_parser("packet", help="Compatibility alias for analyze")
@@ -1872,7 +2192,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     context_start = subcommands.add_parser("context-start", help="Start a task context and render its packet")
     context_start.add_argument("--repo", required=True, type=Path)
-    context_start.add_argument("--mode", choices=["pr", "local", "intent"], default="pr")
+    context_start.add_argument("--mode", choices=["pr", "local", "intent", "repo"], default="pr")
     context_start.add_argument("--base", default="main")
     context_start.add_argument("--head", default="HEAD")
     context_start.add_argument("--intent")
@@ -1884,11 +2204,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     context_start.add_argument("--map-timeout-ms", type=int, default=120_000)
     context_start.add_argument("--allow-missing-map", action="store_true")
     context_start.add_argument("--gitnexus-repo")
+    context_start.add_argument("--gitnexus-mode", choices=["off", "check", "auto"], default="auto")
     context_start.add_argument("--out", type=Path)
 
     context_refresh = subcommands.add_parser("context-refresh", help="Refresh a task context packet")
     context_refresh.add_argument("--repo", required=True, type=Path)
-    context_refresh.add_argument("--mode", choices=["pr", "local", "intent"], default="pr")
+    context_refresh.add_argument("--mode", choices=["pr", "local", "intent", "repo"], default="pr")
     context_refresh.add_argument("--base", default="main")
     context_refresh.add_argument("--head", default="HEAD")
     context_refresh.add_argument("--task-id", required=True)
@@ -1899,6 +2220,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     context_refresh.add_argument("--map-timeout-ms", type=int, default=120_000)
     context_refresh.add_argument("--allow-missing-map", action="store_true")
     context_refresh.add_argument("--gitnexus-repo")
+    context_refresh.add_argument("--gitnexus-mode", choices=["off", "check", "auto"], default="auto")
     context_refresh.add_argument("--out", type=Path)
 
     for command_name, help_text in (
@@ -1923,7 +2245,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     wrap = subcommands.add_parser("wrap", help="Generate a prompt packet and optionally run a command")
     wrap.add_argument("--repo", required=True, type=Path)
-    wrap.add_argument("--mode", choices=["pr", "local", "intent"], default="pr")
+    wrap.add_argument("--mode", choices=["pr", "local", "intent", "repo"], default="pr")
     wrap.add_argument("--base", default="main")
     wrap.add_argument("--head", default="HEAD")
     wrap.add_argument("--intent")
@@ -1936,6 +2258,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     wrap.add_argument("--map-timeout-ms", type=int, default=120_000)
     wrap.add_argument("--allow-missing-map", action="store_true")
     wrap.add_argument("--gitnexus-repo")
+    wrap.add_argument("--gitnexus-mode", choices=["off", "check", "auto"], default="auto")
     wrap.add_argument("--out", type=Path)
     wrap.add_argument("--no-stdin", action="store_true")
     wrap.add_argument("wrapped_command", nargs=argparse.REMAINDER)
@@ -1997,6 +2320,7 @@ def main(argv: list[str]) -> int:
                 allow_missing_map=args.allow_missing_map,
                 gitnexus_repo=args.gitnexus_repo,
                 task_state=state,
+                gitnexus_mode=args.gitnexus_mode,
             )
             state["previous_targets"] = [
                 str(target["path"])
@@ -2026,6 +2350,7 @@ def main(argv: list[str]) -> int:
                 allow_missing_map=args.allow_missing_map,
                 gitnexus_repo=args.gitnexus_repo,
                 task_state=state,
+                gitnexus_mode=args.gitnexus_mode,
             )
             state["previous_targets"] = [
                 str(target["path"])
@@ -2076,6 +2401,7 @@ def main(argv: list[str]) -> int:
                 map_timeout_ms=args.map_timeout_ms,
                 allow_missing_map=args.allow_missing_map,
                 gitnexus_repo=args.gitnexus_repo,
+                gitnexus_mode=args.gitnexus_mode,
             )
             text = render_prompt(packet)
             packet_file = args.out.resolve() if args.out else packet_file_for(packet, args.cache_dir.resolve())
@@ -2136,6 +2462,7 @@ def main(argv: list[str]) -> int:
                 map_timeout_ms=120_000,
                 allow_missing_map=True,
                 gitnexus_repo=None,
+                gitnexus_mode="off",
             )
             output_text(render_packet(packet, args.format), args.out)
             return 0
@@ -2155,6 +2482,7 @@ def main(argv: list[str]) -> int:
             map_timeout_ms=args.map_timeout_ms,
             allow_missing_map=args.allow_missing_map,
             gitnexus_repo=args.gitnexus_repo,
+            gitnexus_mode=args.gitnexus_mode,
         )
         output_text(render_packet(packet, args.format), args.out)
         return 0

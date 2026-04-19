@@ -168,6 +168,31 @@ class RepoContextForgeTests(unittest.TestCase):
 
         self.assertNotIn("dirty_file", entry["rank_signals"])
 
+    def test_repo_mode_selects_top_soulforge_files(self) -> None:
+        state = repo_context_forge.GitState(
+            branch="main",
+            head="abc123",
+            base_ref="origin/main",
+            merge_base="base",
+            pr_files=[],
+            staged_files=[],
+            unstaged_files=[],
+            untracked_files=[],
+        )
+
+        class FakeMap:
+            def top_files(self, _limit: int):
+                return [
+                    repo_context_forge.MapFile("src/app.py", 0.5, 3, 20, 1),
+                    repo_context_forge.MapFile(".soulforge/repomap.db", 0.4, 0, 1, 2),
+                    repo_context_forge.MapFile("src/worker.py", 0.3, 2, 10, 3),
+                ]
+
+        self.assertEqual(
+            repo_context_forge.target_files_for_mode("repo", state, FakeMap(), None, 3),
+            ["src/app.py", "src/worker.py"],
+        )
+
     def test_task_state_boosts_edited_files(self) -> None:
         entries = [
             {
@@ -380,6 +405,117 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertEqual((repo / ".gitignore").read_text(encoding="utf-8"), "*.log\n")
             self.assertNotEqual(packet["target_state"]["analysis_repo"], str(repo))
 
+    def test_soulforge_target_metadata_verifies_analysis_head(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            state = repo_context_forge.ensure_repo_analysis_checkout(
+                repo,
+                "HEAD",
+                Path(cache_dir),
+            )
+            db_path = state.analysis_repo / ".soulforge" / "repomap.db"
+            db_path.parent.mkdir()
+            db_path.write_text("db", encoding="utf-8")
+
+            metadata = repo_context_forge.soulforge_target_metadata(
+                state,
+                repo_context_forge.MapBuildResult(False, [], None, "", "", None),
+                repo_context_forge.SoulForgeMap(state.analysis_repo),
+                Path(cache_dir),
+            )
+
+            self.assertEqual(metadata["status"], "fresh")
+            self.assertTrue(metadata["target_head_verified"])
+            self.assertEqual(metadata["analysis_head_sha"], state.head_sha)
+            self.assertTrue(metadata["analysis_repo_is_cache_owned"])
+
+    def test_gitnexus_auto_reindexes_stale_analysis_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:
+            analysis_repo = Path(repo_dir)
+            registry_path = Path(registry_dir) / "registry.json"
+            state = repo_context_forge.TargetState(
+                mode="pr",
+                source_repo=analysis_repo,
+                analysis_repo=analysis_repo,
+                base_ref="main",
+                head_ref="HEAD",
+                head_sha="new-head",
+                source_dirty=False,
+                target_dirty=False,
+                cache_key="key",
+            )
+            registry_path.write_text(
+                repo_context_forge.json.dumps(
+                    [
+                        {
+                            "name": "analysis",
+                            "path": str(analysis_repo.resolve()),
+                            "lastCommit": "old-head",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            original_run_cmd = repo_context_forge.run_cmd
+
+            def fake_run_cmd(args, **_kwargs):
+                registry_path.write_text(
+                    repo_context_forge.json.dumps(
+                        [
+                            {
+                                "name": "analysis",
+                                "path": str(analysis_repo.resolve()),
+                                "lastCommit": "new-head",
+                                "indexedAt": "now",
+                                "storagePath": str(analysis_repo / ".gitnexus"),
+                            }
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                return repo_context_forge.subprocess.CompletedProcess(args, 0, "", "")
+
+            repo_context_forge.run_cmd = fake_run_cmd
+            try:
+                status = repo_context_forge.ensure_gitnexus_index(
+                    state,
+                    "analysis",
+                    "auto",
+                    registry_path=registry_path,
+                    gitnexus_bin="gitnexus",
+                )
+            finally:
+                repo_context_forge.run_cmd = original_run_cmd
+
+            self.assertEqual(status["status"], "reindexed")
+            self.assertTrue(status["index_fresh"])
+            self.assertTrue(status["reindex_attempted"])
+
+    def test_gitnexus_required_checks_block_missing_symbols(self) -> None:
+        original_run_cmd = repo_context_forge.run_cmd
+
+        def fake_run_cmd(args, **_kwargs):
+            returncode = 1 if args[-1] == "missing_symbol" else 0
+            return repo_context_forge.subprocess.CompletedProcess(args, returncode, "", "missing")
+
+        repo_context_forge.run_cmd = fake_run_cmd
+        try:
+            status = repo_context_forge.verify_gitnexus_required_checks(
+                [
+                    {"kind": "symbol_context", "target": "present_symbol"},
+                    {"kind": "symbol_context", "target": "missing_symbol"},
+                ],
+                {"status": "fresh", "repo": "analysis"},
+                gitnexus_bin="gitnexus",
+            )
+        finally:
+            repo_context_forge.run_cmd = original_run_cmd
+
+        self.assertEqual(status["status"], "blocked")
+        self.assertEqual(status["missing_required_symbols"], ["missing_symbol"])
+        self.assertFalse(status["required_checks_resolved"])
+
     def test_blocker_prompt_renders_worktree_suggestions(self) -> None:
         packet = {
             "schema_version": 1,
@@ -579,6 +715,33 @@ class RepoContextForgeTests(unittest.TestCase):
             codex_context_bootstrap.forge.is_dirty = original_is_dirty
 
         self.assertEqual(mode, "intent")
+
+    def test_bootstrap_auto_mode_defaults_to_repo_when_clean_without_intent(self) -> None:
+        original_is_dirty = codex_context_bootstrap.forge.is_dirty
+        codex_context_bootstrap.forge.is_dirty = lambda _repo, **_kwargs: False
+        try:
+            mode = codex_context_bootstrap.choose_mode(
+                Path("/repo"),
+                "auto",
+                None,
+                "HEAD",
+                None,
+            )
+        finally:
+            codex_context_bootstrap.forge.is_dirty = original_is_dirty
+
+        self.assertEqual(mode, "repo")
+
+    def test_bootstrap_does_not_block_repo_mode(self) -> None:
+        reason = codex_context_bootstrap.should_block_empty_checkout(
+            Path("/repo"),
+            "repo",
+            None,
+            "HEAD",
+            None,
+        )
+
+        self.assertIsNone(reason)
 
     def test_bootstrap_auto_mode_ignores_tool_cache_dirty_for_intent(self) -> None:
         original_is_dirty = codex_context_bootstrap.forge.is_dirty

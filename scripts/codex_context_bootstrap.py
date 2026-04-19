@@ -75,7 +75,7 @@ def choose_mode(
         return "local"
     if intent:
         return "intent"
-    return "local"
+    return "repo"
 
 
 def should_block_empty_checkout(
@@ -85,6 +85,8 @@ def should_block_empty_checkout(
     head_ref: str,
     intent: str | None,
 ) -> str | None:
+    if mode == "repo":
+        return None
     if mode == "pr":
         return None
     git_state = forge.read_git_state(repo, base_ref or head_ref, head_ref)
@@ -99,7 +101,7 @@ def should_block_empty_checkout(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="codex-context-bootstrap")
     parser.add_argument("--repo", type=Path, default=Path.cwd())
-    parser.add_argument("--mode", choices=["auto", "pr", "local", "intent"], default="auto")
+    parser.add_argument("--mode", choices=["auto", "pr", "local", "intent", "repo"], default="auto")
     parser.add_argument("--base")
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--intent")
@@ -111,6 +113,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--require-map", action="store_true")
     parser.add_argument("--allow-empty", action="store_true")
     parser.add_argument("--gitnexus-repo")
+    parser.add_argument("--gitnexus-mode", choices=["off", "check", "auto"], default="auto")
     parser.add_argument("--out", type=Path)
     return parser.parse_args(argv)
 
@@ -128,7 +131,7 @@ def main(argv: list[str]) -> int:
     if mode == "pr" and not base_ref:
         mode = "local"
     if mode == "intent" and not args.intent:
-        mode = "local"
+        mode = "repo"
     if not args.allow_empty:
         blocker_reason = should_block_empty_checkout(root, mode, base_ref, args.head, args.intent)
         if blocker_reason:
@@ -161,6 +164,7 @@ def main(argv: list[str]) -> int:
         map_timeout_ms=args.map_timeout_ms,
         allow_missing_map=not args.require_map,
         gitnexus_repo=args.gitnexus_repo or root.name,
+        gitnexus_mode=args.gitnexus_mode,
     )
     rendered = forge.render_prompt(packet)
     forge.output_text(rendered, args.out)
