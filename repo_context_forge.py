@@ -1762,6 +1762,9 @@ def render_coverage_plan_lines(plan: object, indent: str) -> list[str]:
             for path in files:
                 lines.append(f"{indent}      <file path=\"{html.escape(str(path))}\"/>")
         lines.append(f"{indent}    </files>")
+        lines.append(
+            f"{indent}    <delegate_task action=\"spawn_agent\">Review this coverage area independently before GitNexus calls, GitHub review comments, review findings, or edits. Answer: {html.escape(str(area.get('must_answer') or ''))}</delegate_task>"
+        )
         lines.append(f"{indent}  </area>")
     lines.append(f"{indent}</coverage_plan>")
     return lines
@@ -2597,6 +2600,22 @@ def render_required_intake(packet: dict[str, object]) -> str:
         )
     if not areas:
         lines.append("- none")
+    lines.append("delegation_tasks:")
+    if coverage_plan.get("delegation_required") and areas:
+        for area in areas[:6]:
+            if not isinstance(area, dict):
+                continue
+            files = area.get("files")
+            file_text = ",".join(str(path) for path in files[:6]) if isinstance(files, list) else ""
+            lines.append(
+                "- "
+                f"spawn_agent | area={area.get('id') or 'area'} | "
+                f"kind={area.get('kind') or 'unknown'} | "
+                f"files={file_text} | "
+                f"question={area.get('must_answer') or ''}"
+            )
+    else:
+        lines.append("- none")
     lines.append("critical_area_steps:")
     for step in CRITICAL_AREA_STEPS:
         lines.append(f"- {step}")
@@ -2604,6 +2623,7 @@ def render_required_intake(packet: dict[str, object]) -> str:
         [
             "required_behavior:",
             "- Report this intake before code reasoning, review findings, edits, or GitNexus claims.",
+            "- If delegation_tasks lists spawn_agent tasks and the runtime permits sub-agents, call spawn_agent for each task before GitNexus calls, GitHub review comments, review findings, or edits.",
             "- Satisfy coverage_plan, including required delegation when available, before GitNexus calls, GitHub review comments, review findings, or edits.",
             "- Run the listed gitnexus_required_checks first; they are the initial GitNexus validation scoped to the SoulForge packet and reindexed GitNexus repo.",
             "- Use packet targets plus live base...HEAD, dirty worktree, or intent surface according to packet mode.",
@@ -2871,6 +2891,7 @@ def render_prompt(packet: dict[str, object]) -> str:
         "    Use files under <targets> as the first-pass edit/review surface.",
         "    Use <soulforge_impact> as native repo-map blast radius before file edits.",
         "    Use <gitnexus_status><repo> for every GitNexus MCP call for this packet.",
+        "    If <coverage_plan delegation_required=\"true\"> and the runtime permits sub-agents, call spawn_agent once per coverage area before GitNexus calls, GitHub review comments, review findings, or edits.",
         "    Satisfy coverage_plan, including required delegation when available, before GitNexus calls, GitHub review comments, review findings, or edits.",
         "    Run the listed <gitnexus_required_checks> first as the initial GitNexus validation after SoulForge and reindex.",
         "    Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",

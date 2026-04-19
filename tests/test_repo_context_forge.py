@@ -1231,8 +1231,10 @@ class RepoContextForgeTests(unittest.TestCase):
         )
         self.assertIn("coverage_plan: required=true delegation_required=true", captured["text"])
         self.assertIn("production_contract", captured["text"])
+        self.assertIn("delegation_tasks:", captured["text"])
+        self.assertIn("spawn_agent | area=production_contract", captured["text"])
         self.assertIn(
-            "Satisfy coverage_plan, including required delegation when available",
+            "call spawn_agent for each task before GitNexus calls",
             captured["text"],
         )
         self.assertIn("Do not let unscoped gitnexus_detect_changes(compare)", captured["text"])
@@ -1322,8 +1324,9 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("<required_agent_intake>", rendered)
         self.assertIn("<coverage_plan required=\"true\" delegation_required=\"true\">", rendered)
         self.assertIn('id="production_contract"', rendered)
+        self.assertIn('<delegate_task action="spawn_agent">', rendered)
         self.assertIn(
-            "Satisfy coverage_plan, including required delegation when available",
+            "call spawn_agent once per coverage area before GitNexus calls",
             rendered,
         )
         self.assertIn(

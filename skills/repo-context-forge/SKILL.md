@@ -39,10 +39,11 @@ rerun the bootstrap.
   `<coverage_plan>`
 - satisfy every required `<coverage_plan>` area before GitNexus calls, GitHub
   review comments, review findings, or edits
-- when `<coverage_plan delegation_required="true">` and sub-agents are
-  available and permitted, dispatch independent area reviews before final
-  conclusions; if delegation is unavailable, cover the same areas serially and
-  report each result
+- when the required intake lists `delegation_tasks` and the runtime exposes
+  `spawn_agent` with user permission to delegate, call `spawn_agent` once per
+  listed area before GitNexus calls, GitHub review comments, review findings,
+  or edits; if delegation is unavailable, cover the same areas serially and
+  report that fallback explicitly
 - use `<targets>` as the first-pass edit/review surface
 - use `<soulforge_impact>` as native SoulForge blast-radius context before
   editing or reviewing selected files
