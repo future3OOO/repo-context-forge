@@ -405,6 +405,41 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertEqual((repo / ".gitignore").read_text(encoding="utf-8"), "*.log\n")
             self.assertNotEqual(packet["target_state"]["analysis_repo"], str(repo))
 
+    def test_make_packet_reports_preexisting_tool_cache_without_source_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / ".codex").write_text("cache\n", encoding="utf-8")
+            (repo / ".soulforge").mkdir()
+            (repo / ".soulforge" / "repomap.db").write_text("cache\n", encoding="utf-8")
+
+            packet = repo_context_forge.make_packet(
+                repo,
+                mode="repo",
+                base_ref="HEAD",
+                head_ref="HEAD",
+                intent=None,
+                top=5,
+                token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET,
+                cache_dir=Path(cache_dir),
+                soulforge_bin=None,
+                map_build="never",
+                map_timeout_ms=1,
+                allow_missing_map=True,
+                gitnexus_repo=None,
+            )
+
+            source_status = packet["source_status"]
+            self.assertTrue(source_status["unchanged"])
+            self.assertEqual(source_status["added_paths"], [])
+            self.assertEqual(source_status["tool_cache_paths_created"], [])
+            self.assertEqual(
+                source_status["tool_cache_paths_before"],
+                [".codex", ".soulforge/repomap.db"],
+            )
+            self.assertFalse(packet["target_state"]["source_dirty"])
+            self.assertTrue(packet["target_state"]["source_status_unchanged"])
+
     def test_soulforge_target_metadata_verifies_analysis_head(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
             repo = Path(repo_dir)

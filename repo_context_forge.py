@@ -144,12 +144,16 @@ def repo_root(path: Path) -> Path:
 
 
 def dirty_paths(repo: Path) -> list[str]:
+    return parse_porcelain_paths(porcelain_status(repo))
+
+
+def porcelain_status(repo: Path) -> str:
     status = run_cmd(
         ["git", "status", "--porcelain", "--untracked-files=all"],
         cwd=repo,
         allow_fail=True,
     ).stdout
-    return parse_porcelain_paths(status)
+    return status.rstrip("\n")
 
 
 def parse_porcelain_paths(status: str) -> list[str]:
@@ -196,6 +200,37 @@ def filter_tool_cache_dirty_paths(paths: Iterable[str]) -> list[str]:
         if path not in {".soulforge", ".codex"}
         and not path.startswith((".soulforge/", ".codex/"))
     ]
+
+
+def tool_cache_dirty_paths(paths: Iterable[str]) -> list[str]:
+    return [
+        path
+        for path in paths
+        if path in {".soulforge", ".codex"}
+        or path.startswith((".soulforge/", ".codex/"))
+    ]
+
+
+def source_status_proof(before: str, after: str) -> dict[str, object]:
+    before_lines = set(before.splitlines())
+    after_lines = set(after.splitlines())
+    added_lines = sorted(after_lines - before_lines)
+    removed_lines = sorted(before_lines - after_lines)
+    before_paths = parse_porcelain_paths(before)
+    after_paths = parse_porcelain_paths(after)
+    added_paths = parse_porcelain_paths("\n".join(added_lines))
+    return {
+        "unchanged": before == after,
+        "before_hash": hashlib.sha256(before.encode("utf-8")).hexdigest(),
+        "after_hash": hashlib.sha256(after.encode("utf-8")).hexdigest(),
+        "before_count": len(before_lines),
+        "after_count": len(after_lines),
+        "added_paths": added_paths,
+        "removed_paths": parse_porcelain_paths("\n".join(removed_lines)),
+        "tool_cache_paths_before": tool_cache_dirty_paths(before_paths),
+        "tool_cache_paths_after": tool_cache_dirty_paths(after_paths),
+        "tool_cache_paths_created": tool_cache_dirty_paths(added_paths),
+    }
 
 
 def is_generated_or_cache_path(path: str) -> bool:
@@ -1625,6 +1660,8 @@ def make_packet(
     task_state: dict[str, object] | None = None,
     gitnexus_mode: GitNexusMode = "off",
 ) -> dict[str, object]:
+    source_repo = repo_root(repo)
+    source_status_before = porcelain_status(source_repo)
     target_state = resolve_target_state(repo, mode, base_ref, head_ref, cache_dir)
     gitignore_dirty_before_build = ".gitignore" in dirty_paths(target_state.analysis_repo)
     build_result = build_soulforge_map(
@@ -1666,6 +1703,10 @@ def make_packet(
     gitnexus_repo_name = str(gitnexus_status.get("repo") or gitnexus_repo or target_state.analysis_repo.name)
     plan = build_gitnexus_plan(target_entries, gitnexus_repo_name)
     gitnexus_status = verify_gitnexus_required_checks(plan, gitnexus_status)
+    source_status = source_status_proof(
+        source_status_before,
+        porcelain_status(target_state.source_repo),
+    )
 
     warnings = []
     if build_result.warning:
@@ -1683,6 +1724,8 @@ def make_packet(
         warnings.append("intent mode found no targets; refine --intent or build a map")
     if mode == "repo" and not targets:
         warnings.append("repo mode found no targets; build a SoulForge map or allow map fallback")
+    if not source_status["unchanged"]:
+        warnings.append("source checkout status changed during context generation")
 
     return {
         "schema_version": 1,
@@ -1705,7 +1748,9 @@ def make_packet(
             "analysis_head_sha": soulforge_target["analysis_head_sha"],
             "analysis_repo_is_cache_owned": soulforge_target["analysis_repo_is_cache_owned"],
             "analysis_head_matches_source_head": soulforge_target["analysis_head_matches_source_head"],
+            "source_status_unchanged": source_status["unchanged"],
         },
+        "source_status": source_status,
         "git": {
             "branch": source_git_state.branch,
             "head": source_git_state.head,
@@ -1804,10 +1849,12 @@ def render_markdown(packet: dict[str, object]) -> str:
     soulforge = packet["soulforge"]
     target_state = packet["target_state"]
     gitnexus = packet["gitnexus"]
+    source_status = packet.get("source_status") or {}
     assert isinstance(git, dict)
     assert isinstance(soulforge, dict)
     assert isinstance(target_state, dict)
     assert isinstance(gitnexus, dict)
+    assert isinstance(source_status, dict)
     lines = [
         "# Repo Context Packet",
         "",
@@ -1820,6 +1867,7 @@ def render_markdown(packet: dict[str, object]) -> str:
         f"- analysis repo: `{target_state['analysis_repo']}`",
         f"- analysis head: `{target_state.get('analysis_head_sha', '')}`",
         f"- analysis cache-owned: `{target_state.get('analysis_repo_is_cache_owned', False)}`",
+        f"- source status unchanged: `{source_status.get('unchanged', 'unknown')}`",
         "",
         "## Warnings",
         "",
@@ -1839,6 +1887,11 @@ def render_markdown(packet: dict[str, object]) -> str:
             f"- staged files: {len(git['staged_files'])}",
             f"- unstaged files: {len(git['unstaged_files'])}",
             f"- untracked files: {len(git['untracked_files'])}",
+            f"- source status before hash: `{source_status.get('before_hash', '')}`",
+            f"- source status after hash: `{source_status.get('after_hash', '')}`",
+            f"- source status added paths: {len(source_status.get('added_paths', []))}",
+            f"- source tool-cache paths existed before: {len(source_status.get('tool_cache_paths_before', []))}",
+            f"- source tool-cache paths created: {len(source_status.get('tool_cache_paths_created', []))}",
             "",
             "## SoulForge Map",
             "",
@@ -1899,9 +1952,11 @@ def render_prompt(packet: dict[str, object]) -> str:
     target_state = packet["target_state"]
     gitnexus = packet["gitnexus"]
     soulforge = packet.get("soulforge") or {}
+    source_status = packet.get("source_status") or {}
     assert isinstance(target_state, dict)
     assert isinstance(gitnexus, dict)
     assert isinstance(soulforge, dict)
+    assert isinstance(source_status, dict)
     targets = packet["targets"]
     assert isinstance(targets, list)
 
@@ -1946,7 +2001,32 @@ def render_prompt(packet: dict[str, object]) -> str:
         f"    <analysis_head_matches_source_head>{str(target_state.get('analysis_head_matches_source_head', False)).lower()}</analysis_head_matches_source_head>",
         f"    <source_dirty>{str(target_state['source_dirty']).lower()}</source_dirty>",
         f"    <target_dirty>{str(target_state['target_dirty']).lower()}</target_dirty>",
+        f"    <source_status_unchanged>{str(source_status.get('unchanged', False)).lower()}</source_status_unchanged>",
         "  </target_state>",
+        "  <source_status>",
+        f"    <before_hash>{html.escape(str(source_status.get('before_hash') or ''))}</before_hash>",
+        f"    <after_hash>{html.escape(str(source_status.get('after_hash') or ''))}</after_hash>",
+        f"    <before_count>{html.escape(str(source_status.get('before_count') or 0))}</before_count>",
+        f"    <after_count>{html.escape(str(source_status.get('after_count') or 0))}</after_count>",
+        "    <added_paths>",
+    ])
+    for path in source_status.get("added_paths", []):
+        lines.append(f"      <path>{html.escape(str(path))}</path>")
+    lines.extend([
+        "    </added_paths>",
+        "    <tool_cache_paths_before>",
+    ])
+    for path in source_status.get("tool_cache_paths_before", []):
+        lines.append(f"      <path>{html.escape(str(path))}</path>")
+    lines.extend([
+        "    </tool_cache_paths_before>",
+        "    <tool_cache_paths_created>",
+    ])
+    for path in source_status.get("tool_cache_paths_created", []):
+        lines.append(f"      <path>{html.escape(str(path))}</path>")
+    lines.extend([
+        "    </tool_cache_paths_created>",
+        "  </source_status>",
         "  <soulforge_status>",
     ])
     soulforge_target = soulforge.get("target")
