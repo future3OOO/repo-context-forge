@@ -57,6 +57,32 @@ def choose_mode(
     return "local"
 
 
+def should_block_empty_checkout(
+    repo: Path,
+    mode: forge.Mode,
+    base_ref: str | None,
+    head_ref: str,
+    intent: str | None,
+) -> str | None:
+    if mode == "pr":
+        return None
+    git_state = forge.read_git_state(repo, base_ref or head_ref, head_ref)
+    has_any_surface = any(
+        [
+            git_state.pr_files,
+            git_state.staged_files,
+            git_state.unstaged_files,
+            git_state.untracked_files,
+            intent,
+        ]
+    )
+    if has_any_surface:
+        return None
+    if forge.is_detached(repo):
+        return "detached checkout has no target surface; select the active PR worktree"
+    return "no changed files, dirty files, or intent were available for context mapping"
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="codex-context-bootstrap")
     parser.add_argument("--repo", type=Path, default=Path.cwd())
@@ -70,6 +96,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--map-build", choices=["auto", "always", "never"], default="auto")
     parser.add_argument("--map-timeout-ms", type=int, default=120_000)
     parser.add_argument("--require-map", action="store_true")
+    parser.add_argument("--allow-empty", action="store_true")
     parser.add_argument("--gitnexus-repo")
     parser.add_argument("--out", type=Path)
     return parser.parse_args(argv)
@@ -89,6 +116,22 @@ def main(argv: list[str]) -> int:
         mode = "local"
     if mode == "intent" and not args.intent:
         mode = "local"
+    if not args.allow_empty:
+        blocker_reason = should_block_empty_checkout(root, mode, base_ref, args.head, args.intent)
+        if blocker_reason:
+            packet = forge.make_blocker_packet(
+                root,
+                reason=blocker_reason,
+                base_ref=base_ref,
+                head_ref=args.head,
+                suggestions=[
+                    item
+                    for item in forge.worktree_suggestions(root)
+                    if item.get("path") != str(root)
+                ],
+            )
+            forge.output_text(forge.render_prompt(packet), args.out)
+            return 1
 
     packet = forge.make_packet(
         root,

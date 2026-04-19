@@ -26,6 +26,7 @@ DEFAULT_CACHE_DIR = Path.home() / ".cache" / "repo-context-forge"
 DEFAULT_TOKEN_BUDGET = 2500
 MIN_TOKEN_BUDGET = 1500
 MAX_TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
+TaskEvent = Literal["read", "search", "edit", "mention"]
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class Symbol:
     end_line: int
     signature: str | None
     is_exported: bool
+    summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,17 @@ def unique_sorted(paths: Iterable[str]) -> list[str]:
     return sorted({path for path in paths if path})
 
 
+def unique_ordered(paths: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for path in paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        result.append(path)
+    return result
+
+
 def is_git_repo(path: Path) -> bool:
     proc = run_cmd(["git", "rev-parse", "--is-inside-work-tree"], cwd=path, allow_fail=True)
     return proc.returncode == 0 and proc.stdout.strip() == "true"
@@ -146,12 +159,66 @@ def parse_porcelain_paths(status: str) -> list[str]:
     return paths
 
 
+def is_detached(repo: Path) -> bool:
+    return run_git(repo, ["branch", "--show-current"], allow_fail=True) == ""
+
+
+def worktree_suggestions(repo: Path) -> list[dict[str, str]]:
+    raw = run_git(repo, ["worktree", "list", "--porcelain"], allow_fail=True)
+    suggestions: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in raw.splitlines():
+        if not line:
+            if current:
+                suggestions.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            current["path"] = value
+        elif key == "branch":
+            current["branch"] = value.removeprefix("refs/heads/")
+        elif key == "HEAD":
+            current["head"] = value
+        elif key == "detached":
+            current["detached"] = "true"
+    if current:
+        suggestions.append(current)
+    return suggestions
+
+
 def filter_tool_cache_dirty_paths(paths: Iterable[str]) -> list[str]:
     return [
         path
         for path in paths
         if path != ".soulforge" and not path.startswith(".soulforge/")
     ]
+
+
+def is_generated_or_cache_path(path: str) -> bool:
+    parts = path.split("/")
+    if ".soulforge" in parts or "__pycache__" in parts:
+        return True
+    return path.endswith((".pyc", ".pyo")) or path.startswith(".git/")
+
+
+def is_test_path(path: str) -> bool:
+    parts = path.split("/")
+    name = Path(path).name.lower()
+    return (
+        "test" in parts
+        or "tests" in parts
+        or name.startswith("test_")
+        or name.endswith((".test.js", ".test.mjs", ".spec.js", ".spec.ts"))
+    )
+
+
+def file_role(path: str) -> str:
+    if is_generated_or_cache_path(path):
+        return "generated"
+    if is_test_path(path):
+        return "test"
+    return "production"
 
 
 def cleanup_soulforge_gitignore_change(repo: Path) -> None:
@@ -320,6 +387,71 @@ def estimate_tokens(text: str) -> int:
 def cache_key_for(repo: Path, head_sha: str, extra: str = "") -> str:
     material = f"{repo.resolve()}\0{head_sha}\0{extra}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def default_task_id(repo: Path, head_sha: str, intent: str | None = None) -> str:
+    return cache_key_for(repo, head_sha, intent or "default")
+
+
+def task_state_path(cache_dir: Path, repo: Path, head_sha: str, task_id: str) -> Path:
+    repo_key = cache_key_for(repo, head_sha)
+    return cache_dir / "tasks" / repo.name / repo_key / f"{task_id}.json"
+
+
+def empty_task_state(repo: Path, head_sha: str, task_id: str, intent: str | None) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "repo": str(repo),
+        "head_sha": head_sha,
+        "task_id": task_id,
+        "intent": intent,
+        "read_files": [],
+        "search_files": [],
+        "edited_files": [],
+        "mentioned_files": [],
+        "previous_targets": [],
+        "gitnexus_confirmed_files": [],
+        "gitnexus_missing_files": [],
+    }
+
+
+def load_task_state(path: Path) -> dict[str, object]:
+    if not path.exists():
+        raise RuntimeError(f"task state not found: {path}")
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"task state is not valid JSON: {path}") from exc
+    if not isinstance(state, dict) or state.get("schema_version") != 1:
+        raise RuntimeError(f"unsupported task state schema: {path}")
+    return state
+
+
+def save_task_state(path: Path, state: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def record_task_event(state: dict[str, object], event: TaskEvent, paths: Iterable[str]) -> dict[str, object]:
+    field_by_event = {
+        "read": "read_files",
+        "search": "search_files",
+        "edit": "edited_files",
+        "mention": "mentioned_files",
+    }
+    field = field_by_event[event]
+    existing = state.get(field)
+    if not isinstance(existing, list):
+        existing = []
+    state[field] = unique_ordered([*(str(item) for item in existing), *paths])
+    return state
+
+
+def task_state_paths(state: dict[str, object], field: str) -> set[str]:
+    value = state.get(field)
+    if not isinstance(value, list):
+        return set()
+    return {str(item) for item in value if str(item)}
 
 
 def safe_rmtree(path: Path, cache_root: Path) -> None:
@@ -505,7 +637,7 @@ class SoulForgeMap:
         wanted = list(paths)
         if not self.available or not wanted:
             return {}
-        placeholders = ",".join("?" for _ in wanted)
+        sql_marks = ",".join("?" for _ in wanted)
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
@@ -516,7 +648,7 @@ class SoulForgeMap:
                 )
                 SELECT path, pagerank, symbol_count, line_count, rank
                 FROM ranked
-                WHERE path IN ({placeholders})
+                WHERE path IN ({sql_marks})
                 """,
                 wanted,
             ).fetchall()
@@ -535,11 +667,27 @@ class SoulForgeMap:
         if not self.available:
             return []
         with self._connect() as conn:
-            rows = conn.execute(
+            summary_join = ""
+            summary_select = "NULL AS summary"
+            if self._has_table(conn, "semantic_summaries"):
+                summary_join = """
+                LEFT JOIN semantic_summaries ss ON ss.symbol_id = s.id
+                  AND ss.source = (
+                    SELECT source
+                    FROM semantic_summaries
+                    WHERE symbol_id = s.id
+                    ORDER BY source = 'llm' DESC, source ASC
+                    LIMIT 1
+                  )
                 """
-                SELECT s.name, s.kind, s.line, s.end_line, s.signature, s.is_exported
+                summary_select = "ss.summary AS summary"
+            rows = conn.execute(
+                f"""
+                SELECT s.name, s.kind, s.line, s.end_line, s.signature, s.is_exported,
+                       {summary_select}
                 FROM symbols s
                 JOIN files f ON f.id = s.file_id
+                {summary_join}
                 WHERE f.path = ?
                 ORDER BY s.is_exported DESC, s.line ASC
                 LIMIT ?
@@ -554,8 +702,73 @@ class SoulForgeMap:
                 end_line=int(row["end_line"] or row["line"] or 0),
                 signature=str(row["signature"]) if row["signature"] is not None else None,
                 is_exported=bool(row["is_exported"]),
+                summary=str(row["summary"]) if row["summary"] is not None else None,
             )
             for row in rows
+        ]
+
+    def dependent_count_for_file(self, path: str) -> int:
+        if not self.available:
+            return 0
+        with self._connect() as conn:
+            if not self._has_table(conn, "edges"):
+                return 0
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM files f
+                JOIN edges e ON e.target_file_id = f.id
+                WHERE f.path = ?
+                """,
+                (path,),
+            ).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def graph_neighbors_for_file(self, path: str, limit: int = 5) -> list[dict[str, float | str]]:
+        if not self.available:
+            return []
+        with self._connect() as conn:
+            if not self._has_table(conn, "edges"):
+                return []
+            rows = conn.execute(
+                """
+                SELECT other.path AS path, SUM(e.weight) AS weight
+                FROM files f
+                JOIN edges e ON e.source_file_id = f.id OR e.target_file_id = f.id
+                JOIN files other ON other.id = CASE
+                  WHEN e.source_file_id = f.id THEN e.target_file_id
+                  ELSE e.source_file_id
+                END
+                WHERE f.path = ?
+                GROUP BY other.path
+                ORDER BY weight DESC, other.path ASC
+                LIMIT ?
+                """,
+                (path, limit),
+            ).fetchall()
+        return [
+            {"path": str(row["path"]), "weight": float(row["weight"] or 0)}
+            for row in rows
+            if not is_generated_or_cache_path(str(row["path"]))
+        ]
+
+    def related_files_for_paths(self, paths: Iterable[str], limit: int) -> list[str]:
+        if not self.available or limit <= 0:
+            return []
+        base_paths = set(paths)
+        scores: dict[str, float] = {}
+        for path in base_paths:
+            for neighbor in self.graph_neighbors_for_file(path, limit=limit):
+                candidate = str(neighbor["path"])
+                if candidate not in base_paths:
+                    scores[candidate] = scores.get(candidate, 0) + float(neighbor["weight"])
+            for partner in self.cochanges_for_file(path, limit=limit):
+                candidate = str(partner["path"])
+                if candidate not in base_paths and not is_generated_or_cache_path(candidate):
+                    scores[candidate] = scores.get(candidate, 0) + int(partner["count"]) * 0.5
+        return [
+            path
+            for path, _score in sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:limit]
         ]
 
     def intent_files(self, tokens: list[str], limit: int) -> list[str]:
@@ -633,11 +846,144 @@ def target_files_for_mode(
     top: int,
 ) -> list[str]:
     if mode == "pr":
-        return source_git_state.pr_files
+        changed = [
+            path
+            for path in source_git_state.pr_files
+            if not is_generated_or_cache_path(path)
+        ]
+        related = soul_map.related_files_for_paths(changed, max(0, top - len(changed)))
+        return unique_ordered([*changed, *related])[:top]
     if mode == "local":
-        return selected_files(source_git_state, "all")
+        return [
+            path
+            for path in selected_files(source_git_state, "all")
+            if not is_generated_or_cache_path(path)
+        ][:top]
     tokens = tokenize_intent(intent or "")
-    return soul_map.intent_files(tokens, top)
+    return [
+        path
+        for path in soul_map.intent_files(tokens, top)
+        if not is_generated_or_cache_path(path)
+    ]
+
+
+def rank_target_entry(
+    entry: dict[str, object],
+    source_git_state: GitState,
+    *,
+    mode: Mode,
+) -> dict[str, object]:
+    path = str(entry["path"])
+    role = file_role(path)
+    changed_file = path in source_git_state.pr_files
+    dirty_file = mode != "pr" and path in selected_files(source_git_state, "dirty")
+    changed_symbols = entry.get("changed_symbols")
+    symbol_list = changed_symbols if isinstance(changed_symbols, list) else []
+    cochanges = entry.get("cochanges")
+    graph_neighbors = entry.get("graph_neighbors")
+    pagerank = entry.get("pagerank")
+
+    signals: list[str] = []
+    reasons: list[str] = []
+    score = 0.0
+    if changed_file:
+        signals.append("changed_file")
+        reasons.append("changed in base...HEAD diff")
+        score += 1000
+    if dirty_file:
+        signals.append("dirty_file")
+        reasons.append("present in local staged/unstaged/untracked state")
+        score += 750
+    if role == "production":
+        signals.append("production_file")
+        score += 350 if changed_file or dirty_file else 80
+    elif role == "test":
+        signals.append("test_file")
+        reasons.append("test or verification surface")
+        score += 150 if changed_file or dirty_file else 40
+    else:
+        signals.append("generated_file")
+        score -= 1000
+    if symbol_list:
+        signals.append("changed_symbol")
+        reasons.append("contains symbols overlapping changed hunks")
+        score += 300
+    if isinstance(graph_neighbors, list) and graph_neighbors:
+        signals.append("graph_neighbor")
+        reasons.append("has import/reference graph neighbors in SoulForge map")
+        score += 90
+    if isinstance(cochanges, list) and cochanges:
+        signals.append("cochange_partner")
+        reasons.append("has historical co-change partners in SoulForge map")
+        score += 70
+    if isinstance(pagerank, float | int) and pagerank:
+        signals.append("pagerank")
+        score += min(float(pagerank) * 1000, 100)
+    broad_test_container = False
+    for symbol in symbol_list:
+        if not isinstance(symbol, dict):
+            continue
+        if role == "test" and symbol.get("kind") == "class":
+            start = int(symbol.get("line") or 0)
+            end = int(symbol.get("end_line") or 0)
+            if end - start > 400:
+                broad_test_container = True
+                break
+    if broad_test_container:
+        signals.append("broad_test_container")
+        reasons.append("broad test container kept as verification context")
+        score -= 250
+
+    entry["surface_role"] = role
+    entry["rank_signals"] = signals
+    entry["why_selected"] = reasons or ["selected by target mode"]
+    entry["priority_score"] = round(score, 4)
+    return entry
+
+
+def apply_task_state_to_entries(
+    target_entries: list[dict[str, object]],
+    task_state: dict[str, object] | None,
+) -> list[dict[str, object]]:
+    if not task_state:
+        return target_entries
+    boosts = [
+        ("edited_files", "edited_file", "edited during this task", 500),
+        ("read_files", "read_file", "read during this task", 180),
+        ("search_files", "search_hit", "matched a task search", 140),
+        ("mentioned_files", "mentioned_file", "mentioned in task context", 160),
+        ("previous_targets", "previous_target", "selected in a prior packet", 50),
+        ("gitnexus_confirmed_files", "gitnexus_confirmed", "confirmed by GitNexus", 220),
+        ("gitnexus_missing_files", "gitnexus_missing", "not confirmed by GitNexus", -160),
+    ]
+    for entry in target_entries:
+        path = str(entry["path"])
+        signals = entry.get("rank_signals")
+        if not isinstance(signals, list):
+            signals = []
+        reasons = entry.get("why_selected")
+        if not isinstance(reasons, list):
+            reasons = []
+        score = float(entry.get("priority_score") or 0)
+        for field, signal, reason, boost in boosts:
+            if path in task_state_paths(task_state, field):
+                if signal not in signals:
+                    signals.append(signal)
+                if reason not in reasons:
+                    reasons.append(reason)
+                score += boost
+        entry["rank_signals"] = signals
+        entry["why_selected"] = reasons
+        entry["priority_score"] = round(score, 4)
+    return sorted(
+        target_entries,
+        key=lambda entry: (
+            -float(entry.get("priority_score") or 0),
+            0 if entry.get("surface_role") == "production" else 1,
+            int(entry["rank"]) if isinstance(entry.get("rank"), int) else 999999,
+            str(entry["path"]),
+        ),
+    )
 
 
 def make_target_entries(
@@ -673,25 +1019,36 @@ def make_target_entries(
             dirty_kinds.append("unstaged")
         if path in source_git_state.untracked_files:
             dirty_kinds.append("untracked")
+        entry = {
+            "path": path,
+            "dirty_kinds": dirty_kinds,
+            "source_dirty_overlap": bool(dirty_kinds),
+            "scope_contaminated": mode != "pr" and bool(dirty_kinds),
+            "changed_ranges": ranges,
+            "in_soulforge_map": map_file is not None,
+            "rank": map_file.rank if map_file else None,
+            "pagerank": map_file.pagerank if map_file else None,
+            "symbol_count": map_file.symbol_count if map_file else None,
+            "line_count": map_file.line_count if map_file else None,
+            "changed_symbols": [symbol.__dict__ for symbol in changed_symbols],
+            "symbols": [symbol.__dict__ for symbol in display_symbols],
+            "dependent_count": soul_map.dependent_count_for_file(path),
+            "graph_neighbors": soul_map.graph_neighbors_for_file(path),
+            "cochanges": soul_map.cochanges_for_file(path),
+            "analysis_repo": str(analysis_repo),
+        }
         target_entries.append(
-            {
-                "path": path,
-                "dirty_kinds": dirty_kinds,
-                "source_dirty_overlap": bool(dirty_kinds),
-                "scope_contaminated": mode != "pr" and bool(dirty_kinds),
-                "changed_ranges": ranges,
-                "in_soulforge_map": map_file is not None,
-                "rank": map_file.rank if map_file else None,
-                "pagerank": map_file.pagerank if map_file else None,
-                "symbol_count": map_file.symbol_count if map_file else None,
-                "line_count": map_file.line_count if map_file else None,
-                "changed_symbols": [symbol.__dict__ for symbol in changed_symbols],
-                "symbols": [symbol.__dict__ for symbol in display_symbols],
-                "cochanges": soul_map.cochanges_for_file(path),
-                "analysis_repo": str(analysis_repo),
-            }
+            rank_target_entry(entry, source_git_state, mode=mode)
         )
-    return target_entries
+    return sorted(
+        target_entries,
+        key=lambda entry: (
+            -float(entry.get("priority_score") or 0),
+            0 if entry.get("surface_role") == "production" else 1,
+            int(entry["rank"]) if isinstance(entry.get("rank"), int) else 999999,
+            str(entry["path"]),
+        ),
+    )
 
 
 def build_gitnexus_plan(
@@ -747,6 +1104,137 @@ def build_gitnexus_section(
     }
 
 
+def apply_gitnexus_findings(
+    packet: dict[str, object],
+    findings: dict[str, object],
+) -> dict[str, object]:
+    gitnexus = packet.get("gitnexus")
+    if not isinstance(gitnexus, dict):
+        raise RuntimeError("packet missing gitnexus section")
+    warnings = packet.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+        packet["warnings"] = warnings
+
+    stale = bool(findings.get("stale_index"))
+    unavailable = bool(findings.get("unavailable"))
+    if stale:
+        warnings.append("GitNexus index is stale; blast-radius claims are blocked")
+    if unavailable:
+        warnings.append("GitNexus is unavailable; blast-radius claims are blocked")
+
+    confirmed = set(str(item) for item in findings.get("confirmed_files", []) if str(item))
+    missing = set(str(item) for item in findings.get("missing_files", []) if str(item))
+    impacted = set(str(item) for item in findings.get("impacted_files", []) if str(item))
+    targets = packet.get("targets")
+    if isinstance(targets, list):
+        known = {
+            str(target.get("path"))
+            for target in targets
+            if isinstance(target, dict) and target.get("path")
+        }
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            path = str(target.get("path") or "")
+            signals = target.get("rank_signals")
+            if not isinstance(signals, list):
+                signals = []
+            reasons = target.get("why_selected")
+            if not isinstance(reasons, list):
+                reasons = []
+            if path in confirmed:
+                signals.append("gitnexus_confirmed")
+                reasons.append("confirmed by GitNexus impact/context")
+            if path in missing:
+                signals.append("gitnexus_missing")
+                reasons.append("not confirmed by GitNexus impact/context")
+            target["rank_signals"] = unique_ordered(str(item) for item in signals)
+            target["why_selected"] = unique_ordered(str(item) for item in reasons)
+        absent_impacts = sorted(impacted - known)
+        if absent_impacts:
+            warnings.append(
+                "GitNexus found impacted files absent from map packet: "
+                + ", ".join(absent_impacts[:10])
+            )
+            gitnexus["absent_impacted_files"] = absent_impacts
+
+    gitnexus["status"] = "blocked" if stale or unavailable else "merged"
+    gitnexus["findings"] = findings
+    return packet
+
+
+def make_blocker_packet(
+    repo: Path,
+    *,
+    reason: str,
+    base_ref: str | None,
+    head_ref: str,
+    suggestions: list[dict[str, str]] | None = None,
+) -> dict[str, object]:
+    source_repo = repo_root(repo)
+    head_sha = run_git(source_repo, ["rev-parse", head_ref], allow_fail=True)
+    git_state = read_git_state(source_repo, base_ref or head_ref, head_ref)
+    return {
+        "schema_version": 1,
+        "blocked": True,
+        "blocker": {
+            "reason": reason,
+            "worktree_suggestions": suggestions or [],
+        },
+        "repo": str(source_repo),
+        "mode": "blocked",
+        "scope": "blocked",
+        "intent": None,
+        "token_budget": DEFAULT_TOKEN_BUDGET,
+        "warnings": [reason],
+        "target_state": {
+            "source_repo": str(source_repo),
+            "analysis_repo": str(source_repo),
+            "base_ref": base_ref or "",
+            "head_ref": head_ref,
+            "head_sha": head_sha,
+            "source_dirty": is_dirty(source_repo),
+            "target_dirty": is_dirty(source_repo),
+            "cache_key": None,
+            "detached": is_detached(source_repo),
+        },
+        "git": {
+            "branch": git_state.branch,
+            "head": git_state.head,
+            "base_ref": git_state.base_ref,
+            "merge_base": git_state.merge_base,
+            "pr_files": git_state.pr_files,
+            "staged_files": git_state.staged_files,
+            "unstaged_files": git_state.unstaged_files,
+            "untracked_files": git_state.untracked_files,
+        },
+        "soulforge": {
+            "build": {
+                "attempted": False,
+                "command": [],
+                "returncode": None,
+                "warning": reason,
+            },
+            "stats": {"available": False, "path": str(source_repo / ".soulforge" / "repomap.db")},
+            "top_files": [],
+        },
+        "targets": [],
+        "gitnexus": build_gitnexus_section([], TargetState(
+            mode="local",
+            source_repo=source_repo,
+            analysis_repo=source_repo,
+            base_ref=base_ref or "",
+            head_ref=head_ref,
+            head_sha=head_sha,
+            source_dirty=is_dirty(source_repo),
+            target_dirty=is_dirty(source_repo),
+            cache_key=None,
+        ), source_repo.name),
+        "gitnexus_plan": [],
+    }
+
+
 def make_packet(
     repo: Path,
     *,
@@ -762,6 +1250,7 @@ def make_packet(
     map_timeout_ms: int,
     allow_missing_map: bool,
     gitnexus_repo: str | None,
+    task_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
     target_state = resolve_target_state(repo, mode, base_ref, head_ref, cache_dir)
     gitignore_dirty_before_build = ".gitignore" in dirty_paths(target_state.analysis_repo)
@@ -792,6 +1281,7 @@ def make_packet(
         soul_map=soul_map,
         targets=targets,
     )
+    target_entries = apply_task_state_to_entries(target_entries, task_state)
     plan = build_gitnexus_plan(target_entries, gitnexus_repo)
 
     warnings = []
@@ -810,6 +1300,7 @@ def make_packet(
         "mode": mode,
         "scope": "pr" if mode == "pr" else ("dirty" if mode == "local" else "intent"),
         "intent": intent,
+        "task_state": task_state,
         "token_budget": token_budget,
         "warnings": warnings,
         "target_state": {
@@ -853,6 +1344,18 @@ def render_target_lines(target: dict[str, object], *, max_symbols: int = 8) -> l
     rank = target["rank"] if target["rank"] is not None else "not indexed"
     lines.append(f"### {target['path']}")
     lines.append(f"- map rank: {rank}")
+    if target.get("surface_role"):
+        lines.append(f"- role: {target['surface_role']}")
+    if target.get("priority_score") is not None:
+        lines.append(f"- priority score: {target['priority_score']}")
+    rank_signals = target.get("rank_signals")
+    if isinstance(rank_signals, list) and rank_signals:
+        lines.append(f"- rank signals: {', '.join(str(item) for item in rank_signals)}")
+    why_selected = target.get("why_selected")
+    if isinstance(why_selected, list) and why_selected:
+        lines.append(f"- why selected: {'; '.join(str(item) for item in why_selected)}")
+    if target.get("dependent_count") is not None:
+        lines.append(f"- dependent count: {target['dependent_count']}")
     dirty_kinds = target.get("dirty_kinds")
     if isinstance(dirty_kinds, list) and dirty_kinds:
         lines.append(f"- source dirty overlap: {', '.join(str(item) for item in dirty_kinds)}")
@@ -885,6 +1388,14 @@ def render_target_lines(target: dict[str, object], *, max_symbols: int = 8) -> l
             prefix = "+" if symbol.get("is_exported") else " "
             signature = symbol.get("signature") or f"{symbol.get('kind')} {symbol.get('name')}"
             lines.append(f"  - `{prefix}{signature}` line {symbol.get('line')}")
+            if symbol.get("summary"):
+                lines.append(f"    - summary: {symbol['summary']}")
+    graph_neighbors = target.get("graph_neighbors")
+    if isinstance(graph_neighbors, list) and graph_neighbors:
+        lines.append("- graph neighbors:")
+        for neighbor in graph_neighbors[:5]:
+            if isinstance(neighbor, dict):
+                lines.append(f"  - `{neighbor['path']}` ({neighbor['weight']})")
     cochanges = target.get("cochanges")
     if isinstance(cochanges, list) and cochanges:
         lines.append("- co-change partners:")
@@ -981,6 +1492,33 @@ def render_prompt(packet: dict[str, object]) -> str:
 
     lines = [
         '<repo_context_packet schema_version="1">',
+    ]
+    if packet.get("blocked"):
+        blocker = packet.get("blocker")
+        reason = ""
+        suggestions: list[object] = []
+        if isinstance(blocker, dict):
+            reason = str(blocker.get("reason") or "")
+            raw_suggestions = blocker.get("worktree_suggestions")
+            if isinstance(raw_suggestions, list):
+                suggestions = raw_suggestions
+        lines.extend(
+            [
+                f"  <blocker reason=\"{html.escape(reason)}\">",
+                "    <worktree_suggestions>",
+            ]
+        )
+        for suggestion in suggestions:
+            if isinstance(suggestion, dict):
+                path = html.escape(str(suggestion.get("path") or ""))
+                branch = html.escape(str(suggestion.get("branch") or ""))
+                head = html.escape(str(suggestion.get("head") or ""))
+                detached = html.escape(str(suggestion.get("detached") or "false"))
+                lines.append(
+                    f"      <worktree path=\"{path}\" branch=\"{branch}\" head=\"{head}\" detached=\"{detached}\"/>"
+                )
+        lines.extend(["    </worktree_suggestions>", "  </blocker>"])
+    lines.extend([
         "  <target_state>",
         f"    <mode>{html.escape(str(packet['mode']))}</mode>",
         f"    <source_repo>{html.escape(str(target_state['source_repo']))}</source_repo>",
@@ -997,7 +1535,7 @@ def render_prompt(packet: dict[str, object]) -> str:
         "    Run the GitNexus required checks before editing production code.",
         "  </scope_rules>",
         "  <warnings>",
-    ]
+    ])
     warnings = packet.get("warnings")
     if isinstance(warnings, list):
         for warning in warnings:
@@ -1008,6 +1546,22 @@ def render_prompt(packet: dict[str, object]) -> str:
             continue
         lines.append(f"    <file path=\"{html.escape(str(target['path']))}\">")
         lines.append(f"      <rank>{html.escape(str(target.get('rank')))}</rank>")
+        lines.append(f"      <role>{html.escape(str(target.get('surface_role') or 'unknown'))}</role>")
+        lines.append(f"      <priority_score>{html.escape(str(target.get('priority_score') or 0))}</priority_score>")
+        rank_signals = target.get("rank_signals")
+        if isinstance(rank_signals, list):
+            lines.append("      <rank_signals>")
+            for signal in rank_signals:
+                lines.append(f"        <signal>{html.escape(str(signal))}</signal>")
+            lines.append("      </rank_signals>")
+        why_selected = target.get("why_selected")
+        if isinstance(why_selected, list):
+            lines.append("      <why_selected>")
+            for reason in why_selected:
+                lines.append(f"        <reason>{html.escape(str(reason))}</reason>")
+            lines.append("      </why_selected>")
+        if target.get("dependent_count") is not None:
+            lines.append(f"      <dependent_count>{html.escape(str(target['dependent_count']))}</dependent_count>")
         changed_symbols = target.get("changed_symbols")
         symbols = changed_symbols if isinstance(changed_symbols, list) and changed_symbols else target.get("symbols")
         if isinstance(symbols, list):
@@ -1023,6 +1577,8 @@ def render_prompt(packet: dict[str, object]) -> str:
                 lines.append(
                     f"        <symbol name=\"{name}\" kind=\"{kind}\" line=\"{start}\" end_line=\"{end}\">{signature}</symbol>"
                 )
+                if symbol.get("summary"):
+                    lines.append(f"        <summary>{html.escape(str(symbol['summary']))}</summary>")
             lines.append("      </symbols>")
         lines.append("    </file>")
     lines.extend(["  </targets>", "  <gitnexus_required_checks>"])
@@ -1187,6 +1743,57 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     benchmark.add_argument("--gitnexus-repo")
     benchmark.add_argument("--out", type=Path)
 
+    context_start = subcommands.add_parser("context-start", help="Start a task context and render its packet")
+    context_start.add_argument("--repo", required=True, type=Path)
+    context_start.add_argument("--mode", choices=["pr", "local", "intent"], default="pr")
+    context_start.add_argument("--base", default="main")
+    context_start.add_argument("--head", default="HEAD")
+    context_start.add_argument("--intent")
+    context_start.add_argument("--task-id")
+    context_start.add_argument("--top", type=int, default=20)
+    context_start.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    context_start.add_argument("--soulforge-bin")
+    context_start.add_argument("--map-build", choices=["auto", "always", "never"], default="auto")
+    context_start.add_argument("--map-timeout-ms", type=int, default=120_000)
+    context_start.add_argument("--allow-missing-map", action="store_true")
+    context_start.add_argument("--gitnexus-repo")
+    context_start.add_argument("--out", type=Path)
+
+    context_refresh = subcommands.add_parser("context-refresh", help="Refresh a task context packet")
+    context_refresh.add_argument("--repo", required=True, type=Path)
+    context_refresh.add_argument("--mode", choices=["pr", "local", "intent"], default="pr")
+    context_refresh.add_argument("--base", default="main")
+    context_refresh.add_argument("--head", default="HEAD")
+    context_refresh.add_argument("--task-id", required=True)
+    context_refresh.add_argument("--top", type=int, default=20)
+    context_refresh.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    context_refresh.add_argument("--soulforge-bin")
+    context_refresh.add_argument("--map-build", choices=["auto", "always", "never"], default="auto")
+    context_refresh.add_argument("--map-timeout-ms", type=int, default=120_000)
+    context_refresh.add_argument("--allow-missing-map", action="store_true")
+    context_refresh.add_argument("--gitnexus-repo")
+    context_refresh.add_argument("--out", type=Path)
+
+    for command_name, help_text in (
+        ("context-record-read", "Record files read during the task"),
+        ("context-record-search", "Record files matched by search during the task"),
+        ("context-record-edit", "Record files edited during the task"),
+        ("context-record-mention", "Record files mentioned during the task"),
+    ):
+        parser_for_event = subcommands.add_parser(command_name, help=help_text)
+        parser_for_event.add_argument("--repo", required=True, type=Path)
+        parser_for_event.add_argument("--head", default="HEAD")
+        parser_for_event.add_argument("--task-id", required=True)
+        parser_for_event.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+        parser_for_event.add_argument("paths", nargs="+")
+
+    gitnexus_merge = subcommands.add_parser("gitnexus-merge", help="Merge GitNexus findings into a packet")
+    gitnexus_merge.add_argument("--repo", required=True, type=Path)
+    gitnexus_merge.add_argument("--packet", required=True, type=Path)
+    gitnexus_merge.add_argument("--findings", required=True, type=Path)
+    gitnexus_merge.add_argument("--format", choices=["markdown", "json", "prompt"], default="prompt")
+    gitnexus_merge.add_argument("--out", type=Path)
+
     wrap = subcommands.add_parser("wrap", help="Generate a prompt packet and optionally run a command")
     wrap.add_argument("--repo", required=True, type=Path)
     wrap.add_argument("--mode", choices=["pr", "local", "intent"], default="pr")
@@ -1243,6 +1850,89 @@ def main(argv: list[str]) -> int:
         return 2
 
     try:
+        if args.command == "context-start":
+            head_sha = run_git(repo_root(repo), ["rev-parse", args.head])
+            task_id = args.task_id or default_task_id(repo_root(repo), head_sha, args.intent)
+            state_path = task_state_path(args.cache_dir.resolve(), repo_root(repo), head_sha, task_id)
+            state = empty_task_state(repo_root(repo), head_sha, task_id, args.intent)
+            packet = make_packet(
+                repo,
+                mode=args.mode,
+                base_ref=args.base,
+                head_ref=args.head,
+                intent=args.intent,
+                top=args.top,
+                token_budget=DEFAULT_TOKEN_BUDGET,
+                cache_dir=args.cache_dir.resolve(),
+                soulforge_bin=find_soulforge_binary(args.soulforge_bin),
+                map_build=args.map_build,
+                map_timeout_ms=args.map_timeout_ms,
+                allow_missing_map=args.allow_missing_map,
+                gitnexus_repo=args.gitnexus_repo,
+                task_state=state,
+            )
+            state["previous_targets"] = [
+                str(target["path"])
+                for target in packet["targets"]
+                if isinstance(target, dict)
+            ]
+            save_task_state(state_path, state)
+            output_text(render_prompt(packet), args.out)
+            return 0
+
+        if args.command == "context-refresh":
+            head_sha = run_git(repo_root(repo), ["rev-parse", args.head])
+            state_path = task_state_path(args.cache_dir.resolve(), repo_root(repo), head_sha, args.task_id)
+            state = load_task_state(state_path)
+            packet = make_packet(
+                repo,
+                mode=args.mode,
+                base_ref=args.base,
+                head_ref=args.head,
+                intent=str(state.get("intent") or ""),
+                top=args.top,
+                token_budget=DEFAULT_TOKEN_BUDGET,
+                cache_dir=args.cache_dir.resolve(),
+                soulforge_bin=find_soulforge_binary(args.soulforge_bin),
+                map_build=args.map_build,
+                map_timeout_ms=args.map_timeout_ms,
+                allow_missing_map=args.allow_missing_map,
+                gitnexus_repo=args.gitnexus_repo,
+                task_state=state,
+            )
+            state["previous_targets"] = [
+                str(target["path"])
+                for target in packet["targets"]
+                if isinstance(target, dict)
+            ]
+            save_task_state(state_path, state)
+            output_text(render_prompt(packet), args.out)
+            return 0
+
+        if args.command.startswith("context-record-"):
+            event_by_command: dict[str, TaskEvent] = {
+                "context-record-read": "read",
+                "context-record-search": "search",
+                "context-record-edit": "edit",
+                "context-record-mention": "mention",
+            }
+            head_sha = run_git(repo_root(repo), ["rev-parse", args.head])
+            state_path = task_state_path(args.cache_dir.resolve(), repo_root(repo), head_sha, args.task_id)
+            state = load_task_state(state_path)
+            record_task_event(state, event_by_command[args.command], args.paths)
+            save_task_state(state_path, state)
+            output_text(json.dumps(state, indent=2, sort_keys=True) + "\n", None)
+            return 0
+
+        if args.command == "gitnexus-merge":
+            packet = json.loads(args.packet.read_text(encoding="utf-8"))
+            findings = json.loads(args.findings.read_text(encoding="utf-8"))
+            if not isinstance(packet, dict) or not isinstance(findings, dict):
+                raise RuntimeError("packet and findings must be JSON objects")
+            merged = apply_gitnexus_findings(packet, findings)
+            output_text(render_packet(merged, args.format), args.out)
+            return 0
+
         if args.command == "wrap":
             token_budget = compute_token_budget(args.conversation_tokens, args.token_budget)
             packet = make_packet(

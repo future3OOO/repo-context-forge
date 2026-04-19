@@ -30,17 +30,28 @@ The plugin startup path is:
 5. Codex runs the packet's GitNexus checks before editing when GitNexus MCP is
    available.
 
+In production plugin mode, an ambiguous checkout fails closed. For example, a
+detached clean checkout with no PR diff emits a blocker packet with sibling
+worktree suggestions instead of pretending there is useful local context.
+
 ## What It Does
 
 - `pr` mode creates or reuses a clean cached git worktree at the target head.
 - `local` mode analyzes the current dirty worktree and marks dirty state.
 - `intent` mode searches the ambient map from a user-described change request.
+- native ranking combines changed hunks, production/test role, PageRank,
+  SoulForge graph neighbors, co-change partners, semantic summaries, and task
+  refresh signals.
 - output can be Markdown, JSON, or an XML prompt packet for upstream injection.
 - packets include GitNexus required-check entries for context and impact calls.
+- `gitnexus-merge` merges real GitNexus findings and blocks stale blast-radius
+  claims.
 - `wrap` writes the prompt packet and can pass it to another command before
   that command starts reasoning.
 - `scripts/codex_context_bootstrap.py` is the plugin entrypoint Codex uses to
   avoid manual per-project commands.
+- `context-start`, `context-record-*`, and `context-refresh` provide the
+  per-turn personalization layer.
 - `benchmark` generates no-map, ambient-map, and clean-target-map comparison
   inputs for testing agent behavior.
 

@@ -90,6 +90,133 @@ class RepoContextForgeTests(unittest.TestCase):
             ],
         )
 
+    def test_rank_target_entry_prioritizes_changed_production_over_broad_test(self) -> None:
+        state = repo_context_forge.GitState(
+            branch="feature",
+            head="abc123",
+            base_ref="origin/main",
+            merge_base="base",
+            pr_files=[
+                "workers/browser-automation/browser_automation_worker/cli.py",
+                "tests/python/test_browser_automation_worker.py",
+            ],
+            staged_files=[],
+            unstaged_files=[],
+            untracked_files=[],
+        )
+        production = repo_context_forge.rank_target_entry(
+            {
+                "path": "workers/browser-automation/browser_automation_worker/cli.py",
+                "changed_symbols": [{"name": "_capture", "kind": "function", "line": 10, "end_line": 20}],
+                "cochanges": [],
+                "graph_neighbors": [],
+                "pagerank": 0.01,
+            },
+            state,
+            mode="pr",
+        )
+        broad_test = repo_context_forge.rank_target_entry(
+            {
+                "path": "tests/python/test_browser_automation_worker.py",
+                "changed_symbols": [{"name": "BrowserAutomationWorkerTests", "kind": "class", "line": 1, "end_line": 5000}],
+                "cochanges": [],
+                "graph_neighbors": [],
+                "pagerank": 0.8,
+            },
+            state,
+            mode="pr",
+        )
+
+        self.assertGreater(production["priority_score"], broad_test["priority_score"])
+        self.assertIn("production_file", production["rank_signals"])
+        self.assertIn("broad_test_container", broad_test["rank_signals"])
+
+    def test_pr_ranking_does_not_boost_source_dirty_overlap(self) -> None:
+        state = repo_context_forge.GitState(
+            branch="feature",
+            head="abc123",
+            base_ref="origin/main",
+            merge_base="base",
+            pr_files=[],
+            staged_files=["src/dirty.py"],
+            unstaged_files=[],
+            untracked_files=[],
+        )
+
+        entry = repo_context_forge.rank_target_entry(
+            {
+                "path": "src/dirty.py",
+                "changed_symbols": [],
+                "cochanges": [],
+                "graph_neighbors": [],
+                "pagerank": 0.01,
+            },
+            state,
+            mode="pr",
+        )
+
+        self.assertNotIn("dirty_file", entry["rank_signals"])
+
+    def test_task_state_boosts_edited_files(self) -> None:
+        entries = [
+            {
+                "path": "src/a.py",
+                "surface_role": "production",
+                "rank": 2,
+                "priority_score": 10,
+                "rank_signals": [],
+                "why_selected": [],
+            },
+            {
+                "path": "src/b.py",
+                "surface_role": "production",
+                "rank": 1,
+                "priority_score": 20,
+                "rank_signals": [],
+                "why_selected": [],
+            },
+        ]
+        state = {"schema_version": 1, "edited_files": ["src/a.py"]}
+
+        ranked = repo_context_forge.apply_task_state_to_entries(entries, state)
+
+        self.assertEqual(ranked[0]["path"], "src/a.py")
+        self.assertIn("edited_file", ranked[0]["rank_signals"])
+
+    def test_record_task_event_deduplicates_paths(self) -> None:
+        state = {"schema_version": 1, "read_files": ["src/a.py"]}
+
+        repo_context_forge.record_task_event(state, "read", ["src/a.py", "src/b.py"])
+
+        self.assertEqual(state["read_files"], ["src/a.py", "src/b.py"])
+
+    def test_gitnexus_findings_block_stale_blast_radius_claims(self) -> None:
+        packet = {
+            "warnings": [],
+            "targets": [
+                {
+                    "path": "src/a.py",
+                    "rank_signals": [],
+                    "why_selected": [],
+                }
+            ],
+            "gitnexus": {"status": "planned"},
+        }
+
+        merged = repo_context_forge.apply_gitnexus_findings(
+            packet,
+            {
+                "stale_index": True,
+                "confirmed_files": ["src/a.py"],
+                "impacted_files": ["src/missing.py"],
+            },
+        )
+
+        self.assertEqual(merged["gitnexus"]["status"], "blocked")
+        self.assertIn("gitnexus_confirmed", merged["targets"][0]["rank_signals"])
+        self.assertIn("GitNexus index is stale; blast-radius claims are blocked", merged["warnings"])
+        self.assertEqual(merged["gitnexus"]["absent_impacted_files"], ["src/missing.py"])
+
     def test_parse_unified_diff_new_ranges(self) -> None:
         diff = "\n".join(
             [
@@ -165,6 +292,68 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertEqual(
             repo_context_forge.parse_porcelain_paths(" M .gitignore\n?? .soulforge/repomap.db\n"),
             [".gitignore", ".soulforge/repomap.db"],
+        )
+
+    def test_blocker_prompt_renders_worktree_suggestions(self) -> None:
+        packet = {
+            "schema_version": 1,
+            "blocked": True,
+            "blocker": {
+                "reason": "detached checkout has no target surface",
+                "worktree_suggestions": [
+                    {"path": "/repo/worktree", "branch": "feature", "head": "abc123"}
+                ],
+            },
+            "mode": "blocked",
+            "target_state": {
+                "source_repo": "/repo",
+                "analysis_repo": "/repo",
+                "base_ref": "main",
+                "head_ref": "HEAD",
+                "head_sha": "abc123",
+                "source_dirty": False,
+                "target_dirty": False,
+            },
+            "targets": [],
+            "warnings": ["detached checkout has no target surface"],
+            "gitnexus": {"plan": []},
+        }
+
+        rendered = repo_context_forge.render_prompt(packet)
+
+        self.assertIn("<blocker", rendered)
+        self.assertIn("/repo/worktree", rendered)
+
+    def test_bootstrap_blocks_detached_empty_checkout(self) -> None:
+        state = repo_context_forge.GitState(
+            branch="(detached)",
+            head="abc123",
+            base_ref="origin/main",
+            merge_base="base",
+            pr_files=[],
+            staged_files=[],
+            unstaged_files=[],
+            untracked_files=[],
+        )
+        original_read_git_state = codex_context_bootstrap.forge.read_git_state
+        original_is_detached = codex_context_bootstrap.forge.is_detached
+        codex_context_bootstrap.forge.read_git_state = lambda *_args, **_kwargs: state
+        codex_context_bootstrap.forge.is_detached = lambda _repo: True
+        try:
+            reason = codex_context_bootstrap.should_block_empty_checkout(
+                Path("/repo"),
+                "local",
+                "origin/main",
+                "HEAD",
+                None,
+            )
+        finally:
+            codex_context_bootstrap.forge.read_git_state = original_read_git_state
+            codex_context_bootstrap.forge.is_detached = original_is_detached
+
+        self.assertEqual(
+            reason,
+            "detached checkout has no target surface; select the active PR worktree",
         )
 
     def test_cache_key_is_stable(self) -> None:

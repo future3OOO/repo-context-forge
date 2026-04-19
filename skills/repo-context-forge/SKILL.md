@@ -21,6 +21,10 @@ The path is relative to this `SKILL.md`.
 2. Treat the script output as the initial repository context packet for the
 current task.
 
+If the script exits non-zero and emits a `<blocker>`, stop normal repo analysis
+and surface the blocker. Do not continue with an empty or detached checkout
+packet.
+
 3. Follow the packet's `<scope_rules>`:
 
 - use `<targets>` as the first-pass edit/review surface
@@ -40,6 +44,10 @@ The bootstrap script auto-selects the mode:
 - `intent`: pass `--intent "<user request>"` when there are no changes yet and
   the user's request describes planned work
 
+Detached clean checkouts with no target surface are blockers in production mode.
+Use the packet's worktree suggestions or an explicit user-provided checkout
+instead of guessing.
+
 For a user-described implementation before edits, prefer:
 
 ```bash
@@ -54,6 +62,22 @@ For each `<check>` in `<gitnexus_required_checks>`:
 - `kind="symbol_impact"` means call `gitnexus_impact` upstream for that symbol
 - if GitNexus reports a stale or missing index, reindex or state the blocker
   before trusting blast-radius claims
+
+## Turn Refresh
+
+When Codex materially changes context during a longer task, record it before
+refreshing the packet. Start a task context with an explicit task id:
+
+```bash
+python3 ../../repo_context_forge.py context-start --repo "$PWD" --task-id <id>
+python3 ../../repo_context_forge.py context-record-read --repo "$PWD" --task-id <id> <path>
+python3 ../../repo_context_forge.py context-record-search --repo "$PWD" --task-id <id> <path>
+python3 ../../repo_context_forge.py context-record-edit --repo "$PWD" --task-id <id> <path>
+python3 ../../repo_context_forge.py context-refresh --repo "$PWD" --task-id <id>
+```
+
+The refreshed packet boosts edited, read, searched, and mentioned files while
+preserving changed-hunk priority.
 
 ## Do Not
 
