@@ -42,6 +42,8 @@ packet.
 - in `pr` mode, do not treat dirty source-worktree files as PR targets
 - run the listed `<gitnexus_required_checks>` before editing production code
   when GitNexus MCP tools are available
+- do not run `gitnexus_detect_changes(compare)` as the initial PR analysis;
+  the packet already reindexed GitNexus and scoped the required checks
 
 4. If the packet says SoulForge is unavailable, continue only with the explicit
 fallback surface in the packet and say that symbol-level map data was missing.
@@ -84,9 +86,10 @@ For each `<check>` in `<gitnexus_required_checks>`:
   execution-flow impact
 - cite summary source when semantic summaries materially affect target choice
   or code reasoning
-- do not use `gitnexus_detect_changes(compare)` as PR-diff authority when it
-  conflicts with live `base...HEAD` files or the packet's `pr` targets; use it
-  only as additional graph evidence after the packet target surface is fixed
+- do not use `gitnexus_detect_changes(compare)` for initial PR scoping; it is
+  not packet-scoped and can overreport unrelated historical surfaces
+- use `gitnexus_detect_changes` only after local edits, before commit, or as
+  supplemental graph evidence after the packet target surface is fixed
 - trust blast-radius claims only when `<gitnexus_status>` is `fresh` or
   `reindexed` and `required_checks_resolved` is true
 

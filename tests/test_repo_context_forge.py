@@ -1013,6 +1013,11 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("sources=synthetic=2", captured["text"])
         self.assertIn("gitnexus: repo=example-index; status=fresh", captured["text"])
         self.assertIn("src/a.py", captured["text"])
+        self.assertIn(
+            "Do not run gitnexus_detect_changes(compare) as the initial PR analysis",
+            captured["text"],
+        )
+        self.assertIn("Run the listed gitnexus_required_checks first", captured["text"])
         self.assertIn("END_REPO_CONTEXT_FORGE_REQUIRED_INTAKE\n<repo_context_packet/>", captured["text"])
 
     def test_cache_key_is_stable(self) -> None:
@@ -1083,6 +1088,10 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("<token_budget>16000</token_budget>", rendered)
         self.assertIn("<context_digest>", rendered)
         self.assertIn("<required_agent_intake>", rendered)
+        self.assertIn(
+            "Do not run gitnexus_detect_changes(compare) as initial PR analysis",
+            rendered,
+        )
         self.assertIn("<semantic_sources>", rendered)
         self.assertIn("<semantic_summaries>", rendered)
         self.assertIn('<summary source="llm">Handles the selected packet target</summary>', rendered)

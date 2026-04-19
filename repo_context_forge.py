@@ -2391,8 +2391,10 @@ def render_required_intake(packet: dict[str, object]) -> str:
         [
             "required_behavior:",
             "- Report this intake before code reasoning, review findings, edits, or GitNexus claims.",
+            "- Do not run gitnexus_detect_changes(compare) as the initial PR analysis.",
+            "- Run the listed gitnexus_required_checks first; they are already scoped to the SoulForge packet and reindexed GitNexus repo.",
             "- Use packet targets and live base...HEAD diff as the PR surface.",
-            "- Use gitnexus_detect_changes only as extra graph evidence after the packet surface is fixed.",
+            "- Use gitnexus_detect_changes only after local edits or as extra graph evidence after the packet surface is fixed.",
             "END_REPO_CONTEXT_FORGE_REQUIRED_INTAKE",
             "",
         ]
@@ -2647,6 +2649,7 @@ def render_prompt(packet: dict[str, object]) -> str:
         "    Use files under <targets> as the first-pass edit/review surface.",
         "    Use <soulforge_impact> as native repo-map blast radius before file edits.",
         "    Use <gitnexus_status><repo> for every GitNexus MCP call for this packet.",
+        "    Do not run gitnexus_detect_changes(compare) as initial PR analysis; use the listed <gitnexus_required_checks> first.",
         "    Treat source dirty overlaps as warnings, not PR target files, when mode is pr.",
         "    Trust GitNexus blast-radius claims only when <gitnexus_status> is fresh or reindexed and required checks resolve.",
         "  </scope_rules>",
