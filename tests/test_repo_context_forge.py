@@ -1343,6 +1343,50 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn('path="src/a.py"', rendered)
         self.assertIn('target="handle"', rendered)
 
+    def test_render_prompt_omits_delegate_task_when_delegation_not_required(self) -> None:
+        packet = {
+            "mode": "local",
+            "token_budget": 16000,
+            "target_state": {
+                "source_repo": "/repo",
+                "analysis_repo": "/cache/repo",
+                "base_ref": "HEAD",
+                "head_ref": "HEAD",
+                "head_sha": "abc123",
+                "analysis_head_sha": "abc123",
+                "analysis_repo_is_cache_owned": True,
+                "analysis_head_matches_source_head": True,
+                "source_dirty": True,
+                "target_dirty": False,
+            },
+            "source_status": {"unchanged": True},
+            "policy": {"reference_only_prefixes": []},
+            "soulforge": {"target": {"status": "fresh", "target_head_verified": True}},
+            "semantic_summaries": {"mode": "full_cached", "source_counts": {}},
+            "gitnexus": {"status": "fresh", "repo": "repo", "plan": []},
+            "targets": [],
+            "warnings": [],
+            "coverage_plan": {
+                "required": True,
+                "delegation_required": False,
+                "areas": [
+                    {
+                        "id": "production_contract",
+                        "kind": "production",
+                        "required": True,
+                        "files": ["src/a.py"],
+                        "why": "changed production surface from the packet",
+                        "must_answer": "What changed?",
+                    }
+                ],
+            },
+        }
+
+        rendered = repo_context_forge.render_prompt(packet)
+
+        self.assertIn("<coverage_plan required=\"true\" delegation_required=\"false\">", rendered)
+        self.assertNotIn('<delegate_task action="spawn_agent">', rendered)
+
     def test_render_prompt_compacts_to_budget_and_preserves_gitnexus_checks(self) -> None:
         long_summary = "x" * 5000
         packet = {

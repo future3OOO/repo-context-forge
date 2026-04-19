@@ -1738,6 +1738,7 @@ def render_coverage_plan_lines(plan: object, indent: str) -> list[str]:
     plan = plan if isinstance(plan, dict) else {}
     areas = plan.get("areas")
     areas = areas if isinstance(areas, list) else []
+    delegation_required = bool(plan.get("delegation_required"))
     lines = [
         f"{indent}<coverage_plan required=\"{str(bool(plan.get('required'))).lower()}\" "
         f"delegation_required=\"{str(bool(plan.get('delegation_required'))).lower()}\">"
@@ -1762,9 +1763,10 @@ def render_coverage_plan_lines(plan: object, indent: str) -> list[str]:
             for path in files:
                 lines.append(f"{indent}      <file path=\"{html.escape(str(path))}\"/>")
         lines.append(f"{indent}    </files>")
-        lines.append(
-            f"{indent}    <delegate_task action=\"spawn_agent\">Review this coverage area independently before GitNexus calls, GitHub review comments, review findings, or edits. Answer: {html.escape(str(area.get('must_answer') or ''))}</delegate_task>"
-        )
+        if delegation_required:
+            lines.append(
+                f"{indent}    <delegate_task action=\"spawn_agent\">Review this coverage area independently before GitNexus calls, GitHub review comments, review findings, or edits. Answer: {html.escape(str(area.get('must_answer') or ''))}</delegate_task>"
+            )
         lines.append(f"{indent}  </area>")
     lines.append(f"{indent}</coverage_plan>")
     return lines
