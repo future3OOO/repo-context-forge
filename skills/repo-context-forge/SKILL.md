@@ -13,13 +13,15 @@ debug, refactor, explain, or plan work in a git repository.
 1. Resolve this skill's directory, then run the bootstrap script at:
 
 ```bash
-python3 ../../scripts/codex_context_bootstrap.py --repo "$PWD"
+python3 ../../scripts/codex_context_bootstrap.py --repo "$PWD" --enforce-intake
 ```
 
 The path is relative to this `SKILL.md`.
 
 2. Treat the script output as the initial repository context packet for the
-current task.
+current task. The output begins with `REPO_CONTEXT_FORGE_REQUIRED_INTAKE`; that
+banner is the enforced startup contract and must be reported before any code
+reasoning, review findings, edits, or GitNexus claims.
 
 If the script exits non-zero and emits a `<blocker>`, stop normal repo analysis
 and surface the blocker. Do not continue with an empty or detached checkout
@@ -27,6 +29,9 @@ packet.
 
 3. Follow the packet's `<scope_rules>`:
 
+- before code reasoning, review, or GitNexus calls, surface a short intake from
+  `<context_digest>`: mode, head SHA, token budget, semantic source counts, top
+  targets, SoulForge impact headline, and GitNexus repo/status
 - use `<targets>` as the first-pass edit/review surface
 - use `<soulforge_impact>` as native SoulForge blast-radius context before
   editing or reviewing selected files
@@ -61,7 +66,7 @@ git folder is the target.
 For a user-described implementation before edits, prefer:
 
 ```bash
-python3 ../../scripts/codex_context_bootstrap.py --repo "$PWD" --intent "<task>"
+python3 ../../scripts/codex_context_bootstrap.py --repo "$PWD" --intent "<task>" --enforce-intake
 ```
 
 ## GitNexus Follow-Up
@@ -79,6 +84,9 @@ For each `<check>` in `<gitnexus_required_checks>`:
   execution-flow impact
 - cite summary source when semantic summaries materially affect target choice
   or code reasoning
+- do not use `gitnexus_detect_changes(compare)` as PR-diff authority when it
+  conflicts with live `base...HEAD` files or the packet's `pr` targets; use it
+  only as additional graph evidence after the packet target surface is fixed
 - trust blast-radius claims only when `<gitnexus_status>` is `fresh` or
   `reindexed` and `required_checks_resolved` is true
 

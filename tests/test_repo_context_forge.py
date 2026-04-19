@@ -947,6 +947,74 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertEqual(captured["token_budget"], repo_context_forge.DEFAULT_TOKEN_BUDGET)
         self.assertGreaterEqual(captured["token_budget"], 16_000)
 
+    def test_bootstrap_can_emit_required_intake_before_packet(self) -> None:
+        captured: dict[str, str] = {}
+        originals = {
+            "is_git_repo": codex_context_bootstrap.forge.is_git_repo,
+            "repo_root": codex_context_bootstrap.forge.repo_root,
+            "first_existing_base": codex_context_bootstrap.first_existing_base,
+            "find_soulforge_binary": codex_context_bootstrap.forge.find_soulforge_binary,
+            "make_packet": codex_context_bootstrap.forge.make_packet,
+            "render_prompt": codex_context_bootstrap.forge.render_prompt,
+            "output_text": codex_context_bootstrap.forge.output_text,
+        }
+        packet = {
+            "schema_version": 1,
+            "mode": "pr",
+            "token_budget": 16000,
+            "target_state": {"head_sha": "abc123"},
+            "semantic_summaries": {
+                "mode": "full_cached",
+                "live_llm_generation": False,
+                "source_counts": {"synthetic": 2},
+            },
+            "gitnexus": {
+                "repo": "example-index",
+                "status": "fresh",
+                "required_checks_resolved": True,
+            },
+            "targets": [
+                {
+                    "path": "src/a.py",
+                    "priority_score": 10,
+                    "surface_role": "production",
+                    "rank_signals": ["changed_file"],
+                    "soulforge_impact": {"risk": "medium", "direct_dependents": 1},
+                }
+            ],
+        }
+
+        codex_context_bootstrap.forge.is_git_repo = lambda _repo: True
+        codex_context_bootstrap.forge.repo_root = lambda _repo: Path("/repo")
+        codex_context_bootstrap.first_existing_base = lambda *_args, **_kwargs: "main"
+        codex_context_bootstrap.forge.find_soulforge_binary = lambda _bin: None
+        codex_context_bootstrap.forge.make_packet = lambda *_args, **_kwargs: packet
+        codex_context_bootstrap.forge.render_prompt = lambda _packet: "<repo_context_packet/>\n"
+        codex_context_bootstrap.forge.output_text = (
+            lambda text, _out: captured.__setitem__("text", text)
+        )
+        try:
+            result = codex_context_bootstrap.main(
+                ["--repo", "/repo", "--mode", "repo", "--enforce-intake"]
+            )
+        finally:
+            codex_context_bootstrap.forge.is_git_repo = originals["is_git_repo"]
+            codex_context_bootstrap.forge.repo_root = originals["repo_root"]
+            codex_context_bootstrap.first_existing_base = originals["first_existing_base"]
+            codex_context_bootstrap.forge.find_soulforge_binary = originals["find_soulforge_binary"]
+            codex_context_bootstrap.forge.make_packet = originals["make_packet"]
+            codex_context_bootstrap.forge.render_prompt = originals["render_prompt"]
+            codex_context_bootstrap.forge.output_text = originals["output_text"]
+
+        self.assertEqual(result, 0)
+        self.assertTrue(captured["text"].startswith("REPO_CONTEXT_FORGE_REQUIRED_INTAKE"))
+        self.assertIn("mode: pr", captured["text"])
+        self.assertIn("token_budget: 16000", captured["text"])
+        self.assertIn("sources=synthetic=2", captured["text"])
+        self.assertIn("gitnexus: repo=example-index; status=fresh", captured["text"])
+        self.assertIn("src/a.py", captured["text"])
+        self.assertIn("END_REPO_CONTEXT_FORGE_REQUIRED_INTAKE\n<repo_context_packet/>", captured["text"])
+
     def test_cache_key_is_stable(self) -> None:
         key = repo_context_forge.cache_key_for(Path("/tmp/example"), "abc123")
 
@@ -1013,6 +1081,9 @@ class RepoContextForgeTests(unittest.TestCase):
 
         self.assertIn("<repo_context_packet", rendered)
         self.assertIn("<token_budget>16000</token_budget>", rendered)
+        self.assertIn("<context_digest>", rendered)
+        self.assertIn("<required_agent_intake>", rendered)
+        self.assertIn("<semantic_sources>", rendered)
         self.assertIn("<semantic_summaries>", rendered)
         self.assertIn('<summary source="llm">Handles the selected packet target</summary>', rendered)
         self.assertIn('<source name="llm" count="1"/>', rendered)
@@ -1085,6 +1156,8 @@ class RepoContextForgeTests(unittest.TestCase):
         rendered = repo_context_forge.render_prompt(packet)
 
         self.assertLessEqual(repo_context_forge.estimate_tokens(rendered), 1000)
+        self.assertIn("<context_digest>", rendered)
+        self.assertIn("<required_agent_intake>", rendered)
         self.assertIn('target="handle"', rendered)
         self.assertIn('path="src/a.py"', rendered)
         self.assertNotIn(long_summary, rendered)

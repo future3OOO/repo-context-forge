@@ -1586,6 +1586,17 @@ def semantic_summary_section(target_entries: list[dict[str, object]]) -> dict[st
     }
 
 
+def render_source_counts_lines(semantic: dict[str, object], indent: str) -> list[str]:
+    lines: list[str] = []
+    source_counts = semantic.get("source_counts")
+    if isinstance(source_counts, dict):
+        for source, count in source_counts.items():
+            lines.append(
+                f'{indent}<source name="{html.escape(str(source))}" count="{html.escape(str(count))}"/>'
+            )
+    return lines
+
+
 def build_gitnexus_section(
     plan: list[dict[str, str]],
     target_state: TargetState,
@@ -2279,6 +2290,116 @@ def render_markdown(packet: dict[str, object]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_context_digest_lines(packet: dict[str, object], *, indent: str = "  ") -> list[str]:
+    target_state = packet["target_state"]
+    gitnexus = packet["gitnexus"]
+    semantic = packet.get("semantic_summaries") or {}
+    targets = packet["targets"]
+    assert isinstance(target_state, dict)
+    assert isinstance(gitnexus, dict)
+    assert isinstance(semantic, dict)
+    assert isinstance(targets, list)
+    lines = [
+        f"{indent}<context_digest>",
+        f"{indent}  <required_agent_intake>State this packet's mode, head_sha, token_budget, semantic source counts, top targets, SoulForge impact headlines, and GitNexus repo/status before code reasoning.</required_agent_intake>",
+        f"{indent}  <mode>{html.escape(str(packet['mode']))}</mode>",
+        f"{indent}  <head_sha>{html.escape(str(target_state.get('head_sha') or ''))}</head_sha>",
+        f"{indent}  <token_budget>{html.escape(str(packet.get('token_budget') or DEFAULT_TOKEN_BUDGET))}</token_budget>",
+        f"{indent}  <semantic_mode>{html.escape(str(semantic.get('mode') or 'unknown'))}</semantic_mode>",
+        f"{indent}  <semantic_sources>",
+    ]
+    lines.extend(render_source_counts_lines(semantic, f"{indent}    "))
+    lines.extend([
+        f"{indent}  </semantic_sources>",
+        f"{indent}  <gitnexus repo=\"{html.escape(str(gitnexus.get('repo') or ''))}\" status=\"{html.escape(str(gitnexus.get('status') or 'unknown'))}\" required_checks_resolved=\"{str(gitnexus.get('required_checks_resolved', False)).lower()}\"/>",
+        f"{indent}  <top_targets>",
+    ])
+    for target in targets[:5]:
+        if not isinstance(target, dict):
+            continue
+        impact = target.get("soulforge_impact")
+        impact = impact if isinstance(impact, dict) else {}
+        signals = target.get("rank_signals")
+        signal_text = ",".join(str(item) for item in signals) if isinstance(signals, list) else ""
+        lines.append(
+            f"{indent}    <file path=\"{html.escape(str(target.get('path') or ''))}\" "
+            f"score=\"{html.escape(str(target.get('priority_score') or 0))}\" "
+            f"role=\"{html.escape(str(target.get('surface_role') or 'unknown'))}\" "
+            f"risk=\"{html.escape(str(impact.get('risk') or 'unknown'))}\" "
+            f"direct_dependents=\"{html.escape(str(impact.get('direct_dependents') or 0))}\" "
+            f"signals=\"{html.escape(signal_text)}\"/>"
+        )
+    lines.extend([f"{indent}  </top_targets>", f"{indent}</context_digest>"])
+    return lines
+
+
+def semantic_source_counts_text(semantic: dict[str, object]) -> str:
+    source_counts = semantic.get("source_counts")
+    if not isinstance(source_counts, dict) or not source_counts:
+        return "none"
+    return ", ".join(f"{source}={count}" for source, count in source_counts.items())
+
+
+def render_required_intake(packet: dict[str, object]) -> str:
+    target_state = packet.get("target_state") or {}
+    gitnexus = packet.get("gitnexus") or {}
+    semantic = packet.get("semantic_summaries") or {}
+    targets = packet.get("targets") or []
+    assert isinstance(target_state, dict)
+    assert isinstance(gitnexus, dict)
+    assert isinstance(semantic, dict)
+    assert isinstance(targets, list)
+
+    lines = [
+        "REPO_CONTEXT_FORGE_REQUIRED_INTAKE",
+        f"mode: {packet.get('mode') or 'unknown'}",
+        f"head_sha: {target_state.get('head_sha') or ''}",
+        f"token_budget: {packet.get('token_budget') or DEFAULT_TOKEN_BUDGET}",
+        (
+            "semantic: "
+            f"{semantic.get('mode') or 'unknown'}; "
+            f"live_llm={str(semantic.get('live_llm_generation', False)).lower()}; "
+            f"sources={semantic_source_counts_text(semantic)}"
+        ),
+        (
+            "gitnexus: "
+            f"repo={gitnexus.get('repo') or ''}; "
+            f"status={gitnexus.get('status') or 'unknown'}; "
+            f"required_checks_resolved={str(gitnexus.get('required_checks_resolved', False)).lower()}"
+        ),
+        "top_targets:",
+    ]
+    for target in targets[:5]:
+        if not isinstance(target, dict):
+            continue
+        impact = target.get("soulforge_impact")
+        impact = impact if isinstance(impact, dict) else {}
+        signals = target.get("rank_signals")
+        signal_text = ",".join(str(item) for item in signals) if isinstance(signals, list) else ""
+        lines.append(
+            "- "
+            f"{target.get('path') or ''} | "
+            f"score={target.get('priority_score') or 0} | "
+            f"role={target.get('surface_role') or 'unknown'} | "
+            f"risk={impact.get('risk') or 'unknown'} | "
+            f"direct_dependents={impact.get('direct_dependents') or 0} | "
+            f"signals={signal_text}"
+        )
+    if not any(isinstance(target, dict) for target in targets[:5]):
+        lines.append("- none")
+    lines.extend(
+        [
+            "required_behavior:",
+            "- Report this intake before code reasoning, review findings, edits, or GitNexus claims.",
+            "- Use packet targets and live base...HEAD diff as the PR surface.",
+            "- Use gitnexus_detect_changes only as extra graph evidence after the packet surface is fixed.",
+            "END_REPO_CONTEXT_FORGE_REQUIRED_INTAKE",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def trim_prompt_lines(lines: list[str], token_budget: int) -> list[str] | None:
     if estimate_tokens("\n".join(lines)) <= token_budget:
         return lines
@@ -2329,8 +2450,9 @@ def render_compact_prompt(packet: dict[str, object]) -> str:
         f"    <source_status_unchanged>{str(source_status.get('unchanged', False)).lower()}</source_status_unchanged>",
         f"    <token_budget>{html.escape(str(packet.get('token_budget') or DEFAULT_TOKEN_BUDGET))}</token_budget>",
         "  </target_state>",
-        "  <soulforge_status>",
     ]
+    lines.extend(render_context_digest_lines(packet))
+    lines.append("  <soulforge_status>")
     soulforge_target = soulforge.get("target")
     if isinstance(soulforge_target, dict):
         lines.extend([
@@ -2346,12 +2468,7 @@ def render_compact_prompt(packet: dict[str, object]) -> str:
         f"    <live_llm_generation>{str(semantic.get('live_llm_generation', False)).lower()}</live_llm_generation>",
         "    <source_counts>",
     ])
-    source_counts = semantic.get("source_counts")
-    if isinstance(source_counts, dict):
-        for source, count in source_counts.items():
-            lines.append(
-                f"      <source name=\"{html.escape(str(source))}\" count=\"{html.escape(str(count))}\"/>"
-            )
+    lines.extend(render_source_counts_lines(semantic, "      "))
     lines.extend([
         "    </source_counts>",
         "  </semantic_summaries>",
@@ -2453,6 +2570,9 @@ def render_prompt(packet: dict[str, object]) -> str:
         f"    <source_status_unchanged>{str(source_status.get('unchanged', False)).lower()}</source_status_unchanged>",
         f"    <token_budget>{html.escape(str(packet.get('token_budget') or DEFAULT_TOKEN_BUDGET))}</token_budget>",
         "  </target_state>",
+    ])
+    lines.extend(render_context_digest_lines(packet))
+    lines.extend([
         "  <source_status>",
         f"    <before_hash>{html.escape(str(source_status.get('before_hash') or ''))}</before_hash>",
         f"    <after_hash>{html.escape(str(source_status.get('after_hash') or ''))}</after_hash>",
@@ -2503,12 +2623,7 @@ def render_prompt(packet: dict[str, object]) -> str:
         f"    <live_llm_generation>{str(semantic.get('live_llm_generation', False)).lower()}</live_llm_generation>",
         "    <source_counts>",
     ])
-    source_counts = semantic.get("source_counts")
-    if isinstance(source_counts, dict):
-        for source, count in source_counts.items():
-            lines.append(
-                f"      <source name=\"{html.escape(str(source))}\" count=\"{html.escape(str(count))}\"/>"
-            )
+    lines.extend(render_source_counts_lines(semantic, "      "))
     lines.extend([
         "    </source_counts>",
         "  </semantic_summaries>",

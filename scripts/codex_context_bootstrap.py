@@ -116,8 +116,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--allow-empty", action="store_true")
     parser.add_argument("--gitnexus-repo")
     parser.add_argument("--gitnexus-mode", choices=["off", "check", "auto"], default="auto")
+    parser.add_argument("--enforce-intake", action="store_true")
     parser.add_argument("--out", type=Path)
     return parser.parse_args(argv)
+
+
+def render_bootstrap_output(packet: dict[str, object], enforce_intake: bool) -> str:
+    rendered = forge.render_prompt(packet)
+    if not enforce_intake:
+        return rendered
+    return forge.render_required_intake(packet) + rendered
 
 
 def main(argv: list[str]) -> int:
@@ -149,7 +157,7 @@ def main(argv: list[str]) -> int:
                     and is_user_worktree(item.get("path", ""), args.cache_dir)
                 ],
             )
-            forge.output_text(forge.render_prompt(packet), args.out)
+            forge.output_text(render_bootstrap_output(packet, args.enforce_intake), args.out)
             return 1
 
     token_budget = forge.compute_token_budget(args.conversation_tokens, args.token_budget)
@@ -169,7 +177,7 @@ def main(argv: list[str]) -> int:
         gitnexus_repo=args.gitnexus_repo,
         gitnexus_mode=args.gitnexus_mode,
     )
-    rendered = forge.render_prompt(packet)
+    rendered = render_bootstrap_output(packet, args.enforce_intake)
     forge.output_text(rendered, args.out)
     return 0
 
