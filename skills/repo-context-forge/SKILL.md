@@ -1,0 +1,64 @@
+---
+name: repo-context-forge
+description: Use at the start of coding, debugging, review, refactor, or repo exploration tasks inside a git repository to inject a targeted Repo Context Forge packet before deciding files, edits, or GitNexus queries.
+---
+
+# Repo Context Forge
+
+Use this skill before codebase reasoning when the user asks to edit, review,
+debug, refactor, explain, or plan work in a git repository.
+
+## Required Startup Flow
+
+1. Resolve this skill's directory, then run the bootstrap script at:
+
+```bash
+python3 ../../scripts/codex_context_bootstrap.py --repo "$PWD"
+```
+
+The path is relative to this `SKILL.md`.
+
+2. Treat the script output as the initial repository context packet for the
+current task.
+
+3. Follow the packet's `<scope_rules>`:
+
+- use `<targets>` as the first-pass edit/review surface
+- in `pr` mode, do not treat dirty source-worktree files as PR targets
+- run the listed `<gitnexus_required_checks>` before editing production code
+  when GitNexus MCP tools are available
+
+4. If the packet says SoulForge is unavailable, continue only with the explicit
+fallback surface in the packet and say that symbol-level map data was missing.
+
+## Mode Selection
+
+The bootstrap script auto-selects the mode:
+
+- `pr`: a base ref is available and `base...HEAD` has changed files
+- `local`: dirty local work exists before a PR is pushed
+- `intent`: pass `--intent "<user request>"` when there are no changes yet and
+  the user's request describes planned work
+
+For a user-described implementation before edits, prefer:
+
+```bash
+python3 ../../scripts/codex_context_bootstrap.py --repo "$PWD" --intent "<task>"
+```
+
+## GitNexus Follow-Up
+
+For each `<check>` in `<gitnexus_required_checks>`:
+
+- `kind="symbol_context"` means call `gitnexus_context` for that symbol/file
+- `kind="symbol_impact"` means call `gitnexus_impact` upstream for that symbol
+- if GitNexus reports a stale or missing index, reindex or state the blocker
+  before trusting blast-radius claims
+
+## Do Not
+
+- Do not ask the user to manually run Repo Context Forge commands for routine
+  repo work.
+- Do not edit files before reading the packet and running required GitNexus
+  checks when they are available.
+- Do not use dirty local map results as PR-head truth.

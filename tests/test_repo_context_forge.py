@@ -7,12 +7,28 @@ from pathlib import Path
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "repo_context_forge.py"
-SPEC = importlib.util.spec_from_file_location("repo_context_forge", MODULE_PATH)
-assert SPEC is not None
-repo_context_forge = importlib.util.module_from_spec(SPEC)
-sys.modules["repo_context_forge"] = repo_context_forge
-assert SPEC.loader is not None
-SPEC.loader.exec_module(repo_context_forge)
+ROOT = MODULE_PATH.parents[0]
+
+
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+repo_context_forge = load_module("repo_context_forge", MODULE_PATH)
+codex_context_bootstrap = load_module(
+    "codex_context_bootstrap",
+    ROOT / "scripts" / "codex_context_bootstrap.py",
+)
+install_local_plugin = load_module(
+    "install_local_plugin",
+    ROOT / "scripts" / "install_local_plugin.py",
+)
 
 
 class RepoContextForgeTests(unittest.TestCase):
@@ -217,6 +233,36 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertEqual(env["REPO_CONTEXT_FORGE_ANALYSIS_REPO"], "/cache/repo")
         self.assertEqual(env["REPO_CONTEXT_FORGE_TARGET_SHA"], "abc123")
         self.assertEqual(env["REPO_CONTEXT_FORGE_GITNEXUS_REPO"], "example")
+
+    def test_plugin_manifest_points_to_existing_skill_root(self) -> None:
+        manifest_path = ROOT / ".codex-plugin" / "plugin.json"
+        manifest = repo_context_forge.json.loads(manifest_path.read_text())
+
+        self.assertEqual(manifest["name"], "repo-context-forge")
+        self.assertTrue((ROOT / manifest["skills"]).resolve().is_dir())
+
+    def test_bootstrap_auto_mode_prefers_intent_when_clean_without_base(self) -> None:
+        original_is_dirty = codex_context_bootstrap.forge.is_dirty
+        codex_context_bootstrap.forge.is_dirty = lambda _repo: False
+        try:
+            mode = codex_context_bootstrap.choose_mode(
+                Path("/repo"),
+                "auto",
+                None,
+                "HEAD",
+                "add draft preservation",
+            )
+        finally:
+            codex_context_bootstrap.forge.is_dirty = original_is_dirty
+
+        self.assertEqual(mode, "intent")
+
+    def test_install_plugin_entry_is_installed_by_default(self) -> None:
+        entry = install_local_plugin.plugin_entry()
+
+        self.assertEqual(entry["name"], "repo-context-forge")
+        self.assertEqual(entry["source"]["path"], "./plugins/repo-context-forge")
+        self.assertEqual(entry["policy"]["installation"], "INSTALLED_BY_DEFAULT")
 
 
 if __name__ == "__main__":

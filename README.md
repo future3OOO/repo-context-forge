@@ -7,6 +7,29 @@ The tool is dependency-free Python and can be run against any git repository. It
 uses SoulForge as the first map engine through an adapter, but keeps SoulForge's
 map separate from the target-selection and prompt-packet contracts.
 
+## Codex Plugin
+
+Install the plugin once:
+
+```bash
+python3 scripts/install_local_plugin.py
+```
+
+That registers this repo as the `repo-context-forge` Codex plugin in the local
+plugin marketplace and marks it installed by default. After that, Codex can use
+the plugin skill at the start of code work in any git repository. Users should
+not need to run context commands per task.
+
+The plugin startup path is:
+
+1. Codex loads `repo-context-forge`.
+2. The plugin skill runs `scripts/codex_context_bootstrap.py` for the current
+   git repo.
+3. The bootstrap script auto-selects `pr`, `local`, or `intent` mode.
+4. The generated XML packet becomes the initial repo context for the task.
+5. Codex runs the packet's GitNexus checks before editing when GitNexus MCP is
+   available.
+
 ## What It Does
 
 - `pr` mode creates or reuses a clean cached git worktree at the target head.
@@ -16,6 +39,8 @@ map separate from the target-selection and prompt-packet contracts.
 - packets include GitNexus required-check entries for context and impact calls.
 - `wrap` writes the prompt packet and can pass it to another command before
   that command starts reasoning.
+- `scripts/codex_context_bootstrap.py` is the plugin entrypoint Codex uses to
+  avoid manual per-project commands.
 - `benchmark` generates no-map, ambient-map, and clean-target-map comparison
   inputs for testing agent behavior.
 

@@ -371,7 +371,12 @@ Adjacent no-change surfaces:
 
 Commands run on April 19, 2026:
 
-- `python3 -m unittest discover -s tests -v`: 15 tests passed.
+- `python3 -m unittest discover -s tests -v`: 18 tests passed after adding the Codex plugin manifest, skill, bootstrap script, and local installer.
+- `python3 -m json.tool .codex-plugin/plugin.json`: validated the plugin manifest.
+- `python3 scripts/codex_context_bootstrap.py --help`: validated the plugin bootstrap entrypoint.
+- `python3 scripts/codex_context_bootstrap.py --repo /home/prop_/projects/repo-context-forge --map-build never`: verified local dirty-worktree packet generation.
+- `python3 scripts/codex_context_bootstrap.py --repo /home/prop_/projects/fork_google_workspace_mcp --base upstream/main --head HEAD --map-build auto --gitnexus-repo fork_google_workspace_mcp`: verified clean PR-head packet generation through the plugin bootstrap.
+- `python3 scripts/install_local_plugin.py`: registered the plugin in `/home/prop_/.agents/plugins/marketplace.json` through `/home/prop_/plugins/repo-context-forge`.
 - `python3 repo_context_forge.py analyze --repo /home/prop_/projects/fork_google_workspace_mcp --mode pr --base upstream/main --head HEAD --map-build auto --format prompt --gitnexus-repo fork_google_workspace_mcp --out workspace-mcp-pr-clean-map.prompt.xml`: generated a clean PR-head prompt packet.
 - `python3 repo_context_forge.py benchmark --repo /home/prop_/projects/fork_google_workspace_mcp --base upstream/main --head HEAD --intent "Review the Gmail draft lifecycle changes" --map-build auto --format json --gitnexus-repo fork_google_workspace_mcp --out workspace-mcp-benchmark-map.json`: generated A/B/C benchmark output.
 - `python3 repo_context_forge.py wrap --repo /home/prop_/projects/fork_google_workspace_mcp --mode pr --base upstream/main --head HEAD --map-build auto --gitnexus-repo fork_google_workspace_mcp --out workspace-mcp-wrapper.prompt.xml -- python3 -c ...`: verified wrapper stdin injection and environment metadata.
