@@ -1,0 +1,111 @@
+# Repo Context Forge
+
+Standalone context orchestrator for giving coding agents the right repository
+map before they reason, edit, or run GitNexus.
+
+The tool is dependency-free Python and can be run against any git repository. It
+uses SoulForge as the first map engine through an adapter, but keeps SoulForge's
+map separate from the target-selection and prompt-packet contracts.
+
+## What It Does
+
+- `pr` mode creates or reuses a clean cached git worktree at the target head.
+- `local` mode analyzes the current dirty worktree and marks dirty state.
+- `intent` mode searches the ambient map from a user-described change request.
+- output can be Markdown, JSON, or an XML prompt packet for upstream injection.
+- packets include GitNexus required-check entries for context and impact calls.
+- `wrap` writes the prompt packet and can pass it to another command before
+  that command starts reasoning.
+- `benchmark` generates no-map, ambient-map, and clean-target-map comparison
+  inputs for testing agent behavior.
+
+## Usage
+
+Analyze a PR/head target with a clean target map:
+
+```bash
+python3 repo_context_forge.py analyze \
+  --repo /path/to/repo \
+  --mode pr \
+  --base upstream/main \
+  --head HEAD
+```
+
+Generate an upstream prompt packet:
+
+```bash
+python3 repo_context_forge.py analyze \
+  --repo /path/to/repo \
+  --mode pr \
+  --base upstream/main \
+  --format prompt
+```
+
+Analyze local dirty development before a PR exists:
+
+```bash
+python3 repo_context_forge.py analyze \
+  --repo /path/to/repo \
+  --mode local \
+  --format markdown
+```
+
+Map an intent before implementation:
+
+```bash
+python3 repo_context_forge.py analyze \
+  --repo /path/to/repo \
+  --mode intent \
+  --intent "Add support for updating Gmail drafts while preserving omitted fields"
+```
+
+Generate benchmark inputs:
+
+```bash
+python3 repo_context_forge.py benchmark \
+  --repo /path/to/repo \
+  --base upstream/main \
+  --intent "Review the Gmail draft lifecycle changes"
+```
+
+Run another command with the packet injected through stdin and metadata exposed
+through environment variables:
+
+```bash
+python3 repo_context_forge.py wrap \
+  --repo /path/to/repo \
+  --mode pr \
+  --base upstream/main \
+  --gitnexus-repo my_index_name \
+  -- your-agent-command
+```
+
+`wrap` sets `REPO_CONTEXT_FORGE_PACKET_FILE`,
+`REPO_CONTEXT_FORGE_ANALYSIS_REPO`, `REPO_CONTEXT_FORGE_TARGET_SHA`, and
+`REPO_CONTEXT_FORGE_GITNEXUS_REPO` for the wrapped command.
+
+## Important Options
+
+```bash
+--map-build auto|always|never
+--allow-missing-map
+--cache-dir ~/.cache/repo-context-forge
+--soulforge-bin /path/to/soulforge
+--gitnexus-repo fork_google_workspace_mcp
+--format markdown|json|prompt
+```
+
+By default, `analyze` requires a SoulForge map. Use `--allow-missing-map` only
+when testing failure paths or no-map baselines.
+
+## Production Contract
+
+For PR review, use `mode=pr`. It builds/reads the map from a clean cached target
+worktree, not the dirty root checkout.
+
+For active implementation before a PR exists, use `mode=local` or `mode=intent`.
+These modes intentionally use ambient current-worktree context and mark dirty
+state in the packet.
+
+GitNexus is not replaced by this tool. The packet tells the agent which GitNexus
+context and impact checks must run after the target map has been injected.
