@@ -163,9 +163,57 @@ class RepoContextForgeTests(unittest.TestCase):
 
         area_ids = [area["id"] for area in plan["areas"]]
         self.assertTrue(plan["required"])
-        self.assertTrue(plan["delegation_required"])
+        self.assertFalse(plan["delegation_required"])
         self.assertIn("production_contract", area_ids)
         self.assertIn("verification_contract", area_ids)
+
+    def test_coverage_plan_keeps_required_areas_in_parent_session(self) -> None:
+        plan = repo_context_forge.build_coverage_plan(
+            [
+                {
+                    "path": "src/service.py",
+                    "surface_role": "production",
+                    "rank_signals": ["changed_file"],
+                    "soulforge_impact": {
+                        "risk": "medium",
+                        "direct_dependents": 2,
+                        "total_affected_scope": 5,
+                    },
+                },
+                {
+                    "path": "tests/test_service.py",
+                    "surface_role": "test",
+                    "rank_signals": ["changed_file", "broad_test_container"],
+                    "soulforge_impact": {"risk": "low", "direct_dependents": 0},
+                },
+                {
+                    "path": "README.md",
+                    "surface_role": "production",
+                    "rank_signals": ["changed_file"],
+                    "soulforge_impact": {"risk": "low", "direct_dependents": 0},
+                },
+                {
+                    "path": "src/client.py",
+                    "surface_role": "production",
+                    "rank_signals": ["graph_neighbor", "cochange_partner"],
+                    "soulforge_impact": {"risk": "low", "direct_dependents": 0},
+                },
+            ]
+        )
+
+        area_ids = [area["id"] for area in plan["areas"]]
+
+        self.assertFalse(plan["delegation_required"])
+        self.assertEqual(
+            [
+                "production_contract",
+                "verification_contract",
+                "operator_contract",
+                "blast_radius",
+                "related_map_surface",
+            ],
+            area_ids,
+        )
 
     def test_coverage_plan_includes_all_matching_files_without_truncation(self) -> None:
         entries = [
@@ -807,6 +855,7 @@ class RepoContextForgeTests(unittest.TestCase):
             original_run_cmd = repo_context_forge.run_cmd
 
             def fake_run_cmd(args, **_kwargs):
+                (analysis_repo / ".gitnexus").mkdir()
                 registry_path.write_text(
                     repo_context_forge.json.dumps(
                         [
@@ -837,7 +886,89 @@ class RepoContextForgeTests(unittest.TestCase):
 
             self.assertEqual(status["status"], "reindexed")
             self.assertTrue(status["index_fresh"])
+            self.assertTrue(status["index_present"])
             self.assertTrue(status["reindex_attempted"])
+
+    def test_gitnexus_blocks_when_registered_index_storage_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:
+            analysis_repo = Path(repo_dir)
+            registry_path = Path(registry_dir) / "registry.json"
+            state = repo_context_forge.TargetState(
+                mode="pr",
+                source_repo=analysis_repo,
+                analysis_repo=analysis_repo,
+                base_ref="main",
+                head_ref="HEAD",
+                head_sha="new-head",
+                source_dirty=False,
+                target_dirty=False,
+                cache_key="key",
+            )
+            registry_path.write_text(
+                repo_context_forge.json.dumps(
+                    [
+                        {
+                            "name": "analysis",
+                            "path": str(analysis_repo.resolve()),
+                            "lastCommit": "new-head",
+                            "indexedAt": "now",
+                            "storagePath": str(analysis_repo / ".gitnexus"),
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            status = repo_context_forge.ensure_gitnexus_index(
+                state,
+                "analysis",
+                "check",
+                registry_path=registry_path,
+                gitnexus_bin="gitnexus",
+            )
+
+            self.assertEqual(status["status"], "blocked")
+            self.assertFalse(status["index_fresh"])
+            self.assertFalse(status["index_present"])
+            self.assertIn("index storage is missing", status["warning"])
+
+    def test_gitnexus_blocks_when_reindex_does_not_register_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:
+            analysis_repo = Path(repo_dir)
+            registry_path = Path(registry_dir) / "registry.json"
+            state = repo_context_forge.TargetState(
+                mode="pr",
+                source_repo=analysis_repo,
+                analysis_repo=analysis_repo,
+                base_ref="main",
+                head_ref="HEAD",
+                head_sha="new-head",
+                source_dirty=False,
+                target_dirty=False,
+                cache_key="key",
+            )
+            registry_path.write_text("[]", encoding="utf-8")
+            original_run_cmd = repo_context_forge.run_cmd
+
+            def fake_run_cmd(args, **_kwargs):
+                return repo_context_forge.subprocess.CompletedProcess(args, 0, "", "")
+
+            repo_context_forge.run_cmd = fake_run_cmd
+            try:
+                status = repo_context_forge.ensure_gitnexus_index(
+                    state,
+                    "analysis",
+                    "auto",
+                    registry_path=registry_path,
+                    gitnexus_bin="gitnexus",
+                )
+            finally:
+                repo_context_forge.run_cmd = original_run_cmd
+
+            self.assertEqual(status["status"], "blocked")
+            self.assertTrue(status["reindex_attempted"])
+            self.assertFalse(status["index_present"])
+            self.assertIn("did not create registered index storage", status["warning"])
 
     def test_gitnexus_required_checks_block_missing_symbols(self) -> None:
         original_run_cmd = repo_context_forge.run_cmd
@@ -1173,7 +1304,7 @@ class RepoContextForgeTests(unittest.TestCase):
             },
             "coverage_plan": {
                 "required": True,
-                "delegation_required": True,
+                "delegation_required": False,
                 "areas": [
                     {
                         "id": "production_contract",
@@ -1229,13 +1360,15 @@ class RepoContextForgeTests(unittest.TestCase):
             "Run the listed gitnexus_required_checks first; they are the initial GitNexus validation",
             captured["text"],
         )
-        self.assertIn("coverage_plan: required=true delegation_required=true", captured["text"])
+        self.assertIn("coverage_plan: required=true delegation_required=false", captured["text"])
         self.assertIn("production_contract", captured["text"])
-        self.assertIn("delegation_tasks:", captured["text"])
-        self.assertIn("spawn_agent | area=production_contract", captured["text"])
-        self.assertIn("standing explicit request for sub-agents", captured["text"])
+        self.assertIn("parent_coverage_tasks:", captured["text"])
+        self.assertNotIn("spawn_agent |", captured["text"])
+        self.assertIn("cover_serially | covers=production_contract", captured["text"])
+        self.assertIn("covers=production_contract", captured["text"])
+        self.assertIn("Do not spawn sub-agents from Repo Context Forge output alone.", captured["text"])
         self.assertIn(
-            "call spawn_agent for each task before GitNexus calls",
+            "Cover every required coverage area in the parent session",
             captured["text"],
         )
         self.assertIn("Do not let unscoped gitnexus_detect_changes(compare)", captured["text"])
@@ -1303,7 +1436,7 @@ class RepoContextForgeTests(unittest.TestCase):
             },
             "coverage_plan": {
                 "required": True,
-                "delegation_required": True,
+                "delegation_required": False,
                 "areas": [
                     {
                         "id": "production_contract",
@@ -1323,12 +1456,13 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("<token_budget>16000</token_budget>", rendered)
         self.assertIn("<context_digest>", rendered)
         self.assertIn("<required_agent_intake>", rendered)
-        self.assertIn("<coverage_plan required=\"true\" delegation_required=\"true\">", rendered)
+        self.assertIn("<coverage_plan required=\"true\" delegation_required=\"false\">", rendered)
         self.assertIn('id="production_contract"', rendered)
-        self.assertIn('<delegate_task action="spawn_agent">', rendered)
-        self.assertIn("standing explicit request for sub-agents", rendered)
+        self.assertNotIn('<delegate_task action="spawn_agent"', rendered)
+        self.assertNotIn('area="surface_impact_specialist"', rendered)
+        self.assertIn("Do not spawn sub-agents from Repo Context Forge output alone.", rendered)
         self.assertIn(
-            "call spawn_agent once per coverage area before GitNexus calls",
+            "Cover every required coverage area in the parent session",
             rendered,
         )
         self.assertIn(
@@ -1387,7 +1521,78 @@ class RepoContextForgeTests(unittest.TestCase):
         rendered = repo_context_forge.render_prompt(packet)
 
         self.assertIn("<coverage_plan required=\"true\" delegation_required=\"false\">", rendered)
-        self.assertNotIn('<delegate_task action="spawn_agent">', rendered)
+        self.assertNotIn('<delegate_task action="spawn_agent"', rendered)
+
+    def test_render_prompt_keeps_multiple_areas_in_parent_session(self) -> None:
+        coverage_plan = repo_context_forge.build_coverage_plan(
+            [
+                {
+                    "path": "src/service.py",
+                    "surface_role": "production",
+                    "rank_signals": ["changed_file"],
+                    "soulforge_impact": {
+                        "risk": "medium",
+                        "direct_dependents": 1,
+                        "total_affected_scope": 2,
+                    },
+                },
+                {
+                    "path": "tests/test_service.py",
+                    "surface_role": "test",
+                    "rank_signals": ["changed_file", "broad_test_container"],
+                    "soulforge_impact": {"risk": "low", "direct_dependents": 0},
+                },
+                {
+                    "path": "README.md",
+                    "surface_role": "production",
+                    "rank_signals": ["changed_file"],
+                    "soulforge_impact": {"risk": "low", "direct_dependents": 0},
+                },
+                {
+                    "path": "src/client.py",
+                    "surface_role": "production",
+                    "rank_signals": ["graph_neighbor"],
+                    "soulforge_impact": {"risk": "low", "direct_dependents": 0},
+                },
+            ]
+        )
+        packet = {
+            "mode": "intent",
+            "token_budget": 16000,
+            "target_state": {
+                "source_repo": "/repo",
+                "analysis_repo": "/cache/repo",
+                "base_ref": "main",
+                "head_ref": "HEAD",
+                "head_sha": "abc123",
+                "analysis_head_sha": "abc123",
+                "analysis_repo_is_cache_owned": True,
+                "analysis_head_matches_source_head": True,
+                "source_dirty": True,
+                "target_dirty": True,
+            },
+            "source_status": {"unchanged": True},
+            "policy": {"reference_only_prefixes": []},
+            "soulforge": {"target": {"status": "fresh", "target_head_verified": True}},
+            "semantic_summaries": {"mode": "full_cached", "source_counts": {}},
+            "gitnexus": {"status": "fresh", "repo": "repo", "plan": []},
+            "targets": [],
+            "warnings": [],
+            "coverage_plan": coverage_plan,
+        }
+
+        rendered = repo_context_forge.render_prompt(packet)
+
+        self.assertNotIn('<delegate_task action="spawn_agent"', rendered)
+        self.assertNotIn('area="surface_impact_specialist"', rendered)
+        for area_id in [
+            "production_contract",
+            "verification_contract",
+            "operator_contract",
+            "blast_radius",
+            "related_map_surface",
+        ]:
+            self.assertIn(f'id="{area_id}"', rendered)
 
     def test_render_prompt_compacts_to_budget_and_preserves_gitnexus_checks(self) -> None:
         long_summary = "x" * 5000
@@ -1449,7 +1654,7 @@ class RepoContextForgeTests(unittest.TestCase):
             },
             "coverage_plan": {
                 "required": True,
-                "delegation_required": True,
+                "delegation_required": False,
                 "areas": [
                     {
                         "id": "production_contract",
@@ -1468,7 +1673,7 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertLessEqual(repo_context_forge.estimate_tokens(rendered), 1000)
         self.assertIn("<context_digest>", rendered)
         self.assertIn("<required_agent_intake>", rendered)
-        self.assertIn("<coverage_plan required=\"true\" delegation_required=\"true\">", rendered)
+        self.assertIn("<coverage_plan required=\"true\" delegation_required=\"false\">", rendered)
         self.assertIn('id="production_contract"', rendered)
         self.assertIn('target="handle"', rendered)
         self.assertIn('path="src/a.py"', rendered)

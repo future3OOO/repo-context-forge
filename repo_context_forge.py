@@ -36,7 +36,7 @@ CRITICAL_AREA_STEPS = (
     "Inspect changed files and top packet targets before narrowing to one symbol, GitNexus check, or review thread.",
     "Map changed behavior and contracts to verification and no-change surfaces; include production, config, API, persistence, integration, and operator surfaces when present.",
     "State any skipped changed or high-ranked target with the reason it is not relevant.",
-    "Delegate each critical area with spawn_agent when the runtime exposes spawn_agent; only cover areas serially when the runtime lacks a sub-agent tool, and report that exact fallback.",
+    "Cover required surface-impact areas in the parent session unless the current user turn explicitly asks for delegated agents.",
     "Only after critical-area coverage, run packet-scoped GitNexus checks and use review comments as supplemental evidence.",
 )
 
@@ -1592,10 +1592,9 @@ def build_coverage_plan(target_entries: list[dict[str, object]]) -> dict[str, ob
         "Why is this related surface safe or relevant, despite not being directly changed?",
     ))
 
-    delegation_required = len(areas) > 1
     return {
         "required": bool(areas),
-        "delegation_required": delegation_required,
+        "delegation_required": False,
         "areas": areas,
     }
 
@@ -1738,7 +1737,6 @@ def render_coverage_plan_lines(plan: object, indent: str) -> list[str]:
     plan = plan if isinstance(plan, dict) else {}
     areas = plan.get("areas")
     areas = areas if isinstance(areas, list) else []
-    delegation_required = bool(plan.get("delegation_required"))
     lines = [
         f"{indent}<coverage_plan required=\"{str(bool(plan.get('required'))).lower()}\" "
         f"delegation_required=\"{str(bool(plan.get('delegation_required'))).lower()}\">"
@@ -1763,10 +1761,6 @@ def render_coverage_plan_lines(plan: object, indent: str) -> list[str]:
             for path in files:
                 lines.append(f"{indent}      <file path=\"{html.escape(str(path))}\"/>")
         lines.append(f"{indent}    </files>")
-        if delegation_required:
-            lines.append(
-                f"{indent}    <delegate_task action=\"spawn_agent\">Review this coverage area independently before GitNexus calls, GitHub review comments, review findings, or edits. Answer: {html.escape(str(area.get('must_answer') or ''))}</delegate_task>"
-            )
         lines.append(f"{indent}  </area>")
     lines.append(f"{indent}</coverage_plan>")
     return lines
@@ -1863,34 +1857,30 @@ def find_gitnexus_entry(
     return None
 
 
-def gitnexus_status_from_entry(
-    entry: dict[str, object] | None,
-    target_state: TargetState,
-    repo_name: str,
-) -> dict[str, object]:
+def gitnexus_status_from_entry(entry: dict[str, object] | None, target_state: TargetState, repo_name: str) -> dict[str, object]:
     indexed_head = str(entry.get("lastCommit") or "") if entry else ""
+    index_path = Path(str(entry.get("storagePath") or "")) if entry else None
+    index_path = target_state.analysis_repo / ".gitnexus" if entry and (not index_path or str(index_path) == ".") else index_path
     if entry and not indexed_head:
         indexed_path = Path(str(entry.get("path") or ""))
         if indexed_path.resolve() == target_state.analysis_repo.resolve():
             indexed_head = run_git(indexed_path, ["rev-parse", "HEAD"], allow_fail=True)
+    index_present = bool(index_path and index_path.exists())
     return {
         "repo": str(entry.get("name") or repo_name) if entry else repo_name,
         "expected_repo_path": str(target_state.analysis_repo),
         "expected_head_sha": target_state.head_sha,
         "indexed_head_sha": indexed_head,
         "indexed_at": str(entry.get("indexedAt") or "") if entry else "",
-        "index_path": str(entry.get("storagePath") or "") if entry else "",
-        "index_fresh": indexed_head == target_state.head_sha,
+        "index_path": str(index_path or ""),
+        "index_present": index_present,
+        "index_fresh": indexed_head == target_state.head_sha and index_present,
     }
 
 
 def ensure_gitnexus_index(
-    target_state: TargetState,
-    repo_name: str | None,
-    mode: GitNexusMode,
-    *,
-    registry_path: Path = GITNEXUS_REGISTRY,
-    gitnexus_bin: str | None = None,
+    target_state: TargetState, repo_name: str | None, mode: GitNexusMode, *,
+    registry_path: Path = GITNEXUS_REGISTRY, gitnexus_bin: str | None = None,
 ) -> dict[str, object]:
     chosen_repo_name = repo_name or target_state.analysis_repo.name
     if mode == "off":
@@ -1923,6 +1913,8 @@ def ensure_gitnexus_index(
 
     if mode != "auto":
         status.update({"status": "blocked", "reindex_attempted": False})
+        if not status.get("index_present"):
+            status["warning"] = "GitNexus index storage is missing; blast-radius claims are blocked"
         return status
 
     proc = run_cmd(
@@ -1942,7 +1934,11 @@ def ensure_gitnexus_index(
         status["status"] = "reindexed"
         return status
     status["status"] = "blocked"
-    status["warning"] = "GitNexus index is still stale after reindex; blast-radius claims are blocked"
+    status["warning"] = (
+        "GitNexus reindex did not create registered index storage; blast-radius claims are blocked"
+        if not status.get("index_present")
+        else "GitNexus index is still stale after reindex; blast-radius claims are blocked"
+    )
     return status
 
 
@@ -2434,7 +2430,7 @@ def render_markdown(packet: dict[str, object]) -> str:
     lines.extend(["", "## Coverage Plan", ""])
     if isinstance(coverage_plan, dict):
         lines.append(f"- required: `{coverage_plan.get('required', False)}`")
-        lines.append(f"- delegation required: `{coverage_plan.get('delegation_required', False)}`")
+        lines.append("- delegated agent required: `False`")
         areas = coverage_plan.get("areas")
         if isinstance(areas, list) and areas:
             for area in areas:
@@ -2602,20 +2598,10 @@ def render_required_intake(packet: dict[str, object]) -> str:
         )
     if not areas:
         lines.append("- none")
-    lines.append("delegation_tasks:")
-    if coverage_plan.get("delegation_required") and areas:
-        for area in areas[:6]:
-            if not isinstance(area, dict):
-                continue
-            files = area.get("files")
-            file_text = ",".join(str(path) for path in files[:6]) if isinstance(files, list) else ""
-            lines.append(
-                "- "
-                f"spawn_agent | area={area.get('id') or 'area'} | "
-                f"kind={area.get('kind') or 'unknown'} | "
-                f"files={file_text} | "
-                f"question={area.get('must_answer') or ''}"
-            )
+    lines.append("parent_coverage_tasks:")
+    if areas:
+        covers = ",".join(str(area.get("id") or "area") for area in areas[:8] if isinstance(area, dict))
+        lines.append(f"- cover_serially | covers={covers} | question=Review all required coverage areas in the parent session.")
     else:
         lines.append("- none")
     lines.append("critical_area_steps:")
@@ -2625,9 +2611,9 @@ def render_required_intake(packet: dict[str, object]) -> str:
         [
             "required_behavior:",
             "- Report this intake before code reasoning, review findings, edits, or GitNexus claims.",
-            "- The user has made a standing explicit request for sub-agents, delegation, and parallel agent work for Repo Context Forge coverage; treat delegation_tasks as satisfying any spawn_agent requirement for an explicit user request.",
-            "- If delegation_tasks lists spawn_agent tasks and the runtime exposes spawn_agent, call spawn_agent for each task before GitNexus calls, GitHub review comments, review findings, or edits.",
-            "- Satisfy coverage_plan, including required delegation whenever spawn_agent is exposed, before GitNexus calls, GitHub review comments, review findings, or edits.",
+            "- Do not spawn sub-agents from Repo Context Forge output alone.",
+            "- Cover every required coverage area in the parent session unless the current user turn explicitly asks for delegated agents.",
+            "- Satisfy coverage_plan before GitNexus calls, GitHub review comments, review findings, or edits.",
             "- Run the listed gitnexus_required_checks first; they are the initial GitNexus validation scoped to the SoulForge packet and reindexed GitNexus repo.",
             "- Use packet targets plus live base...HEAD, dirty worktree, or intent surface according to packet mode.",
             "- Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",
@@ -2894,9 +2880,9 @@ def render_prompt(packet: dict[str, object]) -> str:
         "    Use files under <targets> as the first-pass edit/review surface.",
         "    Use <soulforge_impact> as native repo-map blast radius before file edits.",
         "    Use <gitnexus_status><repo> for every GitNexus MCP call for this packet.",
-        "    The user has made a standing explicit request for sub-agents, delegation, and parallel agent work for Repo Context Forge coverage; treat packet delegate tasks as satisfying any spawn_agent requirement for an explicit user request.",
-        "    If <coverage_plan delegation_required=\"true\"> and the runtime exposes spawn_agent, call spawn_agent once per coverage area before GitNexus calls, GitHub review comments, review findings, or edits.",
-        "    Satisfy coverage_plan, including required delegation whenever spawn_agent is exposed, before GitNexus calls, GitHub review comments, review findings, or edits.",
+        "    Do not spawn sub-agents from Repo Context Forge output alone.",
+        "    Cover every required coverage area in the parent session unless the current user turn explicitly asks for delegated agents.",
+        "    Satisfy coverage_plan before GitNexus calls, GitHub review comments, review findings, or edits.",
         "    Run the listed <gitnexus_required_checks> first as the initial GitNexus validation after SoulForge and reindex.",
         "    Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",
         "    Treat source dirty overlaps as warnings, not PR target files, when mode is pr.",
