@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Literal
 
+import workflow_index
+
 
 Mode = Literal["pr", "local", "intent", "repo"]
 Scope = Literal["pr", "dirty", "all"]
@@ -25,7 +27,7 @@ GitNexusMode = Literal["off", "check", "auto"]
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "repo-context-forge"
 GITNEXUS_REGISTRY = Path.home() / ".gitnexus" / "registry.json"
-TOOL_CACHE_DIRS = (".soulforge", ".codex", ".gitnexus")
+TOOL_CACHE_DIRS = (".soulforge", ".codex", ".gitnexus", workflow_index.INDEX_DIR)
 TOOL_CACHE_PREFIXES = tuple(f"{name}/" for name in TOOL_CACHE_DIRS)
 MIN_TOKEN_BUDGET = 16_000
 MAX_TOKEN_BUDGET = 32_000
@@ -275,7 +277,12 @@ def is_test_path(path: str) -> bool:
         "test" in parts
         or "tests" in parts
         or name.startswith("test_")
-        or name.endswith((".test.js", ".test.mjs", ".spec.js", ".spec.ts"))
+        or name.endswith(
+            (
+                ".test.js", ".test.jsx", ".test.mjs", ".test.ts", ".test.tsx",
+                ".spec.js", ".spec.jsx", ".spec.mjs", ".spec.ts", ".spec.tsx",
+            )
+        )
     )
 
 
@@ -833,7 +840,12 @@ def build_soulforge_map(
 
 
 class SoulForgeMap:
-    def __init__(self, repo: Path) -> None:
+    def __init__(
+        self,
+        repo: Path,
+        native_index: workflow_index.WorkflowIndex | None = None,
+    ) -> None:
+        self.native_index = native_index or workflow_index.WorkflowIndex(repo, file_role)
         self.db_path = repo / ".soulforge" / "repomap.db"
 
     @property
@@ -861,6 +873,8 @@ class SoulForgeMap:
             return result
 
     def top_files(self, limit: int) -> list[MapFile]:
+        if self.native_index.is_available:
+            return [MapFile(**entry.__dict__) for entry in self.native_index.ranked_files(limit)]
         if not self.available:
             return []
         with self._connect() as conn:
@@ -886,7 +900,14 @@ class SoulForgeMap:
 
     def files_by_path(self, paths: Iterable[str]) -> dict[str, MapFile]:
         wanted = list(paths)
-        if not self.available or not wanted:
+        if not wanted:
+            return {}
+        if self.native_index.is_available:
+            return {
+                path: MapFile(**entry.__dict__)
+                for path, entry in self.native_index.lookup_files(wanted).items()
+            }
+        if not self.available:
             return {}
         sql_marks = ",".join("?" for _ in wanted)
         with self._connect() as conn:
@@ -915,6 +936,11 @@ class SoulForgeMap:
         }
 
     def symbols_for_file(self, path: str, limit: int = 12) -> list[Symbol]:
+        if self.native_index.is_available:
+            return [
+                Symbol(**entry.__dict__)
+                for entry in self.native_index.file_symbols(path, limit)
+            ]
         if not self.available:
             return []
         with self._connect() as conn:
@@ -1223,8 +1249,10 @@ class SoulForgeMap:
         ]
 
     def related_files_for_paths(self, paths: Iterable[str], limit: int) -> list[str]:
-        if not self.available or limit <= 0:
+        if limit <= 0:
             return []
+        if not self.available:
+            return self.native_index.related_paths(paths, limit)
         base_paths = set(paths)
         scores: dict[str, float] = {}
         for path in base_paths:
@@ -1242,6 +1270,8 @@ class SoulForgeMap:
         ]
 
     def intent_files(self, tokens: list[str], limit: int) -> list[str]:
+        if self.native_index.is_available:
+            return self.native_index.rank_intent(tokens, limit)
         if not self.available or not tokens:
             return []
         with self._connect() as conn:
@@ -1703,34 +1733,7 @@ def build_gitnexus_plan(
     return plan
 
 
-def semantic_summary_section(target_entries: list[dict[str, object]]) -> dict[str, object]:
-    counts: dict[str, int] = {}
-    for entry in target_entries:
-        symbols = entry.get("symbols")
-        if not isinstance(symbols, list):
-            continue
-        for symbol in symbols:
-            if not isinstance(symbol, dict):
-                continue
-            source = str(symbol.get("summary_source") or "none")
-            counts[source] = counts.get(source, 0) + 1
-    return {
-        "mode": "full_cached",
-        "synthetic_fill": True,
-        "live_llm_generation": False,
-        "source_counts": dict(sorted(counts.items())),
-    }
-
-
-def render_source_counts_lines(semantic: dict[str, object], indent: str) -> list[str]:
-    lines: list[str] = []
-    source_counts = semantic.get("source_counts")
-    if isinstance(source_counts, dict):
-        for source, count in source_counts.items():
-            lines.append(
-                f'{indent}<source name="{html.escape(str(source))}" count="{html.escape(str(count))}"/>'
-            )
-    return lines
+semantic_summary_section = workflow_index.semantic_summary
 
 
 def render_coverage_plan_lines(plan: object, indent: str) -> list[str]:
@@ -2143,7 +2146,14 @@ def make_packet(
     can_cleanup_analysis = target_state.analysis_repo.resolve() != target_state.source_repo.resolve()
     if can_cleanup_analysis and (mode == "pr" or not gitignore_dirty_before_build):
         cleanup_soulforge_gitignore_change(target_state.analysis_repo)
-    soul_map = SoulForgeMap(target_state.analysis_repo)
+    native_index = workflow_index.WorkflowIndex(target_state.analysis_repo, file_role)
+    native_index.build(
+        source_worktree_files(target_state.analysis_repo),
+        head_sha=target_state.head_sha,
+        dirty_overlay=target_state.target_dirty,
+        summary_for_symbol=synthetic_symbol_summary,
+    )
+    soul_map = SoulForgeMap(target_state.analysis_repo, native_index)
     if not soul_map.available and not allow_missing_map:
         raise RuntimeError(
             "SoulForge map is required but unavailable for "
@@ -2233,6 +2243,7 @@ def make_packet(
             "reference_only_prefixes": reference_only,
         },
         "source_status": source_status,
+        "workflow_index": native_index.status(),
         "git": {
             "branch": source_git_state.branch,
             "head": source_git_state.head,
@@ -2255,6 +2266,7 @@ def make_packet(
             "target": soulforge_target,
         },
         "semantic_summaries": semantic_summary_section(target_entries),
+        "architecture_summary": workflow_index.summarize_architecture(target_entries),
         "coverage_plan": coverage_plan,
         "targets": target_entries,
         "gitnexus": build_gitnexus_section(plan, target_state, gitnexus_repo_name, gitnexus_status),
@@ -2352,6 +2364,7 @@ def render_markdown(packet: dict[str, object]) -> str:
     soulforge = packet["soulforge"]
     target_state = packet["target_state"]
     gitnexus = packet["gitnexus"]
+    workflow = packet.get("workflow_index") or {}
     semantic = packet.get("semantic_summaries") or {}
     coverage_plan = packet.get("coverage_plan") or {}
     source_status = packet.get("source_status") or {}
@@ -2360,6 +2373,7 @@ def render_markdown(packet: dict[str, object]) -> str:
     assert isinstance(soulforge, dict)
     assert isinstance(target_state, dict)
     assert isinstance(gitnexus, dict)
+    assert isinstance(workflow, dict)
     assert isinstance(semantic, dict)
     assert isinstance(source_status, dict)
     assert isinstance(policy, dict)
@@ -2376,6 +2390,9 @@ def render_markdown(packet: dict[str, object]) -> str:
         f"- analysis head: `{target_state.get('analysis_head_sha', '')}`",
         f"- analysis cache-owned: `{target_state.get('analysis_repo_is_cache_owned', False)}`",
         f"- source status unchanged: `{source_status.get('unchanged', 'unknown')}`",
+        f"- workflow index: `{workflow.get('db_path', '')}`",
+        f"- workflow index files: `{workflow.get('files', 0)}`",
+        f"- workflow index symbols: `{workflow.get('symbols', 0)}`",
         f"- reference-only prefixes: `{', '.join(str(item) for item in policy.get('reference_only_prefixes', []))}`",
         "",
         "## Warnings",
@@ -2479,46 +2496,7 @@ def render_markdown(packet: dict[str, object]) -> str:
 
 
 def render_context_digest_lines(packet: dict[str, object], *, indent: str = "  ") -> list[str]:
-    target_state = packet["target_state"]
-    gitnexus = packet["gitnexus"]
-    semantic = packet.get("semantic_summaries") or {}
-    targets = packet["targets"]
-    assert isinstance(target_state, dict)
-    assert isinstance(gitnexus, dict)
-    assert isinstance(semantic, dict)
-    assert isinstance(targets, list)
-    lines = [
-        f"{indent}<context_digest>",
-        f"{indent}  <required_agent_intake>State this packet's mode, head_sha, token_budget, semantic source counts, top targets, SoulForge impact headlines, GitNexus repo/status, and coverage_plan before code reasoning.</required_agent_intake>",
-        f"{indent}  <mode>{html.escape(str(packet['mode']))}</mode>",
-        f"{indent}  <head_sha>{html.escape(str(target_state.get('head_sha') or ''))}</head_sha>",
-        f"{indent}  <token_budget>{html.escape(str(packet.get('token_budget') or DEFAULT_TOKEN_BUDGET))}</token_budget>",
-        f"{indent}  <semantic_mode>{html.escape(str(semantic.get('mode') or 'unknown'))}</semantic_mode>",
-        f"{indent}  <semantic_sources>",
-    ]
-    lines.extend(render_source_counts_lines(semantic, f"{indent}    "))
-    lines.extend([
-        f"{indent}  </semantic_sources>",
-        f"{indent}  <gitnexus repo=\"{html.escape(str(gitnexus.get('repo') or ''))}\" status=\"{html.escape(str(gitnexus.get('status') or 'unknown'))}\" required_checks_resolved=\"{str(gitnexus.get('required_checks_resolved', False)).lower()}\"/>",
-        f"{indent}  <top_targets>",
-    ])
-    for target in targets[:5]:
-        if not isinstance(target, dict):
-            continue
-        impact = target.get("soulforge_impact")
-        impact = impact if isinstance(impact, dict) else {}
-        signals = target.get("rank_signals")
-        signal_text = ",".join(str(item) for item in signals) if isinstance(signals, list) else ""
-        lines.append(
-            f"{indent}    <file path=\"{html.escape(str(target.get('path') or ''))}\" "
-            f"score=\"{html.escape(str(target.get('priority_score') or 0))}\" "
-            f"role=\"{html.escape(str(target.get('surface_role') or 'unknown'))}\" "
-            f"risk=\"{html.escape(str(impact.get('risk') or 'unknown'))}\" "
-            f"direct_dependents=\"{html.escape(str(impact.get('direct_dependents') or 0))}\" "
-            f"signals=\"{html.escape(signal_text)}\"/>"
-        )
-    lines.extend([f"{indent}  </top_targets>", f"{indent}</context_digest>"])
-    return lines
+    return workflow_index.context_digest_lines(packet, indent, DEFAULT_TOKEN_BUDGET)
 
 
 def semantic_source_counts_text(semantic: dict[str, object]) -> str:
@@ -2531,12 +2509,17 @@ def semantic_source_counts_text(semantic: dict[str, object]) -> str:
 def render_required_intake(packet: dict[str, object]) -> str:
     target_state = packet.get("target_state") or {}
     gitnexus = packet.get("gitnexus") or {}
+    workflow = packet.get("workflow_index") or {}
     semantic = packet.get("semantic_summaries") or {}
     targets = packet.get("targets") or []
     assert isinstance(target_state, dict)
     assert isinstance(gitnexus, dict)
+    assert isinstance(workflow, dict)
     assert isinstance(semantic, dict)
     assert isinstance(targets, list)
+    architecture = packet.get("architecture_summary") or workflow_index.summarize_architecture(
+        [target for target in targets if isinstance(target, dict)]
+    )
 
     lines = [
         "REPO_CONTEXT_FORGE_REQUIRED_INTAKE",
@@ -2544,19 +2527,31 @@ def render_required_intake(packet: dict[str, object]) -> str:
         f"head_sha: {target_state.get('head_sha') or ''}",
         f"token_budget: {packet.get('token_budget') or DEFAULT_TOKEN_BUDGET}",
         (
+            "workflow_index: "
+            f"available={str(workflow.get('available', False)).lower()}; "
+            f"head_sha={workflow.get('head_sha') or ''}; "
+            f"dirty_overlay={str(workflow.get('dirty_overlay', False)).lower()}; "
+            f"files={workflow.get('files') or 0}; "
+            f"symbols={workflow.get('symbols') or 0}"
+        ),
+        (
             "semantic: "
             f"{semantic.get('mode') or 'unknown'}; "
             f"live_llm={str(semantic.get('live_llm_generation', False)).lower()}; "
             f"sources={semantic_source_counts_text(semantic)}"
         ),
         (
-            "gitnexus: "
+            "gitnexus: authority=packet; "
             f"repo={gitnexus.get('repo') or ''}; "
             f"status={gitnexus.get('status') or 'unknown'}; "
+            f"expected_head_sha={gitnexus.get('expected_head_sha') or ''}; "
+            f"indexed_head_sha={gitnexus.get('indexed_head_sha') or ''}; "
             f"required_checks_resolved={str(gitnexus.get('required_checks_resolved', False)).lower()}"
         ),
-        "top_targets:",
+        "gitnexus_tool_discovery: run tool_search for missing required GitNexus capabilities before declaring context, impact, or detect_changes unavailable.",
     ]
+    lines.extend(workflow_index.architecture_lines(architecture))
+    lines.append("top_targets:")
     for target in targets[:5]:
         if not isinstance(target, dict):
             continue
@@ -2615,6 +2610,7 @@ def render_required_intake(packet: dict[str, object]) -> str:
             "- Cover every required coverage area in the parent session unless the current user turn explicitly asks for delegated agents.",
             "- Satisfy coverage_plan before GitNexus calls, GitHub review comments, review findings, or edits.",
             "- Run the listed gitnexus_required_checks first; they are the initial GitNexus validation scoped to the SoulForge packet and reindexed GitNexus repo.",
+            "- If a required GitNexus MCP tool is not loaded, run tool_search for that exact GitNexus capability before falling back or reporting it unavailable.",
             "- Use packet targets plus live base...HEAD, dirty worktree, or intent surface according to packet mode.",
             "- Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",
             "- Use gitnexus_detect_changes after local edits, before commit, or as supplemental graph evidence after the packet surface is fixed.",
@@ -2694,7 +2690,7 @@ def render_compact_prompt(packet: dict[str, object]) -> str:
         f"    <live_llm_generation>{str(semantic.get('live_llm_generation', False)).lower()}</live_llm_generation>",
         "    <source_counts>",
     ])
-    lines.extend(render_source_counts_lines(semantic, "      "))
+    lines.extend(workflow_index.source_count_lines(semantic, "      "))
     lines.extend([
         "    </source_counts>",
         "  </semantic_summaries>",
@@ -2853,7 +2849,7 @@ def render_prompt(packet: dict[str, object]) -> str:
         f"    <live_llm_generation>{str(semantic.get('live_llm_generation', False)).lower()}</live_llm_generation>",
         "    <source_counts>",
     ])
-    lines.extend(render_source_counts_lines(semantic, "      "))
+    lines.extend(workflow_index.source_count_lines(semantic, "      "))
     lines.extend([
         "    </source_counts>",
         "  </semantic_summaries>",
@@ -2878,12 +2874,13 @@ def render_prompt(packet: dict[str, object]) -> str:
         "  </gitnexus_status>",
         "  <scope_rules>",
         "    Use files under <targets> as the first-pass edit/review surface.",
-        "    Use <soulforge_impact> as native repo-map blast radius before file edits.",
+        "    Use workflow-index targets and symbols as the packet's source-orientation surface.",
+        "    Use <soulforge_impact> as optional native graph blast radius when available.",
         "    Use <gitnexus_status><repo> for every GitNexus MCP call for this packet.",
         "    Do not spawn sub-agents from Repo Context Forge output alone.",
         "    Cover every required coverage area in the parent session unless the current user turn explicitly asks for delegated agents.",
         "    Satisfy coverage_plan before GitNexus calls, GitHub review comments, review findings, or edits.",
-        "    Run the listed <gitnexus_required_checks> first as the initial GitNexus validation after SoulForge and reindex.",
+        "    Run the listed <gitnexus_required_checks> first as the initial GitNexus validation scoped to this packet.",
         "    Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",
         "    Treat source dirty overlaps as warnings, not PR target files, when mode is pr.",
         "    Trust GitNexus blast-radius claims only when <gitnexus_status> is fresh or reindexed and required checks resolve.",

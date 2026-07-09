@@ -514,6 +514,7 @@ class RepoContextForgeTests(unittest.TestCase):
                     ".soulforge",
                     ".codex",
                     ".gitnexus/meta.json",
+                    ".repo-context-forge/workflow-index.sqlite3",
                     "src/app.py",
                 ]
             ),
@@ -635,6 +636,234 @@ class RepoContextForgeTests(unittest.TestCase):
             )
             self.assertFalse(packet["target_state"]["source_dirty"])
             self.assertTrue(packet["target_state"]["source_status_unchanged"])
+
+    def test_make_packet_builds_workflow_index_without_soulforge(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            server = repo / "apps" / "ops-dashboard" / "server"
+            server.mkdir(parents=True)
+            (server / "agentGateway.mjs").write_text(
+                "export function createAgentGateway() {\n"
+                "  return { health() { return { ok: true }; } };\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            repo_context_forge.run_cmd(["git", "add", "apps/ops-dashboard/server"], cwd=repo)
+            repo_context_forge.run_cmd(["git", "commit", "-m", "agent gateway"], cwd=repo)
+
+            packet = repo_context_forge.make_packet(
+                repo,
+                mode="intent",
+                base_ref="HEAD",
+                head_ref="HEAD",
+                intent="Improve agent gateway robustness",
+                top=5,
+                token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET,
+                cache_dir=Path(cache_dir),
+                soulforge_bin=None,
+                map_build="never",
+                map_timeout_ms=1,
+                allow_missing_map=True,
+                gitnexus_repo=None,
+            )
+
+            workflow_index = packet["workflow_index"]
+            self.assertTrue(workflow_index["available"])
+            self.assertTrue(Path(str(workflow_index["db_path"])).exists())
+            self.assertGreater(workflow_index["files"], 0)
+            self.assertGreater(workflow_index["symbols"], 0)
+            self.assertEqual(workflow_index["head_sha"], packet["target_state"]["head_sha"])
+            self.assertEqual(
+                packet["targets"][0]["path"],
+                "apps/ops-dashboard/server/agentGateway.mjs",
+            )
+            self.assertFalse(packet["soulforge"]["stats"]["available"])
+            self.assertTrue(packet["source_status"]["unchanged"])
+            rendered = repo_context_forge.render_prompt(packet)
+            self.assertIn("<workflow_index available=\"true\"", rendered)
+            self.assertIn(
+                f"head_sha=\"{workflow_index['head_sha']}\"", rendered
+            )
+
+    def test_intent_mode_selects_targets_without_soulforge_map(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            server = repo / "apps" / "ops-dashboard" / "server"
+            server.mkdir(parents=True)
+            (server / "agentGateway.mjs").write_text(
+                "export function createAgentGateway() { return {}; }\n",
+                encoding="utf-8",
+            )
+            (server / "agentRoutes.mjs").write_text(
+                "export function createAgentRoutes() { return {}; }\n",
+                encoding="utf-8",
+            )
+            (server / "agentGateway.test.mjs").write_text(
+                "test('agent gateway', () => {});\n",
+                encoding="utf-8",
+            )
+            paths = repo_context_forge.source_worktree_files(repo)
+            native_index = repo_context_forge.workflow_index.WorkflowIndex(
+                repo, repo_context_forge.file_role
+            )
+            native_index.build(
+                paths,
+                head_sha=repo_context_forge.run_git(repo, ["rev-parse", "HEAD"]),
+                summary_for_symbol=repo_context_forge.synthetic_symbol_summary,
+            )
+            soul_map = repo_context_forge.SoulForgeMap(repo, native_index)
+
+            targets = repo_context_forge.target_files_for_mode(
+                "intent",
+                repo_context_forge.read_git_state(repo, "HEAD", "HEAD"),
+                soul_map,
+                "Improve agent gateway robustness and tests",
+                5,
+            )
+
+            self.assertEqual(targets[0], "apps/ops-dashboard/server/agentGateway.mjs")
+            self.assertIn("apps/ops-dashboard/server/agentRoutes.mjs", targets)
+            self.assertIn("apps/ops-dashboard/server/agentGateway.test.mjs", targets)
+            self.assertIn(
+                "createAgentGateway",
+                [symbol.name for symbol in soul_map.symbols_for_file(targets[0])],
+            )
+
+    def test_workflow_index_intent_matches_symbol_names(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "processor.py").write_text(
+                "def reconcile_tenant_ledger():\n    return None\n",
+                encoding="utf-8",
+            )
+            native_index = repo_context_forge.workflow_index.WorkflowIndex(
+                repo, repo_context_forge.file_role
+            )
+            native_index.build(
+                repo_context_forge.source_worktree_files(repo),
+                head_sha=repo_context_forge.run_git(repo, ["rev-parse", "HEAD"]),
+                summary_for_symbol=repo_context_forge.synthetic_symbol_summary,
+            )
+
+            self.assertEqual(
+                native_index.rank_intent(["tenant", "ledger"], 5)[0],
+                "src/processor.py",
+            )
+
+    def test_typescript_test_files_are_verification_surface(self) -> None:
+        self.assertEqual(repo_context_forge.file_role("src/App.test.ts"), "test")
+        self.assertEqual(repo_context_forge.file_role("src/App.test.tsx"), "test")
+        self.assertEqual(repo_context_forge.file_role("src/App.spec.tsx"), "test")
+
+    def test_required_intake_includes_architecture_and_gitnexus_authority(self) -> None:
+        packet = {
+            "schema_version": 1,
+            "mode": "pr",
+            "token_budget": 16000,
+            "target_state": {"head_sha": "abc123"},
+            "semantic_summaries": {"mode": "full_cached", "source_counts": {"llm": 1}},
+            "gitnexus": {
+                "status": "reindexed",
+                "repo": "analysis-repo",
+                "expected_head_sha": "abc123",
+                "indexed_head_sha": "abc123",
+                "required_checks_resolved": True,
+            },
+            "targets": [
+                {
+                    "path": "src/service.py",
+                    "surface_role": "production",
+                    "priority_score": 900,
+                    "rank_signals": ["changed_file"],
+                    "symbols": [{"name": "handle", "kind": "function"}],
+                    "soulforge_impact": {
+                        "risk": "medium",
+                        "direct_dependents": 2,
+                        "total_affected_scope": 4,
+                    },
+                },
+                {
+                    "path": "tests/test_service.py",
+                    "surface_role": "test",
+                    "priority_score": 800,
+                    "rank_signals": ["broad_test_container"],
+                    "soulforge_impact": {"risk": "low", "direct_dependents": 0},
+                },
+            ],
+            "coverage_plan": {"required": False, "delegation_required": False, "areas": []},
+        }
+
+        rendered = repo_context_forge.render_required_intake(packet)
+
+        self.assertIn("gitnexus: authority=packet", rendered)
+        self.assertIn("repo=analysis-repo", rendered)
+        self.assertIn("expected_head_sha=abc123", rendered)
+        self.assertIn("indexed_head_sha=abc123", rendered)
+        self.assertIn("gitnexus_tool_discovery:", rendered)
+        self.assertIn("architecture_summary:", rendered)
+        self.assertIn("- roles | production=1,test=1", rendered)
+        self.assertIn(
+            "- hotspots | src/service.py risk=medium direct_dependents=2 total_affected=4",
+            rendered,
+        )
+        self.assertIn("- entry_points | handle", rendered)
+
+    def test_make_packet_populates_architecture_and_gitnexus_head_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "a.py").write_text(
+                "def handle():\n    return 1\n", encoding="utf-8"
+            )
+            original_ensure = repo_context_forge.ensure_gitnexus_index
+            original_verify = repo_context_forge.verify_gitnexus_required_checks
+
+            def fake_ensure(target_state, repo_name, _mode, **_kwargs):
+                return {
+                    "status": "fresh",
+                    "repo": repo_name or target_state.analysis_repo.name,
+                    "expected_head_sha": target_state.head_sha,
+                    "indexed_head_sha": target_state.head_sha,
+                    "required_checks_resolved": True,
+                }
+
+            repo_context_forge.ensure_gitnexus_index = fake_ensure
+            repo_context_forge.verify_gitnexus_required_checks = (
+                lambda _plan, status, **_kwargs: status
+            )
+            try:
+                packet = repo_context_forge.make_packet(
+                    repo,
+                    mode="local",
+                    base_ref="HEAD",
+                    head_ref="HEAD",
+                    intent=None,
+                    top=5,
+                    token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET,
+                    cache_dir=Path(cache_dir),
+                    soulforge_bin=None,
+                    map_build="never",
+                    map_timeout_ms=1,
+                    allow_missing_map=True,
+                    gitnexus_repo=None,
+                )
+            finally:
+                repo_context_forge.ensure_gitnexus_index = original_ensure
+                repo_context_forge.verify_gitnexus_required_checks = original_verify
+
+            self.assertEqual(
+                packet["gitnexus"]["expected_head_sha"],
+                packet["target_state"]["head_sha"],
+            )
+            self.assertEqual(
+                packet["gitnexus"]["indexed_head_sha"],
+                packet["target_state"]["head_sha"],
+            )
+            self.assertTrue(packet["workflow_index"]["dirty_overlay"])
+            self.assertEqual(packet["architecture_summary"]["roles"], {"production": 1})
 
     def test_soulforge_impact_summary_uses_native_map_tables(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:
@@ -1354,7 +1583,10 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("mode: pr", captured["text"])
         self.assertIn("token_budget: 16000", captured["text"])
         self.assertIn("sources=synthetic=2", captured["text"])
-        self.assertIn("gitnexus: repo=example-index; status=fresh", captured["text"])
+        self.assertIn(
+            "gitnexus: authority=packet; repo=example-index; status=fresh",
+            captured["text"],
+        )
         self.assertIn("src/a.py", captured["text"])
         self.assertIn(
             "Run the listed gitnexus_required_checks first; they are the initial GitNexus validation",

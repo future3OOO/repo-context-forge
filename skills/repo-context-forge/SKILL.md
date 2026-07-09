@@ -34,17 +34,20 @@ rerun the bootstrap.
 3. Follow the packet's `<scope_rules>`:
 
 - before code reasoning, review, or GitNexus calls, surface a short intake from
-  `<context_digest>`: mode, head SHA, token budget, semantic source counts, top
-  targets, SoulForge impact headline, GitNexus repo/status, and the generated
-  `<coverage_plan>`
+  `<context_digest>`: mode, head SHA, token budget, workflow-index status,
+  semantic source counts, architecture summary, top targets, optional SoulForge
+  impact headline, packet-authoritative GitNexus repo/head status, and the
+  generated `<coverage_plan>`
 - satisfy every required `<coverage_plan>` area before GitNexus calls, GitHub
   review comments, review findings, or edits
 - use FFF MCP tools for any raw file, symbol, text, broad, or multi-pattern
   discovery needed while covering the packet surface; use Bash `rg` only when
   FFF is unavailable, its transport fails, or exhaustive/machine-readable output
   is required
-- use `<targets>` as the first-pass edit/review surface
-- use `<soulforge_impact>` as native SoulForge blast-radius context before
+- use `<targets>` as the first-pass edit/review surface; targets and prompt
+  symbols come from Forge's workflow index in the analysis checkout, which is
+  exact-head in `pr`/`repo` mode and records the dirty overlay in `local`/`intent`
+- use `<soulforge_impact>` as optional native SoulForge graph context before
   editing or reviewing selected files
 - use `<semantic_summaries>` and each symbol's summary source as injected
   context; `full_cached` means cached LLM/LSP/AST/native summaries are used
@@ -53,14 +56,17 @@ rerun the bootstrap.
 - in `pr` mode, do not treat dirty source-worktree files as PR targets
 - run the listed `<gitnexus_required_checks>` as the first GitNexus validation
   step before editing production code; these checks are scoped to the
-  SoulForge packet and the freshly indexed analysis repo
+  Forge packet and the freshly indexed analysis repo; if a required GitNexus
+  tool is not loaded, use tool discovery for that capability before reporting it
+  unavailable
 - for `pr`, use the live `base...HEAD` packet surface; for `local`, use dirty
   worktree packet targets; for `intent`, use the intent-ranked packet targets
 - do not let unscoped `gitnexus_detect_changes(compare)` choose the target
   surface
 
-4. If the packet says SoulForge is unavailable, continue only with the explicit
-fallback surface in the packet and say that symbol-level map data was missing.
+4. If the packet says SoulForge is unavailable, continue with the workflow-index
+targets and say that optional native SoulForge graph impact was unavailable. Do
+not treat a missing SoulForge map as a blocker when `<targets>` is present.
 
 ## Mode Selection
 
@@ -72,9 +78,10 @@ The bootstrap script auto-selects the mode:
   the user's request describes planned work
 - `repo`: clean current folder with no diff or intent; use whole-repo context
 
-Packets are generated from a cache-owned analysis checkout. Treat the user's
-checkout as read-only input; Repo Context Forge must not leave `.soulforge` or
-`.gitignore` changes in it.
+Packets and the workflow index are generated in a cache-owned analysis
+checkout. Treat the user's checkout as read-only input; Repo Context
+Forge must not leave `.repo-context-forge`, `.soulforge`, or `.gitignore`
+changes in it.
 
 Do not switch to a sibling worktree unless the user explicitly asks. The current
 git folder is the target.
@@ -96,8 +103,8 @@ For each `<check>` in `<gitnexus_required_checks>`:
 - do not call `gitnexus_list_repos` during normal recovery; the packet repo is
   authoritative
 - cite SoulForge impact separately from GitNexus impact when reporting review
-  evidence; SoulForge explains repo-map blast radius, while GitNexus validates
-  execution-flow impact
+  evidence; SoulForge explains native graph blast radius when available, while
+  GitNexus validates execution-flow impact
 - cite summary source when semantic summaries materially affect target choice
   or code reasoning
 - do not use unscoped `gitnexus_detect_changes(compare)` for initial target

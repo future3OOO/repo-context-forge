@@ -3,9 +3,11 @@
 Standalone context orchestrator for giving coding agents the right repository
 map before they reason, edit, or run GitNexus.
 
-The tool is dependency-free Python and can be run against any git repository. It
-uses SoulForge as the first map engine through an adapter, but keeps SoulForge's
-map separate from the target-selection and prompt-packet contracts.
+The tool is dependency-free Python and can be run against any git repository.
+Its workflow index owns deterministic target ranking and source symbols. It
+indexes an exact head for PR/repo mode and the explicit dirty overlay for
+local/intent mode. Optional SoulForge data enriches graph impact without
+becoming a startup dependency.
 
 ## Codex Plugin
 
@@ -26,8 +28,9 @@ The plugin startup path is:
 2. The plugin skill runs `scripts/codex_context_bootstrap.py` for the current
    git repo.
 3. The bootstrap script auto-selects `pr`, `local`, `intent`, or `repo` mode.
-4. The generated XML packet becomes the initial repo context for the task.
-5. GitNexus freshness is checked for the exact target head before blast-radius
+4. Forge builds an atomic workflow index in the cache-owned analysis checkout.
+5. The generated XML packet becomes the initial repo context for the task.
+6. GitNexus freshness is checked for the exact target head before blast-radius
    claims are trusted.
 
 In production plugin mode, the current git folder is the target. Clean folders
@@ -43,9 +46,9 @@ silently switch to sibling worktrees.
   request.
 - `repo` mode maps a clean current project folder for ambient whole-repo
   context.
-- native ranking combines changed hunks, production/test role, PageRank,
-  SoulForge graph neighbors, co-change partners, semantic summaries, and task
-  refresh signals.
+- native ranking combines changed hunks, production/test role, workflow-index
+  relevance, optional SoulForge graph/co-change data, semantic summaries, and
+  task refresh signals.
 - semantic summaries run in `full_cached` mode during bootstrap: cached
   LLM/LSP/AST/native summaries are used first, deterministic synthetic summaries
   fill missing symbols, and live LLM generation is not performed on routine
@@ -54,8 +57,8 @@ silently switch to sibling worktrees.
 - prompt packets default to a 16k token budget and compact optional symbol
   detail before dropping required status, target identity, or GitNexus checks.
 - packets include GitNexus required-check entries for context and impact calls.
-- packets include SoulForge target-head proof and GitNexus exact-head freshness
-  status.
+- packets include workflow-index and architecture summaries, optional SoulForge
+  target-head proof, and packet-authoritative GitNexus exact-head status.
 - `gitnexus-merge` merges real GitNexus findings and blocks stale blast-radius
   claims.
 - `wrap` writes the prompt packet and can pass it to another command before
@@ -144,8 +147,9 @@ python3 repo_context_forge.py wrap \
 --format markdown|json|prompt
 ```
 
-By default, `analyze` requires a SoulForge map. Use `--allow-missing-map` only
-when testing failure paths or no-map baselines.
+By default, `analyze` requires a SoulForge map for backward compatibility. The
+Codex bootstrap permits a missing map because the workflow index
+still provides targets and symbols; only optional native graph impact is absent.
 
 ## Production Contract
 
