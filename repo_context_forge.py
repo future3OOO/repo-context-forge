@@ -597,10 +597,10 @@ def remove_path(path: Path) -> None:
         path.unlink()
 
 
-def reset_cached_worktree(worktree: Path, cache_dir: Path) -> None:
+def reset_cached_worktree(worktree: Path, cache_dir: Path, *, allow_fail: bool = False) -> None:
     require_cache_path(worktree, cache_dir)
-    run_git(worktree, ["reset", "--hard", "HEAD"])
-    run_git(worktree, ["clean", "-fd", "-e", f"{workflow_index.INDEX_DIR}/"])
+    run_git(worktree, ["reset", "--hard", "HEAD"], allow_fail=allow_fail)
+    run_git(worktree, ["clean", "-fd", "-e", f"{workflow_index.INDEX_DIR}/"], allow_fail=allow_fail)
     soulforge_cache = worktree / ".soulforge"
     if os.path.lexists(soulforge_cache):
         require_cache_path(soulforge_cache, cache_dir)
@@ -648,7 +648,7 @@ def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cac
         if remove_checkout:
             safe_rmtree(checkout, cache_dir)
         else:
-            reset_cached_worktree(checkout, cache_dir)
+            reset_cached_worktree(checkout, cache_dir, allow_fail=True)
 
     if not checkout.exists():
         checkout.parent.mkdir(parents=True, exist_ok=True)

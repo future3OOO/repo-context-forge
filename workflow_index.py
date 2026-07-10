@@ -53,6 +53,7 @@ class WorkflowIndex:
         self.repo = repo
         self.role_for_path = role_for_path
         self.db_path = repo / INDEX_DIR / INDEX_DB
+        self._read_warning: str | None = None
 
     @property
     def is_available(self) -> bool:
@@ -149,12 +150,15 @@ class WorkflowIndex:
             if dirty_overlay not in {"true", "false"}:
                 raise ValueError(f"invalid dirty_overlay {dirty_overlay!r}")
         except (KeyError, ValueError, sqlite3.Error) as exc:
+            warning = f"invalid workflow index: {exc}"
+            if self._read_warning:
+                warning = f"{warning}; {self._read_warning}"
             return {
                 "available": False,
                 "db_path": str(self.db_path),
-                "warning": f"invalid workflow index: {exc}",
+                "warning": warning,
             }
-        return {
+        result: dict[str, object] = {
             "available": True,
             "db_path": str(self.db_path),
             "files": files,
@@ -163,6 +167,9 @@ class WorkflowIndex:
             "dirty_overlay": dirty_overlay == "true",
             "schema_version": schema_version,
         }
+        if self._read_warning:
+            result["warning"] = self._read_warning
+        return result
 
     def is_reusable(self, head_sha: str) -> bool:
         status = self.status()
@@ -309,8 +316,11 @@ class WorkflowIndex:
     ) -> list[tuple[object, ...]]:
         try:
             with self._open() as conn:
-                return conn.execute(query, tuple(parameters)).fetchall()
-        except sqlite3.Error:
+                rows = conn.execute(query, tuple(parameters)).fetchall()
+            self._read_warning = None
+            return rows
+        except sqlite3.Error as exc:
+            self._read_warning = f"workflow index read failed: {exc}"
             return []
 
     def _select_files(
@@ -386,6 +396,7 @@ class WorkflowIndex:
         content: str,
         summary_for_symbol: SummaryForSymbol,
     ) -> list[IndexedSymbol]:
+        """Index line-oriented declarations with direct same-line export heuristics."""
         extension = Path(path).suffix.lower()
         patterns: list[tuple[str, str]] = []
         if extension == ".py":

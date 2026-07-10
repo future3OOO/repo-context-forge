@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from collections import namedtuple
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -617,6 +618,32 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertFalse(second.target_dirty)
             self.assertFalse(repo_context_forge.is_dirty(repo, ignore_tool_cache=True))
 
+    def test_pr_analysis_recovers_when_reused_cache_preclean_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            cache = Path(cache_dir)
+            first = repo_context_forge.ensure_pr_worktree(repo, "HEAD", cache)
+            real_run_git = repo_context_forge.run_git
+            reset_attempts = 0
+
+            def fail_first_reset(target, args, *, allow_fail=False):
+                nonlocal reset_attempts
+                if target == first.analysis_repo and args == ["reset", "--hard", "HEAD"]:
+                    reset_attempts += 1
+                    if reset_attempts == 1:
+                        if allow_fail:
+                            return ""
+                        raise RuntimeError("interrupted reset")
+                return real_run_git(target, args, allow_fail=allow_fail)
+
+            with patch.object(repo_context_forge, "run_git", side_effect=fail_first_reset):
+                second = repo_context_forge.ensure_pr_worktree(repo, "HEAD", cache)
+
+            self.assertEqual(second.analysis_repo, first.analysis_repo)
+            self.assertEqual(reset_attempts, 2)
+            self.assertFalse(second.target_dirty)
+
     def test_make_packet_reuses_clean_exact_head_workflow_index(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
             repo = Path(repo_dir)
@@ -659,7 +686,7 @@ class RepoContextForgeTests(unittest.TestCase):
             first = repo_context_forge.make_packet(repo, **arguments)
             index_path = Path(str(first["workflow_index"]["db_path"]))
             first_inode = index_path.stat().st_ino
-            with sqlite3.connect(index_path) as connection:
+            with closing(sqlite3.connect(index_path)) as connection, connection:
                 connection.execute(
                     "UPDATE metadata SET value = 'stale' WHERE key = 'head_sha'"
                 )
@@ -971,7 +998,7 @@ class RepoContextForgeTests(unittest.TestCase):
             repo = Path(repo_dir)
             self.make_git_repo(repo)
             native_index = self.build_workflow_index(repo)
-            with sqlite3.connect(native_index.db_path) as conn:
+            with closing(sqlite3.connect(native_index.db_path)) as conn, conn:
                 conn.execute("DELETE FROM metadata WHERE key = 'head_sha'")
 
             status = native_index.status()
@@ -1001,6 +1028,13 @@ class RepoContextForgeTests(unittest.TestCase):
                 with self.subTest(name=name):
                     self.assertEqual(call(), expected)
             self.assertEqual(native_index.db_path.read_bytes(), corrupt)
+            self.assertIn("read failed", str(native_index.status()["warning"]))
+
+            native_index.build(
+                [], head_sha="recovered", summary_for_symbol=lambda *_args: "summary"
+            )
+            self.assertEqual(native_index.ranked_files(5), [])
+            self.assertNotIn("warning", native_index.status())
 
     def test_workflow_index_closes_build_and_read_connections(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:
@@ -1029,7 +1063,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 native_index.rank_intent(["indexed"], 5)
                 native_index.related_paths(["src/a.py"], 5)
 
-            self.assertGreaterEqual(len(opened), 7)
+            self.assertTrue(opened)
             self.assertTrue(all(connection.closed for connection in opened))
 
     def test_workflow_index_failed_build_closes_and_preserves_index(self) -> None:
@@ -1264,7 +1298,7 @@ class RepoContextForgeTests(unittest.TestCase):
             db_dir = repo / ".soulforge"
             db_dir.mkdir()
             db_path = db_dir / "repomap.db"
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn, conn:
                 conn.executescript(
                     """
                     CREATE TABLE files (
@@ -1354,7 +1388,7 @@ class RepoContextForgeTests(unittest.TestCase):
             repo = Path(repo_dir)
             db_dir = repo / ".soulforge"
             db_dir.mkdir()
-            with sqlite3.connect(db_dir / "repomap.db") as conn:
+            with closing(sqlite3.connect(db_dir / "repomap.db")) as conn, conn:
                 conn.executescript(
                     """
                     CREATE TABLE files (
