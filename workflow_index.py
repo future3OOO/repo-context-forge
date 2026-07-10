@@ -241,7 +241,7 @@ class WorkflowIndex:
     def rank_intent(self, tokens: list[str], limit: int) -> list[str]:
         if not self.is_available or not tokens or limit <= 0:
             return []
-        forms = self._intent_forms(tokens)
+        forms = self._intent_forms([token.lower() for token in tokens])
         candidates: list[str] = []
         for token, singular in forms:
             candidates.extend((token, singular) if singular else (token,))

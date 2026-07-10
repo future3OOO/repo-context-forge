@@ -2133,6 +2133,9 @@ def make_packet(
     source_repo = repo_root(repo)
     source_status_before = porcelain_status(source_repo)
     target_state = resolve_target_state(repo, mode, base_ref, head_ref, cache_dir)
+    if target_state.cache_key is None:
+        raise RuntimeError("packet analysis checkout must be cache-owned")
+    require_cache_path(target_state.analysis_repo, cache_dir)
     gitignore_dirty_before_build = ".gitignore" in dirty_paths(target_state.analysis_repo)
     build_result = build_soulforge_map(
         target_state.analysis_repo,
@@ -2144,15 +2147,12 @@ def make_packet(
     if can_cleanup_analysis and (mode == "pr" or not gitignore_dirty_before_build):
         cleanup_soulforge_gitignore_change(target_state.analysis_repo)
     native_index = workflow_index.WorkflowIndex(target_state.analysis_repo, file_role)
-    cache_owned = target_state.cache_key is not None
-    if cache_owned:
-        require_cache_path(target_state.analysis_repo, cache_dir)
     native_index.ensure_current(
         source_worktree_files(target_state.analysis_repo),
         head_sha=target_state.head_sha,
         dirty_overlay=target_state.target_dirty,
         summary_for_symbol=synthetic_symbol_summary,
-        reuse=cache_owned and not target_state.source_dirty and not target_state.target_dirty,
+        reuse=not target_state.source_dirty and not target_state.target_dirty,
     )
     soul_map = SoulForgeMap(target_state.analysis_repo, native_index)
     # Standalone analyze stays SoulForge-strict; Codex bootstrap explicitly opts into native fallback.

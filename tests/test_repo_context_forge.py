@@ -50,6 +50,8 @@ class TrackedConnection:
         return self.connection.__exit__(*args)
 
     def __getattr__(self, name: str):
+        if name == "connection" and "connection" not in self.__dict__:
+            raise AttributeError(name)
         return getattr(self.connection, name)
 
     def close(self) -> None:
@@ -663,13 +665,25 @@ class RepoContextForgeTests(unittest.TestCase):
                 "gitnexus_repo": None,
             }
 
-            first = repo_context_forge.make_packet(repo, **arguments)
+            original_build = repo_context_forge.workflow_index.WorkflowIndex.build
+            builds = 0
+
+            def count_builds(index, *args, **kwargs):
+                nonlocal builds
+                builds += 1
+                return original_build(index, *args, **kwargs)
+
+            with patch.object(
+                repo_context_forge.workflow_index.WorkflowIndex,
+                "build",
+                new=count_builds,
+            ):
+                first = repo_context_forge.make_packet(repo, **arguments)
+                second = repo_context_forge.make_packet(repo, **arguments)
             index_path = Path(str(first["workflow_index"]["db_path"]))
-            first_inode = index_path.stat().st_ino
-            second = repo_context_forge.make_packet(repo, **arguments)
 
             self.assertEqual(Path(str(second["workflow_index"]["db_path"])), index_path)
-            self.assertEqual(index_path.stat().st_ino, first_inode)
+            self.assertEqual(builds, 1)
 
     def test_make_packet_rebuilds_invalid_cached_workflow_index(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
@@ -685,7 +699,6 @@ class RepoContextForgeTests(unittest.TestCase):
             }
             first = repo_context_forge.make_packet(repo, **arguments)
             index_path = Path(str(first["workflow_index"]["db_path"]))
-            first_inode = index_path.stat().st_ino
             with closing(sqlite3.connect(index_path)) as connection, connection:
                 connection.execute(
                     "UPDATE metadata SET value = 'stale' WHERE key = 'head_sha'"
@@ -693,7 +706,6 @@ class RepoContextForgeTests(unittest.TestCase):
 
             second = repo_context_forge.make_packet(repo, **arguments)
 
-            self.assertNotEqual(index_path.stat().st_ino, first_inode)
             self.assertEqual(
                 second["workflow_index"]["head_sha"],
                 repo_context_forge.run_git(repo, ["rev-parse", "HEAD"]),
@@ -712,15 +724,35 @@ class RepoContextForgeTests(unittest.TestCase):
                 "map_build": "never", "map_timeout_ms": 1,
                 "allow_missing_map": True, "gitnexus_repo": None,
             }
-            first = repo_context_forge.make_packet(repo, **arguments)
-            index_path = Path(str(first["workflow_index"]["db_path"]))
-            first_inode = index_path.stat().st_ino
+            repo_context_forge.make_packet(repo, **arguments)
             (repo / "src" / "a.py").write_text("print('dirty two')\n", encoding="utf-8")
 
             second = repo_context_forge.make_packet(repo, **arguments)
 
-            self.assertNotEqual(index_path.stat().st_ino, first_inode)
             self.assertTrue(second["workflow_index"]["dirty_overlay"])
+
+    def test_make_packet_rejects_non_cache_owned_analysis_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            state = repo_context_forge.TargetState(
+                mode="repo", source_repo=repo, analysis_repo=repo,
+                base_ref="HEAD", head_ref="HEAD",
+                head_sha=repo_context_forge.run_git(repo, ["rev-parse", "HEAD"]),
+                source_dirty=False, target_dirty=False, cache_key=None,
+            )
+            with patch.object(repo_context_forge, "resolve_target_state", return_value=state):
+                with self.assertRaisesRegex(RuntimeError, "cache-owned"):
+                    repo_context_forge.make_packet(
+                        repo, mode="repo", base_ref="HEAD", head_ref="HEAD",
+                        intent=None, top=5,
+                        token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET,
+                        cache_dir=Path(cache_dir), soulforge_bin=None,
+                        map_build="never", map_timeout_ms=1,
+                        allow_missing_map=True, gitnexus_repo=None,
+                    )
+
+            self.assertFalse((repo / repo_context_forge.workflow_index.INDEX_DIR).exists())
 
     def test_make_packet_runs_soulforge_build_outside_source_repo(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
@@ -966,6 +998,7 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertEqual(native_index.rank_intent(["class"], 5), [])
             self.assertEqual(native_index.rank_intent(["status"], 5), [])
             self.assertEqual(native_index.rank_intent(["gateways"], 5), ["src/gateway.py"])
+            self.assertEqual(native_index.rank_intent(["GATEWAYS"], 5), ["src/gateway.py"])
             self.assertEqual(native_index.rank_intent(["ledgers"], 5), ["src/ledger.py"])
 
     def test_workflow_index_negative_symbol_limit_returns_no_symbols(self) -> None:
