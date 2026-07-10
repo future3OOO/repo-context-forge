@@ -979,6 +979,29 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertFalse(status["available"])
             self.assertIn("head_sha", str(status["warning"]))
 
+    def test_workflow_index_corrupt_database_fails_closed_for_all_readers(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            native_index = repo_context_forge.workflow_index.WorkflowIndex(
+                repo, repo_context_forge.file_role
+            )
+            native_index.db_path.parent.mkdir(parents=True)
+            corrupt = b"not a sqlite database"
+            native_index.db_path.write_bytes(corrupt)
+
+            self.assertFalse(native_index.status()["available"])
+            calls = {
+                "ranked_files": (lambda: native_index.ranked_files(5), []),
+                "lookup_files": (lambda: native_index.lookup_files(["src/a.py"]), {}),
+                "file_symbols": (lambda: native_index.file_symbols("src/a.py", 5), []),
+                "rank_intent": (lambda: native_index.rank_intent(["agent"], 5), []),
+                "related_paths": (lambda: native_index.related_paths(["src/a.py"], 5), []),
+            }
+            for name, (call, expected) in calls.items():
+                with self.subTest(name=name):
+                    self.assertEqual(call(), expected)
+            self.assertEqual(native_index.db_path.read_bytes(), corrupt)
+
     def test_workflow_index_closes_build_and_read_connections(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:
             repo = Path(repo_dir)

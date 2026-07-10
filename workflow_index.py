@@ -16,6 +16,8 @@ INDEX_DB = "workflow-index.sqlite3"
 SCHEMA_VERSION = 1
 SOURCE_EXTENSIONS = {".js", ".jsx", ".mjs", ".py", ".ts", ".tsx"}
 STRUCTURED_EXTENSIONS = {".json", ".toml", ".yaml", ".yml"}
+FILE_COLUMNS = "path, base_score, symbol_count, line_count, base_rank"
+SYMBOL_COLUMNS = "name, kind, line, end_line, signature, is_exported, summary, summary_source"
 
 RoleForPath = Callable[[str], str]
 SummaryForSymbol = Callable[[str, str, str], str]
@@ -23,6 +25,8 @@ SummaryForSymbol = Callable[[str, str, str], str]
 
 @dataclass(frozen=True)
 class IndexedFile:
+    """Compatibility DTO; pagerank is workflow relevance, not graph PageRank."""
+
     path: str
     pagerank: float
     symbol_count: int
@@ -189,16 +193,10 @@ class WorkflowIndex:
     def ranked_files(self, limit: int) -> list[IndexedFile]:
         if not self.is_available or limit <= 0:
             return []
-        with self._open() as conn:
-            rows = conn.execute(
-                """
-                SELECT path, base_score, symbol_count, line_count, base_rank
-                FROM files
-                ORDER BY role != 'production', base_score DESC, path ASC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+        rows = self._select_files(
+            "ORDER BY role != 'production', base_score DESC, path ASC LIMIT ?",
+            (limit,),
+        )
         return [self._indexed_file(row) for row in rows]
 
     def lookup_files(self, paths: Iterable[str]) -> dict[str, IndexedFile]:
@@ -206,31 +204,19 @@ class WorkflowIndex:
         if not self.is_available or not wanted:
             return {}
         marks = ",".join("?" for _ in wanted)
-        with self._open() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT path, base_score, symbol_count, line_count, base_rank
-                FROM files WHERE path IN ({marks})
-                """,
-                wanted,
-            ).fetchall()
+        rows = self._select_files(f"WHERE path IN ({marks})", wanted)
         return {str(row[0]): self._indexed_file(row) for row in rows}
 
     def file_symbols(self, path: str, limit: int) -> list[IndexedSymbol]:
         if limit < 1 or not self.is_available:
             return []
-        with self._open() as conn:
-            rows = conn.execute(
-                """
-                SELECT name, kind, line, end_line, signature, is_exported,
-                       summary, summary_source
-                FROM symbols
-                WHERE file_path = ?
-                ORDER BY is_exported DESC, line ASC
-                LIMIT ?
-                """,
-                (path, limit),
-            ).fetchall()
+        rows = self._fetchall(
+            f"""SELECT {SYMBOL_COLUMNS} FROM symbols
+            WHERE file_path = ?
+            ORDER BY is_exported DESC, line ASC
+            LIMIT ?""",
+            (path, limit),
+        )
         return [
             IndexedSymbol(
                 name=str(name),
@@ -254,15 +240,14 @@ class WorkflowIndex:
             candidates.extend((token, singular) if singular else (token,))
         candidates = list(dict.fromkeys(candidates))
         predicates = " OR ".join("instr(search_terms, ?) > 0" for _ in candidates)
-        with self._open() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT path, role, base_score, search_terms
-                FROM files
-                WHERE {predicates}
-                """,
-                candidates,
-            ).fetchall()
+        rows = self._fetchall(
+            f"""
+            SELECT path, role, base_score, search_terms
+            FROM files
+            WHERE {predicates}
+            """,
+            candidates,
+        )
         scored: list[tuple[float, str, str]] = []
         for path, role, base_score, search_terms in rows:
             score = float(base_score)
@@ -291,8 +276,7 @@ class WorkflowIndex:
         base_paths = set(paths)
         stems = {self._logical_stem(path) for path in base_paths}
         parent_dirs = {str(Path(path).parent) for path in base_paths}
-        with self._open() as conn:
-            candidates = [str(row[0]) for row in conn.execute("SELECT path FROM files")]
+        candidates = [str(row[0]) for row in self._fetchall("SELECT path FROM files")]
         scores: dict[str, float] = {}
         for candidate in candidates:
             if candidate in base_paths:
@@ -319,6 +303,20 @@ class WorkflowIndex:
         return closing(
             sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
         )
+
+    def _fetchall(
+        self, query: str, parameters: Iterable[object] = ()
+    ) -> list[tuple[object, ...]]:
+        try:
+            with self._open() as conn:
+                return conn.execute(query, tuple(parameters)).fetchall()
+        except sqlite3.Error:
+            return []
+
+    def _select_files(
+        self, clause: str, parameters: Iterable[object]
+    ) -> list[tuple[object, ...]]:
+        return self._fetchall(f"SELECT {FILE_COLUMNS} FROM files {clause}", parameters)
 
     @staticmethod
     def _create_schema(conn: sqlite3.Connection) -> None:

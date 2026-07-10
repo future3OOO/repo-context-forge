@@ -647,6 +647,8 @@ def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cac
             remove_checkout = existing_sha != head_sha
         if remove_checkout:
             safe_rmtree(checkout, cache_dir)
+        else:
+            reset_cached_worktree(checkout, cache_dir)
 
     if not checkout.exists():
         checkout.parent.mkdir(parents=True, exist_ok=True)
@@ -654,8 +656,8 @@ def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cac
             ["git", "clone", "--no-checkout", "--shared", str(source_repo), str(checkout)]
         )
 
-    reset_cached_worktree(checkout, cache_dir)
     run_git(checkout, ["checkout", "-B", "repo-context-forge-target", head_sha])
+    reset_cached_worktree(checkout, cache_dir)
 
 
 def ensure_pr_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
@@ -1236,9 +1238,9 @@ class SoulForgeMap:
         ]
 
     def related_files_for_paths(self, paths: Iterable[str], limit: int) -> list[str]:
+        """Intentionally prefer SoulForge graph/cochange; workflow heuristics are fallback."""
         if limit <= 0:
             return []
-        # SoulForge owns real graph data; workflow-index relationships are heuristic fallback.
         if not self.available:
             return self.native_index.related_paths(paths, limit)
         base_paths = set(paths)
