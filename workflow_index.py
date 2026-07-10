@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import tempfile
+from contextlib import AbstractContextManager, closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -68,7 +69,7 @@ class WorkflowIndex:
         os.close(descriptor)
         temporary_path = Path(temporary_name)
         try:
-            with sqlite3.connect(temporary_path) as conn:
+            with closing(sqlite3.connect(temporary_path)) as conn, conn:
                 self._create_schema(conn)
                 for rank, row in enumerate(
                     self._file_rows(paths, summary_for_symbol), start=1
@@ -231,18 +232,20 @@ class WorkflowIndex:
             matched = False
             haystack = str(search_terms)
             for token in tokens:
-                singular = token[:-1] if token.endswith("s") else token
+                singular = None
+                if len(token) > 4 and token.endswith("ies"):
+                    singular = token[:-3] + "y"
+                elif (
+                    len(token) > 3
+                    and token.endswith("s")
+                    and not token.endswith(("ss", "us", "is"))
+                ):
+                    singular = token[:-1]
                 if re.search(rf"\b{re.escape(token)}\b", haystack):
                     score += 45
                     matched = True
                 elif singular and re.search(rf"\b{re.escape(singular)}\b", haystack):
                     score += 35
-                    matched = True
-                elif token in haystack:
-                    score += 20
-                    matched = True
-                elif singular and singular in haystack:
-                    score += 12
                     matched = True
             if matched:
                 scored.append((score, str(role), str(path)))
@@ -284,8 +287,10 @@ class WorkflowIndex:
             )[:limit]
         ]
 
-    def _open(self) -> sqlite3.Connection:
-        return sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
+    def _open(self) -> AbstractContextManager[sqlite3.Connection]:
+        return closing(
+            sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
+        )
 
     @staticmethod
     def _create_schema(conn: sqlite3.Connection) -> None:

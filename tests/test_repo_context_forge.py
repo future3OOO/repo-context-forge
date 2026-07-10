@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from collections import namedtuple
 from pathlib import Path
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "repo_context_forge.py"
@@ -33,6 +34,26 @@ install_local_plugin = load_module(
     "install_local_plugin",
     ROOT / "scripts" / "install_local_plugin.py",
 )
+
+
+class TrackedConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        self.closed = False
+
+    def __enter__(self):
+        self.connection.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self.connection.__exit__(*args)
+
+    def __getattr__(self, name: str):
+        return getattr(self.connection, name)
+
+    def close(self) -> None:
+        self.closed = True
+        self.connection.close()
 
 
 class RepoContextForgeTests(unittest.TestCase):
@@ -814,6 +835,34 @@ class RepoContextForgeTests(unittest.TestCase):
                 "src/processor.py",
             )
 
+    def test_workflow_index_intent_uses_whole_terms_and_safe_plurals(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            paths = [
+                "src/valid.py",
+                "src/classifier.py",
+                "src/statue.py",
+                "src/gateway.py",
+                "src/ledger.py",
+            ]
+            for path in paths:
+                (repo / path).write_text("pass\n", encoding="utf-8")
+            native_index = repo_context_forge.workflow_index.WorkflowIndex(
+                repo, repo_context_forge.file_role
+            )
+            native_index.build(
+                paths,
+                head_sha="abc123",
+                summary_for_symbol=repo_context_forge.synthetic_symbol_summary,
+            )
+
+            self.assertEqual(native_index.rank_intent(["id"], 5), [])
+            self.assertEqual(native_index.rank_intent(["class"], 5), [])
+            self.assertEqual(native_index.rank_intent(["status"], 5), [])
+            self.assertEqual(native_index.rank_intent(["gateways"], 5), ["src/gateway.py"])
+            self.assertEqual(native_index.rank_intent(["ledgers"], 5), ["src/ledger.py"])
+
     def test_workflow_index_negative_symbol_limit_returns_no_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:
             repo = Path(repo_dir)
@@ -851,6 +900,76 @@ class RepoContextForgeTests(unittest.TestCase):
 
             self.assertFalse(status["available"])
             self.assertIn("head_sha", str(status["warning"]))
+
+    def test_workflow_index_closes_build_and_read_connections(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            opened: list[TrackedConnection] = []
+            real_connect = sqlite3.connect
+
+            def connect(*args, **kwargs):
+                connection = TrackedConnection(real_connect(*args, **kwargs))
+                opened.append(connection)
+                return connection
+
+            with patch.object(
+                repo_context_forge.workflow_index.sqlite3,
+                "connect",
+                side_effect=connect,
+            ):
+                native_index = self.build_workflow_index(
+                    repo, "def indexed_symbol():\n    return 1\n"
+                )
+                native_index.status()
+                native_index.ranked_files(5)
+                native_index.lookup_files(["src/a.py"])
+                native_index.file_symbols("src/a.py", 5)
+                native_index.rank_intent(["indexed"], 5)
+                native_index.related_paths(["src/a.py"], 5)
+
+            self.assertEqual(len(opened), 7)
+            self.assertTrue(all(connection.closed for connection in opened))
+
+    def test_workflow_index_failed_build_closes_and_preserves_index(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            native_index = self.build_workflow_index(repo)
+            original_database = native_index.db_path.read_bytes()
+            (repo / "src" / "a.py").write_text(
+                "def replacement():\n    return 1\n", encoding="utf-8"
+            )
+            opened: list[TrackedConnection] = []
+            real_connect = sqlite3.connect
+
+            def connect(*args, **kwargs):
+                connection = TrackedConnection(real_connect(*args, **kwargs))
+                opened.append(connection)
+                return connection
+
+            def fail_summary(_path: str, _name: str, _kind: str) -> str:
+                raise RuntimeError("summary failed")
+
+            with patch.object(
+                repo_context_forge.workflow_index.sqlite3,
+                "connect",
+                side_effect=connect,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "summary failed"):
+                    native_index.build(
+                        ["src/a.py"],
+                        head_sha="replacement",
+                        summary_for_symbol=fail_summary,
+                    )
+
+            self.assertEqual(len(opened), 1)
+            self.assertTrue(opened[0].closed)
+            self.assertEqual(native_index.db_path.read_bytes(), original_database)
+            self.assertEqual(
+                list(native_index.db_path.parent.glob("workflow-index.sqlite3.*.tmp")),
+                [],
+            )
 
     def test_workflow_index_exports_only_top_level_public_python_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:
@@ -961,9 +1080,6 @@ class RepoContextForgeTests(unittest.TestCase):
             (repo / "src" / "a.py").write_text(
                 "def handle():\n    return 1\n", encoding="utf-8"
             )
-            original_ensure = repo_context_forge.ensure_gitnexus_index
-            original_verify = repo_context_forge.verify_gitnexus_required_checks
-
             def fake_ensure(target_state, repo_name, _mode, **_kwargs):
                 return {
                     "status": "fresh",
@@ -973,11 +1089,15 @@ class RepoContextForgeTests(unittest.TestCase):
                     "required_checks_resolved": True,
                 }
 
-            repo_context_forge.ensure_gitnexus_index = fake_ensure
-            repo_context_forge.verify_gitnexus_required_checks = (
-                lambda _plan, status, **_kwargs: status
-            )
-            try:
+            with patch.object(
+                repo_context_forge,
+                "ensure_gitnexus_index",
+                side_effect=fake_ensure,
+            ), patch.object(
+                repo_context_forge,
+                "verify_gitnexus_required_checks",
+                side_effect=lambda _plan, status, **_kwargs: status,
+            ):
                 packet = repo_context_forge.make_packet(
                     repo,
                     mode="local",
@@ -993,9 +1113,6 @@ class RepoContextForgeTests(unittest.TestCase):
                     allow_missing_map=True,
                     gitnexus_repo=None,
                 )
-            finally:
-                repo_context_forge.ensure_gitnexus_index = original_ensure
-                repo_context_forge.verify_gitnexus_required_checks = original_verify
 
             self.assertEqual(
                 packet["gitnexus"]["expected_head_sha"],
@@ -1477,31 +1594,20 @@ class RepoContextForgeTests(unittest.TestCase):
         )
 
     def test_bootstrap_prefers_environment_pr_base_over_main(self) -> None:
-        original_git_output = codex_context_bootstrap.git_output
-        original_base = os.environ.get("GITHUB_BASE_REF")
-        os.environ["GITHUB_BASE_REF"] = "codex/native-startup-checkout"
-        codex_context_bootstrap.git_output = (
-            lambda _repo, args: "sha"
+        with patch.dict(
+            os.environ, {"GITHUB_BASE_REF": "codex/native-startup-checkout"}
+        ), patch.object(
+            codex_context_bootstrap,
+            "git_output",
+            side_effect=lambda _repo, args: "sha"
             if args[-1] in {"origin/codex/native-startup-checkout", "origin/main"}
-            else ""
-        )
-        try:
+            else "",
+        ):
             base = codex_context_bootstrap.first_existing_base(Path("/repo"), None)
-        finally:
-            codex_context_bootstrap.git_output = original_git_output
-            if original_base is None:
-                os.environ.pop("GITHUB_BASE_REF", None)
-            else:
-                os.environ["GITHUB_BASE_REF"] = original_base
 
         self.assertEqual(base, "origin/codex/native-startup-checkout")
 
     def test_bootstrap_prefers_live_pr_base_over_main(self) -> None:
-        original_run_cmd = codex_context_bootstrap.forge.run_cmd
-        original_git_output = codex_context_bootstrap.git_output
-        original_which = codex_context_bootstrap.shutil.which
-        original_base = os.environ.pop("GITHUB_BASE_REF", None)
-
         def fake_run_cmd(args, **_kwargs):
             if args[:2] == ["gh", "pr"]:
                 return repo_context_forge.subprocess.CompletedProcess(
@@ -1509,43 +1615,42 @@ class RepoContextForgeTests(unittest.TestCase):
                 )
             raise AssertionError(f"unexpected command: {args}")
 
-        codex_context_bootstrap.forge.run_cmd = fake_run_cmd
-        codex_context_bootstrap.shutil.which = lambda _command: "/usr/bin/gh"
-        codex_context_bootstrap.git_output = (
-            lambda _repo, args: "origin-sha"
+        with patch.dict(os.environ, {"GITHUB_BASE_REF": ""}), patch.object(
+            codex_context_bootstrap.forge,
+            "run_cmd",
+            side_effect=fake_run_cmd,
+        ), patch.object(
+            codex_context_bootstrap.shutil,
+            "which",
+            return_value="/usr/bin/gh",
+        ), patch.object(
+            codex_context_bootstrap,
+            "git_output",
+            side_effect=lambda _repo, args: "origin-sha"
             if args[-1] == "origin/codex/native-startup-checkout"
             else "upstream-sha"
             if args[-1] == "upstream/codex/native-startup-checkout"
             else "main-sha"
             if args[-1] == "origin/main"
-            else ""
-        )
-        try:
+            else "",
+        ):
             base = codex_context_bootstrap.first_existing_base(Path("/repo"), None)
-        finally:
-            codex_context_bootstrap.forge.run_cmd = original_run_cmd
-            codex_context_bootstrap.git_output = original_git_output
-            codex_context_bootstrap.shutil.which = original_which
-            if original_base is not None:
-                os.environ["GITHUB_BASE_REF"] = original_base
 
         self.assertEqual(base, "origin/codex/native-startup-checkout")
 
     def test_bootstrap_falls_back_to_main_without_github_cli(self) -> None:
-        original_git_output = codex_context_bootstrap.git_output
-        original_which = codex_context_bootstrap.shutil.which
-        original_base = os.environ.pop("GITHUB_BASE_REF", None)
-        codex_context_bootstrap.shutil.which = lambda _command: None
-        codex_context_bootstrap.git_output = (
-            lambda _repo, args: "sha" if args[-1] == "origin/main" else ""
-        )
-        try:
+        with patch.dict(os.environ, {"GITHUB_BASE_REF": ""}), patch.object(
+            codex_context_bootstrap.shutil,
+            "which",
+            return_value=None,
+        ), patch.object(
+            codex_context_bootstrap,
+            "git_output",
+            side_effect=lambda _repo, args: "sha"
+            if args[-1] == "origin/main"
+            else "",
+        ):
             base = codex_context_bootstrap.first_existing_base(Path("/repo"), None)
-        finally:
-            codex_context_bootstrap.git_output = original_git_output
-            codex_context_bootstrap.shutil.which = original_which
-            if original_base is not None:
-                os.environ["GITHUB_BASE_REF"] = original_base
 
         self.assertEqual(base, "origin/main")
 
