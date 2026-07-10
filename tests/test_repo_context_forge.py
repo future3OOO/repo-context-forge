@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sqlite3
 import sys
 import tempfile
 import unittest
+from collections import namedtuple
 from pathlib import Path
 
 
@@ -43,6 +45,21 @@ class RepoContextForgeTests(unittest.TestCase):
         (root / "src" / "a.py").write_text("print('clean')\n", encoding="utf-8")
         repo_context_forge.run_cmd(["git", "add", ".gitignore", "src/a.py"], cwd=root)
         repo_context_forge.run_cmd(["git", "commit", "-m", "initial"], cwd=root)
+
+    def build_workflow_index(
+        self, repo: Path, source: str | None = None
+    ) -> repo_context_forge.workflow_index.WorkflowIndex:
+        if source is not None:
+            (repo / "src" / "a.py").write_text(source, encoding="utf-8")
+        native_index = repo_context_forge.workflow_index.WorkflowIndex(
+            repo, repo_context_forge.file_role
+        )
+        native_index.build(
+            repo_context_forge.source_worktree_files(repo),
+            head_sha=repo_context_forge.run_git(repo, ["rev-parse", "HEAD"]),
+            summary_for_symbol=repo_context_forge.synthetic_symbol_summary,
+        )
+        return native_index
 
     def test_unique_sorted_deduplicates_and_sorts(self) -> None:
         self.assertEqual(
@@ -562,6 +579,23 @@ class RepoContextForgeTests(unittest.TestCase):
             )
             self.assertEqual(common_dir, ".git")
 
+    def test_pr_analysis_reuses_cache_after_generated_agent_files(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            cache = Path(cache_dir)
+            first = repo_context_forge.ensure_pr_worktree(repo, "HEAD", cache)
+            generated = first.analysis_repo / ".claude" / "skills" / "gitnexus"
+            generated.mkdir(parents=True)
+            (generated / "SKILL.md").write_text("generated\n", encoding="utf-8")
+
+            second = repo_context_forge.ensure_pr_worktree(repo, "HEAD", cache)
+
+            self.assertEqual(second.analysis_repo, first.analysis_repo)
+            self.assertFalse((second.analysis_repo / ".claude").exists())
+            self.assertFalse(second.target_dirty)
+            self.assertFalse(repo_context_forge.is_dirty(repo, ignore_tool_cache=True))
+
     def test_make_packet_runs_soulforge_build_outside_source_repo(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
             repo = Path(repo_dir)
@@ -731,6 +765,33 @@ class RepoContextForgeTests(unittest.TestCase):
                 [symbol.name for symbol in soul_map.symbols_for_file(targets[0])],
             )
 
+    def test_soulforge_adapter_converts_native_records_by_interface(self) -> None:
+        file_entry = namedtuple(
+            "FileEntry", "path pagerank symbol_count line_count rank"
+        )("src/a.py", 0.5, 1, 2, 1)
+        symbol_entry = namedtuple(
+            "SymbolEntry",
+            "name kind line end_line signature is_exported summary summary_source",
+        )("handle", "function", 1, 1, "def handle():", True, "summary", "workflow_index")
+
+        class NativeIndex:
+            is_available = True
+
+            def ranked_files(self, _limit):
+                return [file_entry]
+
+            def lookup_files(self, _paths):
+                return {file_entry.path: file_entry}
+
+            def file_symbols(self, _path, _limit):
+                return [symbol_entry]
+
+        soul_map = repo_context_forge.SoulForgeMap(Path("/repo"), NativeIndex())
+
+        self.assertEqual(soul_map.top_files(1)[0].path, "src/a.py")
+        self.assertEqual(soul_map.files_by_path(["src/a.py"])["src/a.py"].rank, 1)
+        self.assertEqual(soul_map.symbols_for_file("src/a.py")[0].name, "handle")
+
     def test_workflow_index_intent_matches_symbol_names(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:
             repo = Path(repo_dir)
@@ -751,6 +812,77 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertEqual(
                 native_index.rank_intent(["tenant", "ledger"], 5)[0],
                 "src/processor.py",
+            )
+
+    def test_workflow_index_negative_symbol_limit_returns_no_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            native_index = self.build_workflow_index(
+                repo, "def indexed_symbol():\n    return 1\n"
+            )
+
+            self.assertEqual(native_index.file_symbols("src/a.py", -1), [])
+
+    def test_workflow_index_reads_database_from_uri_special_path(self) -> None:
+        with tempfile.TemporaryDirectory() as parent_dir:
+            repo = Path(parent_dir) / "repo?#special"
+            repo.mkdir()
+            self.make_git_repo(repo)
+            native_index = self.build_workflow_index(
+                repo, "def indexed_symbol():\n    return 1\n"
+            )
+
+            self.assertTrue(native_index.status()["available"])
+            self.assertEqual(
+                [symbol.name for symbol in native_index.file_symbols("src/a.py", 5)],
+                ["indexed_symbol"],
+            )
+
+    def test_workflow_index_status_rejects_missing_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            native_index = self.build_workflow_index(repo)
+            with sqlite3.connect(native_index.db_path) as conn:
+                conn.execute("DELETE FROM metadata WHERE key = 'head_sha'")
+
+            status = native_index.status()
+
+            self.assertFalse(status["available"])
+            self.assertIn("head_sha", str(status["warning"]))
+
+    def test_workflow_index_exports_only_top_level_public_python_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            native_index = self.build_workflow_index(
+                repo,
+                "def public():\n"
+                "    def inner():\n"
+                "        return 1\n"
+                "    return inner()\n\n"
+                "class Example:\n"
+                "    def method(self):\n"
+                "        return 1\n\n"
+                "def _private():\n"
+                "    return 1\n",
+            )
+
+            exports = {
+                symbol.name: symbol.is_exported
+                for symbol in native_index.file_symbols("src/a.py", 10)
+            }
+
+            self.assertEqual(
+                exports,
+                {
+                    "public": True,
+                    "inner": False,
+                    "Example": True,
+                    "method": False,
+                    "_private": False,
+                },
             )
 
     def test_typescript_test_files_are_verification_surface(self) -> None:
@@ -810,6 +942,17 @@ class RepoContextForgeTests(unittest.TestCase):
             rendered,
         )
         self.assertIn("- entry_points | handle", rendered)
+
+    def test_context_digest_rejects_malformed_packet_sections(self) -> None:
+        packet = {
+            "mode": "pr",
+            "target_state": {"head_sha": "abc123"},
+            "gitnexus": {},
+            "targets": "not-a-list",
+        }
+
+        with self.assertRaisesRegex(ValueError, "targets must be a list"):
+            repo_context_forge.render_context_digest_lines(packet)
 
     def test_make_packet_populates_architecture_and_gitnexus_head_proof(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
@@ -1332,6 +1475,79 @@ class RepoContextForgeTests(unittest.TestCase):
                 cache_dir,
             )
         )
+
+    def test_bootstrap_prefers_environment_pr_base_over_main(self) -> None:
+        original_git_output = codex_context_bootstrap.git_output
+        original_base = os.environ.get("GITHUB_BASE_REF")
+        os.environ["GITHUB_BASE_REF"] = "codex/native-startup-checkout"
+        codex_context_bootstrap.git_output = (
+            lambda _repo, args: "sha"
+            if args[-1] in {"origin/codex/native-startup-checkout", "origin/main"}
+            else ""
+        )
+        try:
+            base = codex_context_bootstrap.first_existing_base(Path("/repo"), None)
+        finally:
+            codex_context_bootstrap.git_output = original_git_output
+            if original_base is None:
+                os.environ.pop("GITHUB_BASE_REF", None)
+            else:
+                os.environ["GITHUB_BASE_REF"] = original_base
+
+        self.assertEqual(base, "origin/codex/native-startup-checkout")
+
+    def test_bootstrap_prefers_live_pr_base_over_main(self) -> None:
+        original_run_cmd = codex_context_bootstrap.forge.run_cmd
+        original_git_output = codex_context_bootstrap.git_output
+        original_which = codex_context_bootstrap.shutil.which
+        original_base = os.environ.pop("GITHUB_BASE_REF", None)
+
+        def fake_run_cmd(args, **_kwargs):
+            if args[:2] == ["gh", "pr"]:
+                return repo_context_forge.subprocess.CompletedProcess(
+                    args, 0, "codex/native-startup-checkout\n", ""
+                )
+            raise AssertionError(f"unexpected command: {args}")
+
+        codex_context_bootstrap.forge.run_cmd = fake_run_cmd
+        codex_context_bootstrap.shutil.which = lambda _command: "/usr/bin/gh"
+        codex_context_bootstrap.git_output = (
+            lambda _repo, args: "origin-sha"
+            if args[-1] == "origin/codex/native-startup-checkout"
+            else "upstream-sha"
+            if args[-1] == "upstream/codex/native-startup-checkout"
+            else "main-sha"
+            if args[-1] == "origin/main"
+            else ""
+        )
+        try:
+            base = codex_context_bootstrap.first_existing_base(Path("/repo"), None)
+        finally:
+            codex_context_bootstrap.forge.run_cmd = original_run_cmd
+            codex_context_bootstrap.git_output = original_git_output
+            codex_context_bootstrap.shutil.which = original_which
+            if original_base is not None:
+                os.environ["GITHUB_BASE_REF"] = original_base
+
+        self.assertEqual(base, "origin/codex/native-startup-checkout")
+
+    def test_bootstrap_falls_back_to_main_without_github_cli(self) -> None:
+        original_git_output = codex_context_bootstrap.git_output
+        original_which = codex_context_bootstrap.shutil.which
+        original_base = os.environ.pop("GITHUB_BASE_REF", None)
+        codex_context_bootstrap.shutil.which = lambda _command: None
+        codex_context_bootstrap.git_output = (
+            lambda _repo, args: "sha" if args[-1] == "origin/main" else ""
+        )
+        try:
+            base = codex_context_bootstrap.first_existing_base(Path("/repo"), None)
+        finally:
+            codex_context_bootstrap.git_output = original_git_output
+            codex_context_bootstrap.shutil.which = original_which
+            if original_base is not None:
+                os.environ["GITHUB_BASE_REF"] = original_base
+
+        self.assertEqual(base, "origin/main")
 
     def test_bootstrap_blocks_detached_pr_checkout_before_mapping(self) -> None:
         original_current_branch = codex_context_bootstrap.current_branch

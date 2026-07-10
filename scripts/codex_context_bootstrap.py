@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -24,6 +26,18 @@ def git_output(repo: Path, args: list[str]) -> str:
 
 def first_existing_base(repo: Path, requested: str | None) -> str | None:
     candidates = [requested] if requested else []
+    if not requested:
+        pr_base = os.environ.get("GITHUB_BASE_REF", "").strip()
+        if not pr_base and shutil.which("gh"):
+            proc = forge.run_cmd(
+                ["gh", "pr", "view", "--json", "baseRefName", "--jq", ".baseRefName"],
+                cwd=repo,
+                allow_fail=True,
+            )
+            if proc.returncode == 0:
+                pr_base = proc.stdout.strip()
+        if pr_base:
+            candidates.extend((f"origin/{pr_base}", f"upstream/{pr_base}", pr_base))
     candidates.extend(BASE_CANDIDATES)
     seen: set[str] = set()
     for candidate in candidates:

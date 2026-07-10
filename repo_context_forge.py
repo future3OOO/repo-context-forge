@@ -660,7 +660,7 @@ def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cac
             ["git", "clone", "--no-checkout", "--shared", str(source_repo), str(checkout)]
         )
 
-    run_git(checkout, ["reset", "--hard", "HEAD"], allow_fail=True)
+    reset_cached_worktree(checkout, cache_dir)
     run_git(checkout, ["checkout", "-B", "repo-context-forge-target", head_sha])
 
 
@@ -722,7 +722,6 @@ def ensure_local_analysis_worktree(source_repo: Path, head_ref: str, cache_dir: 
     ).resolve()
 
     ensure_cached_checkout(source_repo, head_sha, worktree, cache_dir)
-    reset_cached_worktree(worktree, cache_dir)
     overlay_source_worktree(source_repo, worktree)
     cleanup_soulforge_gitignore_change(worktree)
 
@@ -874,7 +873,7 @@ class SoulForgeMap:
 
     def top_files(self, limit: int) -> list[MapFile]:
         if self.native_index.is_available:
-            return [MapFile(**entry.__dict__) for entry in self.native_index.ranked_files(limit)]
+            return [MapFile(entry.path, entry.pagerank, entry.symbol_count, entry.line_count, entry.rank) for entry in self.native_index.ranked_files(limit)]
         if not self.available:
             return []
         with self._connect() as conn:
@@ -904,7 +903,7 @@ class SoulForgeMap:
             return {}
         if self.native_index.is_available:
             return {
-                path: MapFile(**entry.__dict__)
+                path: MapFile(entry.path, entry.pagerank, entry.symbol_count, entry.line_count, entry.rank)
                 for path, entry in self.native_index.lookup_files(wanted).items()
             }
         if not self.available:
@@ -938,7 +937,7 @@ class SoulForgeMap:
     def symbols_for_file(self, path: str, limit: int = 12) -> list[Symbol]:
         if self.native_index.is_available:
             return [
-                Symbol(**entry.__dict__)
+                Symbol(entry.name, entry.kind, entry.line, entry.end_line, entry.signature, entry.is_exported, entry.summary, entry.summary_source)
                 for entry in self.native_index.file_symbols(path, limit)
             ]
         if not self.available:

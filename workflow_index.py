@@ -129,18 +129,34 @@ class WorkflowIndex:
     def status(self) -> dict[str, object]:
         if not self.is_available:
             return {"available": False, "db_path": str(self.db_path)}
-        with self._open() as conn:
-            files = int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
-            symbols = int(conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0])
-            metadata = dict(conn.execute("SELECT key, value FROM metadata").fetchall())
+        try:
+            with self._open() as conn:
+                files = int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+                symbols = int(conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0])
+                metadata = dict(conn.execute("SELECT key, value FROM metadata").fetchall())
+            schema_version = int(metadata["schema_version"])
+            head_sha = metadata["head_sha"]
+            dirty_overlay = metadata["dirty_overlay"]
+            if schema_version != SCHEMA_VERSION:
+                raise ValueError(f"unsupported schema_version {schema_version}")
+            if not head_sha:
+                raise ValueError("head_sha is empty")
+            if dirty_overlay not in {"true", "false"}:
+                raise ValueError(f"invalid dirty_overlay {dirty_overlay!r}")
+        except (KeyError, ValueError, sqlite3.Error) as exc:
+            return {
+                "available": False,
+                "db_path": str(self.db_path),
+                "warning": f"invalid workflow index: {exc}",
+            }
         return {
             "available": True,
             "db_path": str(self.db_path),
             "files": files,
             "symbols": symbols,
-            "head_sha": metadata["head_sha"],
-            "dirty_overlay": metadata["dirty_overlay"] == "true",
-            "schema_version": int(metadata["schema_version"]),
+            "head_sha": head_sha,
+            "dirty_overlay": dirty_overlay == "true",
+            "schema_version": schema_version,
         }
 
     def ranked_files(self, limit: int) -> list[IndexedFile]:
@@ -174,7 +190,7 @@ class WorkflowIndex:
         return {str(row[0]): self._indexed_file(row) for row in rows}
 
     def file_symbols(self, path: str, limit: int) -> list[IndexedSymbol]:
-        if not self.is_available:
+        if limit < 1 or not self.is_available:
             return []
         with self._open() as conn:
             rows = conn.execute(
@@ -269,7 +285,7 @@ class WorkflowIndex:
         ]
 
     def _open(self) -> sqlite3.Connection:
-        return sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        return sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
 
     @staticmethod
     def _create_schema(conn: sqlite3.Connection) -> None:
@@ -374,7 +390,11 @@ class WorkflowIndex:
                         line=line_number,
                         end_line=line_number,
                         signature=line.strip(),
-                        is_exported=line.lstrip().startswith("export ") or not name.startswith("_"),
+                        is_exported=(
+                            line == line.lstrip() and not name.startswith("_")
+                            if extension == ".py"
+                            else line.lstrip().startswith("export ") or not name.startswith("_")
+                        ),
                         summary=summary_for_symbol(path, name, kind),
                     )
                 )
@@ -518,16 +538,24 @@ def architecture_lines(summary: object) -> list[str]:
 def context_digest_lines(
     packet: dict[str, object], indent: str, default_token_budget: int
 ) -> list[str]:
-    target_state = packet["target_state"]
-    gitnexus = packet["gitnexus"]
-    workflow = packet.get("workflow_index") or {}
-    semantic = packet.get("semantic_summaries") or {}
-    targets = packet["targets"]
-    assert isinstance(target_state, dict)
-    assert isinstance(gitnexus, dict)
-    assert isinstance(workflow, dict)
-    assert isinstance(semantic, dict)
-    assert isinstance(targets, list)
+    mode = packet.get("mode")
+    target_state = packet.get("target_state")
+    gitnexus = packet.get("gitnexus")
+    workflow = packet.get("workflow_index", {})
+    semantic = packet.get("semantic_summaries", {})
+    targets = packet.get("targets")
+    if not isinstance(mode, str):
+        raise ValueError("packet mode must be a string")
+    if not isinstance(target_state, dict):
+        raise ValueError("packet target_state must be an object")
+    if not isinstance(gitnexus, dict):
+        raise ValueError("packet gitnexus must be an object")
+    if not isinstance(workflow, dict):
+        raise ValueError("packet workflow_index must be an object")
+    if not isinstance(semantic, dict):
+        raise ValueError("packet semantic_summaries must be an object")
+    if not isinstance(targets, list):
+        raise ValueError("packet targets must be a list")
     architecture = packet.get("architecture_summary") or summarize_architecture(
         [target for target in targets if isinstance(target, dict)]
     )
@@ -539,7 +567,7 @@ def context_digest_lines(
             "GitNexus authority repo/status, and coverage_plan before code reasoning."
             "</required_agent_intake>"
         ),
-        f"{indent}  <mode>{html.escape(str(packet['mode']))}</mode>",
+        f"{indent}  <mode>{html.escape(mode)}</mode>",
         f"{indent}  <head_sha>{html.escape(str(target_state.get('head_sha') or ''))}</head_sha>",
         (
             f"{indent}  <token_budget>"

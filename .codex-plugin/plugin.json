@@ -1,6 +1,6 @@
 {
   "name": "repo-context-forge",
-  "version": "0.2.0+codex.20260709224426",
+  "version": "0.2.0+codex.20260710002219",
   "description": "Inject targeted repository context before Codex edits, reviews, or runs GitNexus.",
   "author": {
     "name": "Repo Context Forge"
