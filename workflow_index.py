@@ -160,6 +160,32 @@ class WorkflowIndex:
             "schema_version": schema_version,
         }
 
+    def is_reusable(self, head_sha: str) -> bool:
+        status = self.status()
+        return (
+            status.get("available") is True
+            and status.get("head_sha") == head_sha
+            and status.get("dirty_overlay") is False
+        )
+
+    def ensure_current(
+        self,
+        paths: Iterable[str],
+        *,
+        head_sha: str,
+        dirty_overlay: bool,
+        summary_for_symbol: SummaryForSymbol,
+        reuse: bool,
+    ) -> None:
+        if reuse and self.is_reusable(head_sha):
+            return
+        self.build(
+            paths,
+            head_sha=head_sha,
+            dirty_overlay=dirty_overlay,
+            summary_for_symbol=summary_for_symbol,
+        )
+
     def ranked_files(self, limit: int) -> list[IndexedFile]:
         if not self.is_available or limit <= 0:
             return []
@@ -222,25 +248,27 @@ class WorkflowIndex:
     def rank_intent(self, tokens: list[str], limit: int) -> list[str]:
         if not self.is_available or not tokens or limit <= 0:
             return []
+        forms = self._intent_forms(tokens)
+        candidates: list[str] = []
+        for token, singular in forms:
+            candidates.extend((token, singular) if singular else (token,))
+        candidates = list(dict.fromkeys(candidates))
+        predicates = " OR ".join("instr(search_terms, ?) > 0" for _ in candidates)
         with self._open() as conn:
             rows = conn.execute(
-                "SELECT path, role, base_score, search_terms FROM files"
+                f"""
+                SELECT path, role, base_score, search_terms
+                FROM files
+                WHERE {predicates}
+                """,
+                candidates,
             ).fetchall()
         scored: list[tuple[float, str, str]] = []
         for path, role, base_score, search_terms in rows:
             score = float(base_score)
             matched = False
             haystack = str(search_terms)
-            for token in tokens:
-                singular = None
-                if len(token) > 4 and token.endswith("ies"):
-                    singular = token[:-3] + "y"
-                elif (
-                    len(token) > 3
-                    and token.endswith("s")
-                    and not token.endswith(("ss", "us", "is"))
-                ):
-                    singular = token[:-1]
+            for token, singular in forms:
                 if re.search(rf"\b{re.escape(token)}\b", haystack):
                     score += 45
                     matched = True
@@ -398,7 +426,7 @@ class WorkflowIndex:
                         is_exported=(
                             line == line.lstrip() and not name.startswith("_")
                             if extension == ".py"
-                            else line.lstrip().startswith("export ") or not name.startswith("_")
+                            else line.lstrip().startswith("export ")
                         ),
                         summary=summary_for_symbol(path, name, kind),
                     )
@@ -426,6 +454,18 @@ class WorkflowIndex:
         spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", " ".join(values))
         separators = re.sub(r"[^A-Za-z0-9]+", " ", spaced)
         return f"{' '.join(values)} {separators}".lower()
+
+    @staticmethod
+    def _intent_forms(tokens: list[str]) -> list[tuple[str, str | None]]:
+        return [(token, WorkflowIndex._singular_intent_token(token)) for token in tokens]
+
+    @staticmethod
+    def _singular_intent_token(token: str) -> str | None:
+        if len(token) > 4 and token.endswith("ies"):
+            return token[:-3] + "y"
+        if len(token) > 3 and token.endswith("s") and not token.endswith(("ss", "us", "is")):
+            return token[:-1]
+        return None
 
     @staticmethod
     def _logical_stem(path: str) -> str:

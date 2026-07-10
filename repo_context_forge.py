@@ -68,13 +68,7 @@ class TargetState:
     cache_key: str | None
 
 
-@dataclass(frozen=True)
-class MapFile:
-    path: str
-    pagerank: float
-    symbol_count: int
-    line_count: int
-    rank: int
+MapFile = workflow_index.IndexedFile
 
 
 @dataclass(frozen=True)
@@ -606,7 +600,7 @@ def remove_path(path: Path) -> None:
 def reset_cached_worktree(worktree: Path, cache_dir: Path) -> None:
     require_cache_path(worktree, cache_dir)
     run_git(worktree, ["reset", "--hard", "HEAD"])
-    run_git(worktree, ["clean", "-fd"])
+    run_git(worktree, ["clean", "-fd", "-e", f"{workflow_index.INDEX_DIR}/"])
     soulforge_cache = worktree / ".soulforge"
     if os.path.lexists(soulforge_cache):
         require_cache_path(soulforge_cache, cache_dir)
@@ -873,7 +867,7 @@ class SoulForgeMap:
 
     def top_files(self, limit: int) -> list[MapFile]:
         if self.native_index.is_available:
-            return [MapFile(entry.path, entry.pagerank, entry.symbol_count, entry.line_count, entry.rank) for entry in self.native_index.ranked_files(limit)]
+            return self.native_index.ranked_files(limit)
         if not self.available:
             return []
         with self._connect() as conn:
@@ -902,10 +896,7 @@ class SoulForgeMap:
         if not wanted:
             return {}
         if self.native_index.is_available:
-            return {
-                path: MapFile(entry.path, entry.pagerank, entry.symbol_count, entry.line_count, entry.rank)
-                for path, entry in self.native_index.lookup_files(wanted).items()
-            }
+            return self.native_index.lookup_files(wanted)
         if not self.available:
             return {}
         sql_marks = ",".join("?" for _ in wanted)
@@ -936,10 +927,7 @@ class SoulForgeMap:
 
     def symbols_for_file(self, path: str, limit: int = 12) -> list[Symbol]:
         if self.native_index.is_available:
-            return [
-                Symbol(entry.name, entry.kind, entry.line, entry.end_line, entry.signature, entry.is_exported, entry.summary, entry.summary_source)
-                for entry in self.native_index.file_symbols(path, limit)
-            ]
+            return [self._native_symbol(entry) for entry in self.native_index.file_symbols(path, limit)]
         if not self.available:
             return []
         with self._connect() as conn:
@@ -1250,6 +1238,7 @@ class SoulForgeMap:
     def related_files_for_paths(self, paths: Iterable[str], limit: int) -> list[str]:
         if limit <= 0:
             return []
+        # SoulForge owns real graph data; workflow-index relationships are heuristic fallback.
         if not self.available:
             return self.native_index.related_paths(paths, limit)
         base_paths = set(paths)
@@ -1327,6 +1316,13 @@ class SoulForgeMap:
                 (path, limit),
             ).fetchall()
         return [{"path": str(row["path"]), "count": int(row["count"])} for row in rows]
+
+    @staticmethod
+    def _native_symbol(entry: workflow_index.IndexedSymbol) -> Symbol:
+        return Symbol(
+            name=entry.name, kind=entry.kind, line=entry.line, end_line=entry.end_line, signature=entry.signature, is_exported=entry.is_exported,
+            summary=entry.summary, summary_source=entry.summary_source,
+        )
 
     @staticmethod
     def _has_table(conn: sqlite3.Connection, table: str) -> bool:
@@ -2146,13 +2142,18 @@ def make_packet(
     if can_cleanup_analysis and (mode == "pr" or not gitignore_dirty_before_build):
         cleanup_soulforge_gitignore_change(target_state.analysis_repo)
     native_index = workflow_index.WorkflowIndex(target_state.analysis_repo, file_role)
-    native_index.build(
+    cache_owned = target_state.cache_key is not None
+    if cache_owned:
+        require_cache_path(target_state.analysis_repo, cache_dir)
+    native_index.ensure_current(
         source_worktree_files(target_state.analysis_repo),
         head_sha=target_state.head_sha,
         dirty_overlay=target_state.target_dirty,
         summary_for_symbol=synthetic_symbol_summary,
+        reuse=cache_owned and not target_state.source_dirty and not target_state.target_dirty,
     )
     soul_map = SoulForgeMap(target_state.analysis_repo, native_index)
+    # Standalone analyze stays SoulForge-strict; Codex bootstrap explicitly opts into native fallback.
     if not soul_map.available and not allow_missing_map:
         raise RuntimeError(
             "SoulForge map is required but unavailable for "

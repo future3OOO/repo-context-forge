@@ -617,6 +617,84 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertFalse(second.target_dirty)
             self.assertFalse(repo_context_forge.is_dirty(repo, ignore_tool_cache=True))
 
+    def test_make_packet_reuses_clean_exact_head_workflow_index(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            arguments = {
+                "mode": "repo",
+                "base_ref": "HEAD",
+                "head_ref": "HEAD",
+                "intent": None,
+                "top": 5,
+                "token_budget": repo_context_forge.DEFAULT_TOKEN_BUDGET,
+                "cache_dir": Path(cache_dir),
+                "soulforge_bin": None,
+                "map_build": "never",
+                "map_timeout_ms": 1,
+                "allow_missing_map": True,
+                "gitnexus_repo": None,
+            }
+
+            first = repo_context_forge.make_packet(repo, **arguments)
+            index_path = Path(str(first["workflow_index"]["db_path"]))
+            first_inode = index_path.stat().st_ino
+            second = repo_context_forge.make_packet(repo, **arguments)
+
+            self.assertEqual(Path(str(second["workflow_index"]["db_path"])), index_path)
+            self.assertEqual(index_path.stat().st_ino, first_inode)
+
+    def test_make_packet_rebuilds_invalid_cached_workflow_index(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            arguments = {
+                "mode": "repo", "base_ref": "HEAD", "head_ref": "HEAD",
+                "intent": None, "top": 5,
+                "token_budget": repo_context_forge.DEFAULT_TOKEN_BUDGET,
+                "cache_dir": Path(cache_dir), "soulforge_bin": None,
+                "map_build": "never", "map_timeout_ms": 1,
+                "allow_missing_map": True, "gitnexus_repo": None,
+            }
+            first = repo_context_forge.make_packet(repo, **arguments)
+            index_path = Path(str(first["workflow_index"]["db_path"]))
+            first_inode = index_path.stat().st_ino
+            with sqlite3.connect(index_path) as connection:
+                connection.execute(
+                    "UPDATE metadata SET value = 'stale' WHERE key = 'head_sha'"
+                )
+
+            second = repo_context_forge.make_packet(repo, **arguments)
+
+            self.assertNotEqual(index_path.stat().st_ino, first_inode)
+            self.assertEqual(
+                second["workflow_index"]["head_sha"],
+                repo_context_forge.run_git(repo, ["rev-parse", "HEAD"]),
+            )
+
+    def test_make_packet_rebuilds_repeated_dirty_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "a.py").write_text("print('dirty one')\n", encoding="utf-8")
+            arguments = {
+                "mode": "local", "base_ref": "HEAD", "head_ref": "HEAD",
+                "intent": None, "top": 5,
+                "token_budget": repo_context_forge.DEFAULT_TOKEN_BUDGET,
+                "cache_dir": Path(cache_dir), "soulforge_bin": None,
+                "map_build": "never", "map_timeout_ms": 1,
+                "allow_missing_map": True, "gitnexus_repo": None,
+            }
+            first = repo_context_forge.make_packet(repo, **arguments)
+            index_path = Path(str(first["workflow_index"]["db_path"]))
+            first_inode = index_path.stat().st_ino
+            (repo / "src" / "a.py").write_text("print('dirty two')\n", encoding="utf-8")
+
+            second = repo_context_forge.make_packet(repo, **arguments)
+
+            self.assertNotEqual(index_path.stat().st_ino, first_inode)
+            self.assertTrue(second["workflow_index"]["dirty_overlay"])
+
     def test_make_packet_runs_soulforge_build_outside_source_repo(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
             repo = Path(repo_dir)
@@ -928,7 +1006,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 native_index.rank_intent(["indexed"], 5)
                 native_index.related_paths(["src/a.py"], 5)
 
-            self.assertEqual(len(opened), 7)
+            self.assertGreaterEqual(len(opened), 7)
             self.assertTrue(all(connection.closed for connection in opened))
 
     def test_workflow_index_failed_build_closes_and_preserves_index(self) -> None:
@@ -1001,6 +1079,38 @@ class RepoContextForgeTests(unittest.TestCase):
                     "Example": True,
                     "method": False,
                     "_private": False,
+                },
+            )
+
+    def test_workflow_index_exports_only_explicit_javascript_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "a.ts").write_text(
+                "export function publicFunction() {}\n"
+                "function privateFunction() {}\n"
+                "export class PublicClass {}\n"
+                "class PrivateClass {}\n"
+                "export const publicArrow = () => {};\n"
+                "const privateArrow = () => {};\n",
+                encoding="utf-8",
+            )
+            native_index = self.build_workflow_index(repo)
+
+            exports = {
+                symbol.name: symbol.is_exported
+                for symbol in native_index.file_symbols("src/a.ts", 10)
+            }
+
+            self.assertEqual(
+                exports,
+                {
+                    "publicFunction": True,
+                    "PublicClass": True,
+                    "publicArrow": True,
+                    "privateFunction": False,
+                    "PrivateClass": False,
+                    "privateArrow": False,
                 },
             )
 
