@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import html
 import json
@@ -99,9 +100,19 @@ def run_cmd(
     cwd: Path | None = None,
     allow_fail: bool = False,
     env: dict[str, str] | None = None,
+    suppress_core_dump: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    command = args
+    if suppress_core_dump:
+        command = [
+            "/bin/sh",
+            "-c",
+            'printf 0 > /proc/self/coredump_filter && exec "$@"',
+            "sh",
+            *args,
+        ]
     proc = subprocess.run(
-        args,
+        command,
         cwd=cwd,
         env=env,
         text=True,
@@ -1917,29 +1928,59 @@ def ensure_gitnexus_index(
             status["warning"] = "GitNexus index storage is missing; blast-radius claims are blocked"
         return status
 
-    proc = run_cmd(
-        [binary, "analyze", "--force", "--skip-agents-md", str(target_state.analysis_repo)],
-        allow_fail=True,
-    )
-    entry = find_gitnexus_entry(target_state.analysis_repo, chosen_repo_name, registry_path=registry_path)
-    status = gitnexus_status_from_entry(entry, target_state, chosen_repo_name)
-    status["reindex_attempted"] = True
-    status["reindex_returncode"] = proc.returncode
-    if proc.returncode != 0:
+    lock_path = target_state.analysis_repo.parent / f".{target_state.analysis_repo.name}.gitnexus.lock"
+    try:
+        lock_file = lock_path.open("a")
+    except OSError as exc:
+        status.update(
+            status="blocked",
+            reindex_attempted=False,
+            warning=f"GitNexus reindex lock failed; blast-radius claims are blocked ({exc})",
+        )
+        return status
+
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        status.update(
+            status="blocked",
+            reindex_attempted=False,
+            warning="GitNexus reindex is already running for this analysis checkout",
+        )
+        lock_file.close()
+        return status
+
+    with lock_file:
+        entry = find_gitnexus_entry(target_state.analysis_repo, chosen_repo_name, registry_path=registry_path)
+        status = gitnexus_status_from_entry(entry, target_state, chosen_repo_name)
+        if status["index_fresh"]:
+            status.update({"status": "fresh", "reindex_attempted": False})
+            return status
+
+        proc = run_cmd(
+            [binary, "analyze", "--force", "--skip-agents-md", str(target_state.analysis_repo)],
+            allow_fail=True,
+            suppress_core_dump=True,
+        )
+        entry = find_gitnexus_entry(target_state.analysis_repo, chosen_repo_name, registry_path=registry_path)
+        status = gitnexus_status_from_entry(entry, target_state, chosen_repo_name)
+        status["reindex_attempted"] = True
+        status["reindex_returncode"] = proc.returncode
+        if proc.returncode != 0:
+            status["status"] = "blocked"
+            status["warning"] = "GitNexus reindex failed; blast-radius claims are blocked"
+            status["stderr"] = proc.stderr[-2000:]
+            return status
+        if status["index_fresh"]:
+            status["status"] = "reindexed"
+            return status
         status["status"] = "blocked"
-        status["warning"] = "GitNexus reindex failed; blast-radius claims are blocked"
-        status["stderr"] = proc.stderr[-2000:]
+        status["warning"] = (
+            "GitNexus reindex did not create registered index storage; blast-radius claims are blocked"
+            if not status.get("index_present")
+            else "GitNexus index is still stale after reindex; blast-radius claims are blocked"
+        )
         return status
-    if status["index_fresh"]:
-        status["status"] = "reindexed"
-        return status
-    status["status"] = "blocked"
-    status["warning"] = (
-        "GitNexus reindex did not create registered index storage; blast-radius claims are blocked"
-        if not status.get("index_present")
-        else "GitNexus index is still stale after reindex; blast-radius claims are blocked"
-    )
-    return status
 
 
 def verify_gitnexus_required_checks(
