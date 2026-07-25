@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import sqlite3
 import sys
@@ -43,6 +44,14 @@ class RepoContextForgeTests(unittest.TestCase):
         (root / "src" / "a.py").write_text("print('clean')\n", encoding="utf-8")
         repo_context_forge.run_cmd(["git", "add", ".gitignore", "src/a.py"], cwd=root)
         repo_context_forge.run_cmd(["git", "commit", "-m", "initial"], cwd=root)
+
+    def test_run_cmd_can_suppress_core_dump_payloads(self) -> None:
+        result = repo_context_forge.run_cmd(
+            ["cat", "/proc/self/coredump_filter"],
+            suppress_core_dump=True,
+        )
+
+        self.assertEqual(result.stdout.strip(), "00000000")
 
     def test_unique_sorted_deduplicates_and_sorts(self) -> None:
         self.assertEqual(
@@ -827,7 +836,8 @@ class RepoContextForgeTests(unittest.TestCase):
 
     def test_gitnexus_auto_reindexes_stale_analysis_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:
-            analysis_repo = Path(repo_dir)
+            analysis_repo = Path(repo_dir) / "analysis"
+            analysis_repo.mkdir()
             registry_path = Path(registry_dir) / "registry.json"
             state = repo_context_forge.TargetState(
                 mode="pr",
@@ -889,6 +899,39 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertTrue(status["index_present"])
             self.assertTrue(status["reindex_attempted"])
 
+    def test_gitnexus_auto_blocks_when_analysis_checkout_is_locked(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:
+            analysis_repo = Path(repo_dir) / "analysis"
+            analysis_repo.mkdir()
+            registry_path = Path(registry_dir) / "registry.json"
+            registry_path.write_text("[]", encoding="utf-8")
+            state = repo_context_forge.TargetState(
+                mode="pr",
+                source_repo=analysis_repo,
+                analysis_repo=analysis_repo,
+                base_ref="main",
+                head_ref="HEAD",
+                head_sha="new-head",
+                source_dirty=False,
+                target_dirty=False,
+                cache_key="key",
+            )
+            lock_path = analysis_repo.parent / f".{analysis_repo.name}.gitnexus.lock"
+
+            with lock_path.open("a") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                status = repo_context_forge.ensure_gitnexus_index(
+                    state,
+                    "analysis",
+                    "auto",
+                    registry_path=registry_path,
+                    gitnexus_bin="/bin/true",
+                )
+
+            self.assertEqual(status["status"], "blocked")
+            self.assertFalse(status["reindex_attempted"])
+            self.assertIn("already running", status["warning"])
+
     def test_gitnexus_blocks_when_registered_index_storage_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:
             analysis_repo = Path(repo_dir)
@@ -934,7 +977,8 @@ class RepoContextForgeTests(unittest.TestCase):
 
     def test_gitnexus_blocks_when_reindex_does_not_register_storage(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:
-            analysis_repo = Path(repo_dir)
+            analysis_repo = Path(repo_dir) / "analysis"
+            analysis_repo.mkdir()
             registry_path = Path(registry_dir) / "registry.json"
             state = repo_context_forge.TargetState(
                 mode="pr",
