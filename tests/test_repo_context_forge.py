@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import fcntl
 import importlib.util
+import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -644,6 +646,82 @@ class RepoContextForgeTests(unittest.TestCase):
             )
             self.assertFalse(packet["target_state"]["source_dirty"])
             self.assertTrue(packet["target_state"]["source_status_unchanged"])
+
+    def test_make_packet_prunes_cache_checkouts_past_retention(self) -> None:
+        """Cache checkouts accumulated forever: 966 of them, 92GB, oldest three
+        months old. Each packet must retire checkouts past the retention age
+        while leaving the one it just produced alone."""
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            cache = Path(cache_dir)
+            self.make_git_repo(repo)
+
+            # First packet generates a checkout through production code.
+            stale = self.packet_checkout(repo, cache)
+            self.assertTrue(stale.exists())
+            self.advance_head(repo, "c.py")
+
+            # Age the first checkout past the retention window.
+            aged = time.time() - (repo_context_forge.CACHE_KEEP_DAYS + 1) * 86400
+            os.utime(stale, (aged, aged))
+
+            current = self.packet_checkout(repo, cache)
+
+            self.assertNotEqual(current, stale)
+            self.assertFalse(stale.exists(), "checkout past retention age was not pruned")
+            self.assertTrue(current.exists(), "the packet's own checkout must survive")
+
+    def test_make_packet_caps_total_cache_checkouts(self) -> None:
+        """Age alone does not bound the cache — 31GB survived a 14-day sweep — so
+        the count cap is the real bound. The packet's own checkout counts toward
+        it, otherwise a cap of N silently keeps N+1."""
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            cache = Path(cache_dir)
+            self.make_git_repo(repo)
+            original_max = repo_context_forge.CACHE_KEEP_MAX
+            repo_context_forge.CACHE_KEEP_MAX = 1
+            try:
+                first = self.packet_checkout(repo, cache)
+                self.advance_head(repo, "c.py")
+                second = self.packet_checkout(repo, cache)
+            finally:
+                repo_context_forge.CACHE_KEEP_MAX = original_max
+
+            self.assertNotEqual(first, second)
+            live = sorted(
+                path.name
+                for name in repo_context_forge.CACHE_DIRS
+                if (cache / name).is_dir()
+                for path in (cache / name).iterdir()
+            )
+            self.assertEqual(live, [second.name], "a cap of 1 must keep exactly one checkout")
+
+    def packet_checkout(self, repo: Path, cache: Path) -> Path:
+        packet = repo_context_forge.make_packet(
+            repo,
+            mode="repo",
+            base_ref="HEAD",
+            head_ref="HEAD",
+            intent=None,
+            top=5,
+            token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET,
+            cache_dir=cache,
+            soulforge_bin=None,
+            map_build="never",
+            map_timeout_ms=1,
+            allow_missing_map=True,
+            gitnexus_repo=None,
+        )
+        return Path(str(packet["target_state"]["analysis_repo"]))
+
+    def advance_head(self, repo: Path, filename: str) -> None:
+        """Move HEAD so the next packet keys a different cache checkout."""
+        (repo / "src" / filename).write_text("print('next')\n", encoding="utf-8")
+        repo_context_forge.run_git(repo, ["add", "-A"])
+        repo_context_forge.run_git(
+            repo, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "next"]
+        )
 
     def test_soulforge_impact_summary_uses_native_map_tables(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:

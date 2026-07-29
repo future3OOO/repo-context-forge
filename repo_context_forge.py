@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Literal
@@ -557,6 +558,32 @@ def safe_rmtree(path: Path, cache_root: Path) -> None:
     if root not in resolved.parents and resolved != root:
         raise RuntimeError(f"refusing to remove path outside cache root: {resolved}")
     shutil.rmtree(resolved)
+
+
+CACHE_DIRS = ("worktrees", "analysis-worktrees", "analysis-checkouts")
+CACHE_KEEP_DAYS = int(os.environ.get("REPO_CONTEXT_FORGE_CACHE_KEEP_DAYS", "14"))
+CACHE_KEEP_MAX = int(os.environ.get("REPO_CONTEXT_FORGE_CACHE_KEEP_MAX", "60"))
+
+
+def prune_cache_checkouts(cache_dir: Path, protect: Path | None = None) -> None:
+    """Retire cache checkouts past the retention age, then past the count cap.
+    Nothing ever removed these, so they reached 966 checkouts / 92GB; age alone
+    does not bound size (31GB survived a 14-day sweep), so the cap is the bound."""
+    keep = protect.resolve() if protect else None
+    entries = sorted(
+        (p.stat().st_mtime, p)
+        for name in CACHE_DIRS
+        if (cache_dir / name).is_dir()
+        for p in (cache_dir / name).iterdir()
+        if p.is_dir() and not p.is_symlink() and p.resolve() != keep
+    )
+    cutoff = time.time() - CACHE_KEEP_DAYS * 86400
+    # The protected checkout occupies one slot, or a cap of N would keep N + 1.
+    allowed = CACHE_KEEP_MAX - (1 if keep else 0)
+    doomed = {p for mtime, p in entries if mtime < cutoff}
+    doomed.update(p for _, p in entries[: max(0, len(entries) - allowed)])
+    for path in doomed:
+        safe_rmtree(path, cache_dir)
 
 
 def require_cache_path(path: Path, cache_root: Path) -> Path:
@@ -2174,6 +2201,7 @@ def make_packet(
     source_repo = repo_root(repo)
     source_status_before = porcelain_status(source_repo)
     target_state = resolve_target_state(repo, mode, base_ref, head_ref, cache_dir)
+    prune_cache_checkouts(cache_dir, protect=target_state.analysis_repo)
     gitignore_dirty_before_build = ".gitignore" in dirty_paths(target_state.analysis_repo)
     build_result = build_soulforge_map(
         target_state.analysis_repo,

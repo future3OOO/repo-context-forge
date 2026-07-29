@@ -147,6 +147,20 @@ python3 repo_context_forge.py wrap \
 By default, `analyze` requires a SoulForge map. Use `--allow-missing-map` only
 when testing failure paths or no-map baselines.
 
+### Cache retention
+
+Every packet retires cache checkouts under `--cache-dir`, because nothing used
+to and they reached 966 checkouts / 92GB. The checkout the current packet is
+using is never a candidate.
+
+```bash
+REPO_CONTEXT_FORGE_CACHE_KEEP_DAYS=14   # retire checkouts older than this
+REPO_CONTEXT_FORGE_CACHE_KEEP_MAX=60    # hard cap on total checkouts kept
+```
+
+Age alone does not bound size — 31GB survived a 14-day sweep — so the count cap
+is the real bound. Both are read at start-up.
+
 ## Production Contract
 
 For PR review, use `mode=pr`. It builds/reads the map from a clean cached target
