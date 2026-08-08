@@ -124,11 +124,11 @@ When Codex materially changes context during a longer task, record it before
 refreshing the packet. Start a task context with an explicit task id:
 
 ```bash
-python3 ../../repo_context_forge.py context-start --repo "$PWD" --task-id <id>
-python3 ../../repo_context_forge.py context-record-read --repo "$PWD" --task-id <id> <path>
-python3 ../../repo_context_forge.py context-record-search --repo "$PWD" --task-id <id> <path>
-python3 ../../repo_context_forge.py context-record-edit --repo "$PWD" --task-id <id> <path>
-python3 ../../repo_context_forge.py context-refresh --repo "$PWD" --task-id <id>
+python3 "$SKILL_DIR/../../repo_context_forge.py" context-start --repo "$PWD" --task-id <id>
+python3 "$SKILL_DIR/../../repo_context_forge.py" context-record-read --repo "$PWD" --task-id <id> <path>
+python3 "$SKILL_DIR/../../repo_context_forge.py" context-record-search --repo "$PWD" --task-id <id> <path>
+python3 "$SKILL_DIR/../../repo_context_forge.py" context-record-edit --repo "$PWD" --task-id <id> <path>
+python3 "$SKILL_DIR/../../repo_context_forge.py" context-refresh --repo "$PWD" --task-id <id>
 ```
 
 The refreshed packet boosts edited, read, searched, and mentioned files while

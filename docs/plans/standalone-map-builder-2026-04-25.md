@@ -31,7 +31,7 @@
 ## Affected Surface
 
 - changed boundary or behavior:
-  - map build path: `find_soulforge_binary()`, `build_soulforge_map()`, `MapBuildResult`, `make_context_packet()`
+  - map build path: `find_soulforge_binary()`, `build_soulforge_map()`, `MapBuildResult`, `make_packet()`
   - map read contract: `SoulForgeMap` SQLite schema expectations
   - plugin entrypoint: `scripts/codex_context_bootstrap.py`
   - CLI options and docs around `--map-build`, `--soulforge-bin`, and missing-map behavior
@@ -199,4 +199,3 @@
 ## Change Log
 
 - 2026-04-25: created standalone map-builder implementation plan.
-

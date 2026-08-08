@@ -337,8 +337,8 @@ Required behavior:
   - GitNexus finds impacted processes absent from the prompt packet
   - GitNexus index SHA does not match packet target SHA
   - GitNexus is unavailable
-- never block code reading because GitNexus is unavailable, but block
-  production blast-radius claims
+- block production workflow decisions while GitNexus is unavailable; diagnostic
+  code reading may continue only without blast-radius claims
 
 Commit structure:
 

@@ -372,6 +372,7 @@ def execute(
         if (
             not resolved_identity
             or resolved_file != expected_file
+            or (kind == "file_context" and resolved_identity != f"File:{target}")
             or (kind != "file_context" and resolved_name != target)
         ):
             entry["diagnostic"] = "GitNexus result identity does not match the planned check"
