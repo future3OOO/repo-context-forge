@@ -59,7 +59,7 @@
 - estimated net implementation: at or below 500 lines; stop and shrink before 1,000.
 - regroup rule: stop if the implementation creates a second owner or exceeds the split threshold.
 - deploy freeze: do not replace either live authority until the exact pushed head passes verification and reviewer audit; preserve each old location independently as a recoverable backup.
-- dependency gate: runtime activation requires GitNexus PR #3 commit `1841c6c` or a reviewed successor containing it; the released/installed 1.5.3 CLI lacks `impact --uid`. This task does not merge either PR and must not add a bare-name compatibility fallback.
+- dependency gate: runtime activation requires GitNexus PR #3 commit `255896f` or a reviewed successor containing it; the released/installed 1.5.3 CLI lacks `impact --uid`. This task does not merge either PR and must not add a bare-name compatibility fallback.
 
 ## PR Plan
 
@@ -83,7 +83,7 @@
 - [x] preserve PR #3 safety and produce duplicate-name RED
 - [x] implement producer result and atomic packet output
 - [x] run full verification, review, and Claude challenge
-- [x] publish GitNexus UID-impact dependency PR #3 at `1841c6cbd405e7059b68d456477982a79fbe101c`
+- [x] publish GitNexus UID-impact dependency PR #3 and its reviewer-fix head at `255896f08b645384551b3143917248c90b4e7f95`
 - [x] report exact omitted-check count non-blockingly through analysis, JSON, and prompt
 - [x] consume context-resolved UID through the dependency and make the real duplicate-name test pass
 - [x] record repeated PR #2-versus-PR #4 timing evidence in `docs/plans/issue-94-pr2-pr4-timing-evidence-2026-08-08.md`
@@ -99,4 +99,5 @@
 - 2026-08-08: current-head review fixes write machine JSON for early blockers, preserve context/impact pairs and the 20-check cap, align operator wording, and clarify the PR #3 authority/donor disposition. Replaced the two programmed-collaborator reindex tests with an explicit assertion on the real public reindex path. Full suite: 94 passed; producer-donor and review-fix quality gates: `ok: true`; Standards and producer-slice Spec reviews: zero findings.
 - 2026-08-08: OPS follow-up admitted two production occurrences: silent cap omission and duplicate-name impact refusal. Published the minimal GitNexus dependency as future3OOO/GitNexus#3; this plan now governs its Repo Context Forge consumer, truthful non-blocking omission reporting, and focused timing evidence.
 - 2026-08-08: follow-up RED/GREEN complete against exact GitNexus dependency `1841c6c`: 24 canonical checks report 20 selected and 4 omitted without blocking; duplicate-name context and impact resolve both file-scoped UIDs. Full suite: 95 passed. Follow-up and PR #2-base production gates pass; Standards and producer-slice Spec reviews have zero findings.
+- 2026-08-08: GitNexus reviewer follow-up `255896f` preserves JVM Class/Interface constructor and file traversal for UID impact and removes two fake-green CLI test exits. Repo Context Forge runtime activation now binds that reviewed successor; the original timing evidence remains attributed to the exact `1841c6c` build measured there.
 - 2026-08-08: precommit challenge confirmed the implementation but blocked live activation on dependency ordering: installed package version 1.5.3 is not the PR #3 build. Recorded the exact-commit gate and rejected a compatibility shim; no merge performed.
