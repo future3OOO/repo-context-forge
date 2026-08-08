@@ -164,7 +164,8 @@ def ensure_index(
 
     with lock_file:
         status = _current_status(*status_args)
-        if _accept_fresh(status):
+        fresh_after_lock = _accept_fresh(status)
+        if fresh_after_lock:
             return status
         proc = run_command(
             [binary, "analyze", "--force", "--skip-agents-md", str(analysis_repo)],
