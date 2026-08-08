@@ -55,7 +55,7 @@
 
 - plan type: cross-repository dependency plus single Repo Context Forge consolidation PR
 - PR count: 2 across repositories
-- stack depth: GitNexus PR #3 is a dependency of Repo Context Forge PR #4; Repo Context Forge PR #4 remains stacked on Repo Context Forge PR #2
+- stack depth: GitNexus PR #3 is a dependency of Repo Context Forge PR #4; Repo Context Forge PR #4 contains PR #2's ancestry and may be retargeted to the chosen production base without merging PR #2 first
 - estimated net implementation: at or below 500 lines; stop and shrink before 1,000.
 - regroup rule: stop if the implementation creates a second owner or exceeds the split threshold.
 - deploy freeze: do not replace either live authority until the exact pushed head passes verification and reviewer audit; preserve each old location independently as a recoverable backup.
@@ -66,7 +66,7 @@
 | PR | Branch | Base | Owner Slice | Commit Structure | Verification | Entry | Exit |
 |---|---|---|---|---|---|---|---|
 | GitNexus #3 | `codex/uid-impact-selector` | GitNexus `main` `cb772b9` | expose existing UID impact through current CLI/MCP Interface | one dependency commit | real duplicate-name DB test, CLI E2E, typecheck/build, reviewer gates | clean isolated clone | pushed clean dependency head; no merge |
-| A | `codex/issue-94-graph-analysis` | PR #2 `0cbbd10` | Repo Context Forge producer only | PR #3 safety; producer TDD/implementation; review fixes if needed | real-seam test, full suite, quality/GitNexus/advisor/reviewer gates | clean isolated clone | pushed clean head and matching clean install |
+| A | `codex/issue-94-graph-analysis` | PR #2 `0cbbd10` during construction; retarget to the chosen production base for final review | Repo Context Forge producer only | PR #3 safety; producer TDD/implementation; review fixes if needed | real-seam test, full suite, quality/GitNexus/advisor/reviewer gates | clean isolated clone | pushed clean head and matching clean install |
 
 ## Verification Plan
 
@@ -86,9 +86,13 @@
 - [x] publish GitNexus UID-impact dependency PR #3 and its reviewer-fix head at `255896f08b645384551b3143917248c90b4e7f95`
 - [x] report exact omitted-check count non-blockingly through analysis, JSON, and prompt
 - [x] consume context-resolved UID through the dependency and make the real duplicate-name test pass
-- [x] record repeated PR #2-versus-PR #4 timing evidence in `docs/plans/issue-94-pr2-pr4-timing-evidence-2026-08-08.md`
-- [ ] commit, push, open/update PR, and close current-head reviewer loop
-- [ ] back up and replace live install with the exact pushed commit
+- [x] reproduce the nested no-symbol `file_context` blocker against GitNexus `255896f`
+- [x] add a real public-bootstrap RED/GREEN test and resolve files through exact `File:<repository-path>` UID identity
+- [x] refresh repeated PR #2-versus-corrected-PR #4 timing evidence against GitNexus `255896f`
+- [x] rerun full verification and Standards/Spec code review on the correction
+- [x] complete the Claude precommit challenge on the live correction diff
+- [ ] commit, push, retarget PR #4 to the chosen production base, and close the resulting exact-head reviewer loop
+- [ ] replace both live Repo Context Forge checkouts only after the pushed head passes review
 - [ ] record exact donor/overlay dispositions and final identity proof
 
 ## Change Log
@@ -101,3 +105,5 @@
 - 2026-08-08: follow-up RED/GREEN complete against exact GitNexus dependency `1841c6c`: 24 canonical checks report 20 selected and 4 omitted without blocking; duplicate-name context and impact resolve both file-scoped UIDs. Full suite: 95 passed. Follow-up and PR #2-base production gates pass; Standards and producer-slice Spec reviews have zero findings.
 - 2026-08-08: GitNexus reviewer follow-up `255896f` preserves JVM Class/Interface constructor and file traversal for UID impact and removes two fake-green CLI test exits. Repo Context Forge runtime activation now binds that reviewed successor; the original timing evidence remains attributed to the exact `1841c6c` build measured there.
 - 2026-08-08: precommit challenge confirmed the implementation but blocked live activation on dependency ordering: installed package version 1.5.3 is not the PR #3 build. Recorded the exact-commit gate and rejected a compatibility shim; no merge performed.
+- 2026-08-09: admitted the demonstrated nested-file blocker: `file_context` passed a repository path as a symbol name. A real public-bootstrap test now selects a nested no-symbol file with a duplicate basename, and the existing Graph Analysis Module resolves it through GitNexus's exact `File:<repository-path>` UID Interface while retaining file/UID validation. Refreshed timing uses corrected PR #4 code and GitNexus `255896f`.
+- 2026-08-09: acceptance evidence is reported precisely: the prior OPS run ended `review_incomplete` with one medium notice; Repo Context Forge CodeRabbit skipped the non-default-base diff; GitNexus CodeRabbit was rate-limited; and the GitNexus full suite result was 4,665 passed, 143 documented environment/optional-parser failures, and 171 skipped, with the directly affected suites green. `/bin/false` remains diagnostic-only evidence, not real-runtime Issue #94 proof.

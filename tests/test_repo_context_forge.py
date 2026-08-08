@@ -322,6 +322,62 @@ class RepoContextForgeTests(unittest.TestCase):
                 result.stdout,
             )
 
+    def test_public_bootstrap_resolves_nested_file_context_by_exact_identity(self) -> None:
+        self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
+        with (
+            tempfile.TemporaryDirectory() as repo_dir,
+            tempfile.TemporaryDirectory() as cache_dir,
+            tempfile.TemporaryDirectory() as runtime_home,
+        ):
+            repo = Path(repo_dir)
+            packet_path = Path(runtime_home) / "packet.json"
+            self.make_git_repo(repo)
+            (repo / "ARCHITECTURE.md").write_text("# Root architecture\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "ARCHITECTURE.md"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "root architecture"])
+            (repo / "docs").mkdir()
+            (repo / "docs" / "ARCHITECTURE.md").write_text(
+                "# Nested architecture\n", encoding="utf-8"
+            )
+            repo_context_forge.run_git(repo, ["add", "docs/ARCHITECTURE.md"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "nested architecture"])
+
+            result = repo_context_forge.run_cmd(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "codex_context_bootstrap.py"),
+                    "--repo",
+                    str(repo),
+                    "--mode",
+                    "pr",
+                    "--base",
+                    "HEAD~1",
+                    "--top",
+                    "1",
+                    "--cache-dir",
+                    cache_dir,
+                    "--map-build",
+                    "never",
+                    "--gitnexus-mode",
+                    "auto",
+                    "--allow-stale-pr-head",
+                    "--packet-json-out",
+                    str(packet_path),
+                ],
+                env={**os.environ, "HOME": runtime_home},
+                allow_fail=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
+            self.assertNotIn("blocked", packet)
+            self.assertTrue(packet["gitnexus"]["required_checks_resolved"])
+            entries = packet["gitnexus"]["analysis"]["entries"]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["kind"], "file_context")
+            self.assertEqual(entries[0]["file"], "docs/ARCHITECTURE.md")
+            self.assertEqual(entries[0]["resolved_identity"], "File:docs/ARCHITECTURE.md")
+
     def test_public_bootstrap_reports_exact_omitted_check_count_non_blocking(self) -> None:
         self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
         with (

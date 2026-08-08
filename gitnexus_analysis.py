@@ -303,7 +303,7 @@ def execute(
             unresolved.append(dict(entry))
             continue
         if kind == "file_context":
-            command = [binary, "context", "-r", repo_name, target]
+            command = [binary, "context", "-r", repo_name, "-u", f"File:{target}"]
         elif kind == "symbol_context":
             command = [binary, "context", "-r", repo_name, "-f", file_path, target]
         elif kind == "symbol_impact":
