@@ -207,6 +207,13 @@ def render_bootstrap_output(packet: dict[str, object], enforce_intake: bool) -> 
     return forge.render_required_intake(packet) + rendered
 
 
+def output_packet(packet: dict[str, object], args: argparse.Namespace) -> int:
+    if args.packet_json_out:
+        forge.write_json_atomic(args.packet_json_out, packet)
+    forge.output_text(render_bootstrap_output(packet, args.enforce_intake), args.out)
+    return 1 if packet.get("blocked") else 0
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     repo = args.repo.resolve()
@@ -235,8 +242,7 @@ def main(argv: list[str]) -> int:
                 and is_user_worktree(item.get("path", ""), args.cache_dir)
             ],
         )
-        forge.output_text(render_bootstrap_output(packet, args.enforce_intake), args.out)
-        return 1
+        return output_packet(packet, args)
     if not args.allow_empty:
         blocker_reason = should_block_empty_checkout(root, mode, base_ref, args.head, args.intent)
         if blocker_reason:
@@ -252,8 +258,7 @@ def main(argv: list[str]) -> int:
                     and is_user_worktree(item.get("path", ""), args.cache_dir)
                 ],
             )
-            forge.output_text(render_bootstrap_output(packet, args.enforce_intake), args.out)
-            return 1
+            return output_packet(packet, args)
 
     token_budget = forge.compute_token_budget(args.conversation_tokens, args.token_budget)
     packet = forge.make_packet(
@@ -272,11 +277,7 @@ def main(argv: list[str]) -> int:
         gitnexus_repo=args.gitnexus_repo,
         gitnexus_mode=args.gitnexus_mode,
     )
-    if args.packet_json_out:
-        forge.write_json_atomic(args.packet_json_out, packet)
-    rendered = render_bootstrap_output(packet, args.enforce_intake)
-    forge.output_text(rendered, args.out)
-    return 1 if packet.get("blocked") else 0
+    return output_packet(packet, args)
 
 
 if __name__ == "__main__":

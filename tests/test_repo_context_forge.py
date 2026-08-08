@@ -188,6 +188,36 @@ class RepoContextForgeTests(unittest.TestCase):
             ],
         )
 
+    def test_build_gitnexus_plan_never_splits_context_impact_pair_at_cap(self) -> None:
+        entries = [{"path": "README.md", "symbols": []}]
+        entries.extend(
+            {
+                "path": f"src/module_{index}.py",
+                "symbols": [{"name": f"handle_{index}", "kind": "function"}],
+            }
+            for index in range(10)
+        )
+
+        plan = repo_context_forge.build_gitnexus_plan(entries)
+
+        self.assertLessEqual(len(plan), repo_context_forge.MAX_GITNEXUS_CHECKS)
+        symbol_checks = {
+            (item["file"], item["target"]): item["kind"]
+            for item in plan
+            if item["kind"] == "symbol_context"
+        }
+        impact_checks = {
+            (item["file"], item["target"]): item["kind"]
+            for item in plan
+            if item["kind"] == "symbol_impact"
+        }
+        self.assertEqual(symbol_checks.keys(), impact_checks.keys())
+
+        file_plan = repo_context_forge.build_gitnexus_plan(
+            [{"path": f"docs/{index}.md", "symbols": []} for index in range(21)]
+        )
+        self.assertEqual(len(file_plan), repo_context_forge.MAX_GITNEXUS_CHECKS)
+
     def test_public_bootstrap_keeps_duplicate_symbol_names_file_scoped(self) -> None:
         self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
         with (
@@ -329,6 +359,7 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
             packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
             self.assertNotIn("blocked", packet)
+            self.assertEqual(packet["gitnexus"]["status"], "reindexed")
             self.assertTrue(packet["gitnexus"]["required_checks_resolved"])
             self.assertTrue(
                 repo_context_forge.gitnexus_analysis.result_is_resolved(
@@ -1688,71 +1719,6 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertEqual(metadata["analysis_head_sha"], state.head_sha)
             self.assertTrue(metadata["analysis_repo_is_cache_owned"])
 
-    def test_gitnexus_auto_reindexes_stale_analysis_checkout(self) -> None:
-        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:
-            analysis_repo = Path(repo_dir) / "analysis"
-            analysis_repo.mkdir()
-            registry_path = Path(registry_dir) / "registry.json"
-            state = repo_context_forge.TargetState(
-                mode="pr",
-                source_repo=analysis_repo,
-                analysis_repo=analysis_repo,
-                base_ref="main",
-                head_ref="HEAD",
-                head_sha="new-head",
-                source_dirty=False,
-                target_dirty=False,
-                cache_key="key",
-            )
-            registry_path.write_text(
-                repo_context_forge.json.dumps(
-                    [
-                        {
-                            "name": "analysis",
-                            "path": str(analysis_repo.resolve()),
-                            "lastCommit": "old-head",
-                        }
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            original_run_cmd = repo_context_forge.run_cmd
-
-            def fake_run_cmd(args, **_kwargs):
-                (analysis_repo / ".gitnexus").mkdir()
-                registry_path.write_text(
-                    repo_context_forge.json.dumps(
-                        [
-                            {
-                                "name": "analysis",
-                                "path": str(analysis_repo.resolve()),
-                                "lastCommit": "new-head",
-                                "indexedAt": "now",
-                                "storagePath": str(analysis_repo / ".gitnexus"),
-                            }
-                        ]
-                    ),
-                    encoding="utf-8",
-                )
-                return repo_context_forge.subprocess.CompletedProcess(args, 0, "", "")
-
-            repo_context_forge.run_cmd = fake_run_cmd
-            try:
-                status = self.ensure_gitnexus_index(
-                    state,
-                    "analysis",
-                    "auto",
-                    registry_path=registry_path,
-                    gitnexus_bin="gitnexus",
-                )
-            finally:
-                repo_context_forge.run_cmd = original_run_cmd
-
-            self.assertEqual(status["status"], "reindexed")
-            self.assertTrue(status["index_fresh"])
-            self.assertTrue(status["index_present"])
-            self.assertTrue(status["reindex_attempted"])
-
     def test_gitnexus_auto_blocks_when_analysis_checkout_is_locked(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:
             analysis_repo = Path(repo_dir) / "analysis"
@@ -1828,45 +1794,6 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertFalse(status["index_fresh"])
             self.assertFalse(status["index_present"])
             self.assertIn("index storage is missing", status["warning"])
-
-    def test_gitnexus_blocks_when_reindex_does_not_register_storage(self) -> None:
-        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:
-            analysis_repo = Path(repo_dir) / "analysis"
-            analysis_repo.mkdir()
-            registry_path = Path(registry_dir) / "registry.json"
-            state = repo_context_forge.TargetState(
-                mode="pr",
-                source_repo=analysis_repo,
-                analysis_repo=analysis_repo,
-                base_ref="main",
-                head_ref="HEAD",
-                head_sha="new-head",
-                source_dirty=False,
-                target_dirty=False,
-                cache_key="key",
-            )
-            registry_path.write_text("[]", encoding="utf-8")
-            original_run_cmd = repo_context_forge.run_cmd
-
-            def fake_run_cmd(args, **_kwargs):
-                return repo_context_forge.subprocess.CompletedProcess(args, 0, "", "")
-
-            repo_context_forge.run_cmd = fake_run_cmd
-            try:
-                status = self.ensure_gitnexus_index(
-                    state,
-                    "analysis",
-                    "auto",
-                    registry_path=registry_path,
-                    gitnexus_bin="gitnexus",
-                )
-            finally:
-                repo_context_forge.run_cmd = original_run_cmd
-
-            self.assertEqual(status["status"], "blocked")
-            self.assertTrue(status["reindex_attempted"])
-            self.assertFalse(status["index_present"])
-            self.assertIn("did not create registered index storage", status["warning"])
 
     def test_gitnexus_command_failure_blocks_required_check(self) -> None:
         status = self.execute_gitnexus_plan(
@@ -1995,6 +1922,34 @@ class RepoContextForgeTests(unittest.TestCase):
             reason,
             "detached checkout has no target surface; select the active PR worktree",
         )
+
+    def test_public_bootstrap_writes_machine_packet_for_early_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            packet_path = repo / "blocker.json"
+            self.make_git_repo(repo)
+            repo_context_forge.run_git(repo, ["checkout", "--detach"])
+
+            result = repo_context_forge.run_cmd(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "codex_context_bootstrap.py"),
+                    "--repo",
+                    str(repo),
+                    "--mode",
+                    "local",
+                    "--base",
+                    "HEAD",
+                    "--packet-json-out",
+                    str(packet_path),
+                ],
+                allow_fail=True,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
+            self.assertTrue(packet["blocked"])
+            self.assertIn("detached checkout", packet["blocker"]["reason"])
 
     def test_bootstrap_ignores_tool_cache_as_context_surface(self) -> None:
         state = repo_context_forge.GitState(

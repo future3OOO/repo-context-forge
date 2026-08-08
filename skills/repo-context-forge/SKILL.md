@@ -138,6 +138,6 @@ preserving changed-hunk priority.
 
 - Do not ask the user to manually run Repo Context Forge commands for routine
   repo work.
-- Do not edit files before reading the packet and running required GitNexus
-  checks when they are available.
+- Do not edit files before reading the packet and confirming its executed
+  GitNexus checks resolved when they are available.
 - Do not use dirty local map results as PR-head truth.

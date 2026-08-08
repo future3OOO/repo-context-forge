@@ -41,7 +41,9 @@
 
 - claude-skills Issue #95 and manual workflow bookkeeping changes.
 - New graph frameworks, coverage scorers, repository resolvers, query languages, or Adapter hierarchies.
-- PR #3 cache-retention commit `63be875` and the installed overlay's duplicate `architecture_summary.py`.
+- PR #3's second cache-retention/docs delta in `63be875` and the installed overlay's duplicate
+  `architecture_summary.py`; `63be875` is also the Claude runtime authority because it contains
+  the accepted `f5b6f94` single-flight/crash-dump ancestor.
 - Merge actions.
 
 ## Authority And Conflict Rule
@@ -77,7 +79,7 @@
 - [x] refs, authority, isolated checkout, Repo Context Forge intake, GitNexus scope, diagnosis, Claude scope check, and preflight complete
 - [x] preserve PR #3 safety and produce duplicate-name RED
 - [x] implement producer result and atomic packet output
-- [ ] run full verification, review, and Claude challenge
+- [x] run full verification, review, and Claude challenge
 - [ ] commit, push, open/update PR, and close current-head reviewer loop
 - [ ] back up and replace live install with the exact pushed commit
 - [ ] record exact donor/overlay dispositions and final identity proof
@@ -86,4 +88,5 @@
 
 - 2026-08-08: created from re-queried refs and preflight evidence.
 - 2026-08-08: quality-gate precheck required the touched 3,454-line owner to shrink; moved only its cohesive GitNexus registry/freshness/locking/execution boundary into the issue-specified Graph Analysis Module. Serial process count and runtime behavior remain unchanged.
-- 2026-08-08: precommit advisor findings: fixed missing public exit-0 proof and blocker-exit documentation; rejected weakening duplicate-name blockers because Issue #94 explicitly requires unresolved results to block; rejected removing authority/producer revision because both are required result fields; retained two pre-existing reindex unit stubs as non-load-bearing baseline coverage rather than broadening this slice.
+- 2026-08-08: precommit advisor findings: fixed missing public exit-0 proof and blocker-exit documentation; rejected weakening duplicate-name blockers because Issue #94 explicitly requires unresolved results to block; rejected removing authority/producer revision because both are required result fields.
+- 2026-08-08: current-head review fixes write machine JSON for early blockers, preserve context/impact pairs and the 20-check cap, align operator wording, and clarify the PR #3 authority/donor disposition. Replaced the two programmed-collaborator reindex tests with an explicit assertion on the real public reindex path. Full suite: 94 passed; producer-donor and review-fix quality gates: `ok: true`; Standards and producer-slice Spec reviews: zero findings.

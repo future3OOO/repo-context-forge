@@ -1717,6 +1717,8 @@ def build_gitnexus_plan(
         if not isinstance(symbols, list) or not symbols:
             key = ("file_context", path, path, "")
             if key not in seen:
+                if len(plan) >= MAX_GITNEXUS_CHECKS:
+                    return plan
                 item = {"kind": "file_context", "file": path, "target": path}
                 if repo_name:
                     item["repo"] = repo_name
@@ -1741,18 +1743,14 @@ def build_gitnexus_plan(
             if repo_name:
                 context_item["repo"] = repo_name
                 impact_item["repo"] = repo_name
-            for item in (context_item, impact_item):
-                key = (
-                    item["kind"],
-                    item.get("file", ""),
-                    item["target"],
-                    item.get("direction", ""),
-                )
-                if key not in seen:
-                    plan.append(item)
-                    seen.add(key)
-            if len(plan) >= MAX_GITNEXUS_CHECKS:
-                return plan[:MAX_GITNEXUS_CHECKS]
+            context_key = ("symbol_context", path, name, "")
+            impact_key = ("symbol_impact", path, name, "upstream")
+            if context_key in seen and impact_key in seen:
+                continue
+            if len(plan) + 2 > MAX_GITNEXUS_CHECKS:
+                return plan
+            plan.extend((context_item, impact_item))
+            seen.update((context_key, impact_key))
     return plan
 
 
