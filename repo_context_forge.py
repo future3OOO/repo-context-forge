@@ -1002,21 +1002,7 @@ class SoulForgeMap:
         return symbols
 
     def dependent_count_for_file(self, path: str) -> int:
-        if not self.available:
-            return 0
-        with self._connect() as conn:
-            if not self._has_table(conn, "edges"):
-                return 0
-            row = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM files f
-                JOIN edges e ON e.target_file_id = f.id
-                WHERE f.path = ?
-                """,
-                (path,),
-            ).fetchone()
-        return int(row[0] or 0) if row else 0
+        return len(self.file_links(path, direction="dependents", limit=-1))
 
     def file_links(
         self,
@@ -1201,7 +1187,7 @@ class SoulForgeMap:
         dependencies = self.file_links(path, direction="dependencies")
         cochanges = self.cochanges_for_file(path)
         symbols = self.exported_symbols_at_risk(path)
-        direct = len(dependents)
+        direct = self.dependent_count_for_file(path)
         transitive = self.transitive_dependent_count_for_file(path)
         max_symbol_usage = max((int(symbol["usage_files"]) for symbol in symbols), default=0)
         if direct >= 10 or transitive >= 25 or max_symbol_usage >= 10:

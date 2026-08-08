@@ -1548,6 +1548,68 @@ class RepoContextForgeTests(unittest.TestCase):
                 },
             )
 
+    def test_workflow_index_rejects_parenthesized_non_callable_constants(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "a.ts").write_text(
+                "const config = (defaults);\n"
+                "const sum = (left: number, right: number) => left + right;\n"
+                "const typed = (value: string): string => value;\n"
+                "const callback = (run: () => void): void => run();\n"
+                "const deep = (run: (next: () => void) => void): void => run(() => {});\n"
+                "const multiline = (\n"
+                "  value: string,\n"
+                "): string => value;\n"
+                "const dialog = (\n"
+                "  <Dialog />\n"
+                ");\n",
+                encoding="utf-8",
+            )
+            native_index = self.build_workflow_index(repo)
+
+            self.assertEqual(
+                [symbol.name for symbol in native_index.file_symbols("src/a.ts", 10)],
+                ["sum", "typed", "callback", "deep", "multiline"],
+            )
+
+    def test_workflow_index_includes_named_default_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "a.ts").write_text(
+                "export default async function load() {}\n"
+                "export default class Service {}\n",
+                encoding="utf-8",
+            )
+            native_index = self.build_workflow_index(repo)
+
+            self.assertEqual(
+                {
+                    symbol.name: (symbol.kind, symbol.is_exported)
+                    for symbol in native_index.file_symbols("src/a.ts", 10)
+                },
+                {"load": ("function", True), "Service": ("class", True)},
+            )
+
+    def test_workflow_index_relates_python_test_companions(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "service.py").write_text(
+                "def handle():\n    return 1\n", encoding="utf-8"
+            )
+            (repo / "tests").mkdir()
+            (repo / "tests" / "test_service.py").write_text(
+                "def test_handle():\n    assert True\n", encoding="utf-8"
+            )
+            native_index = self.build_workflow_index(repo)
+
+            self.assertEqual(
+                native_index.related_paths(["src/service.py"], 5)[0],
+                "tests/test_service.py",
+            )
+
     def test_typescript_test_files_are_verification_surface(self) -> None:
         self.assertEqual(repo_context_forge.file_role("src/App.test.ts"), "test")
         self.assertEqual(repo_context_forge.file_role("src/App.test.tsx"), "test")
@@ -1651,6 +1713,7 @@ class RepoContextForgeTests(unittest.TestCase):
     def test_soulforge_impact_summary_uses_native_map_tables(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:
             repo = Path(repo_dir)
+            self.make_git_repo(repo)
             db_dir = repo / ".soulforge"
             db_dir.mkdir()
             db_path = db_dir / "repomap.db"
@@ -1708,11 +1771,16 @@ class RepoContextForgeTests(unittest.TestCase):
                         (3, "tests/test_core.py", 0.3, 1, 20),
                         (4, "src/config.py", 0.2, 1, 20),
                         (5, "src/worker.py", 0.1, 1, 20),
+                    ]
+                    + [
+                        (index, f"src/client_{index}.py", 0.1, 1, 20)
+                        for index in range(6, 15)
                     ],
                 )
                 conn.executemany(
                     "INSERT INTO edges VALUES (?, ?, ?, ?)",
-                    [(2, 1, 1.0, 1), (3, 2, 1.0, 1), (1, 4, 0.5, 1)],
+                    [(2, 1, 1.0, 1), (3, 2, 1.0, 1), (1, 4, 0.5, 1)]
+                    + [(index, 1, 1.0, 1) for index in range(6, 15)],
                 )
                 conn.execute("INSERT INTO cochanges VALUES (1, 3, 4)")
                 conn.executemany(
@@ -1728,13 +1796,26 @@ class RepoContextForgeTests(unittest.TestCase):
                 )
                 conn.execute("INSERT INTO calls VALUES (20, 'Handle', 10, 1, 3)")
 
-            impact = repo_context_forge.SoulForgeMap(repo).impact_summary_for_file("src/core.py")
+            soul_map = repo_context_forge.SoulForgeMap(repo)
+            impact = soul_map.impact_summary_for_file("src/core.py")
+            target = repo_context_forge.make_target_entries(
+                mode="repo",
+                source_repo=repo,
+                analysis_repo=repo,
+                base_ref="HEAD",
+                head_ref="HEAD",
+                source_git_state=repo_context_forge.read_git_state(repo, "HEAD", "HEAD"),
+                soul_map=soul_map,
+                targets=["src/core.py"],
+            )[0]
 
-            self.assertEqual(impact["direct_dependents"], 1)
+            self.assertEqual(target["dependent_count"], 10)
+            self.assertEqual(impact["direct_dependents"], 10)
             self.assertEqual(impact["dependencies"], 1)
             self.assertEqual(impact["cochange_partners"], 1)
-            self.assertEqual(impact["total_affected_scope"], 2)
-            self.assertEqual(impact["risk"], "medium")
+            self.assertEqual(impact["total_affected_scope"], 11)
+            self.assertEqual(impact["risk"], "high")
+            self.assertEqual(len(impact["dependents"]), 8)
             self.assertEqual(impact["dependents"][0]["path"], "src/app.py")
             self.assertEqual(impact["exported_symbols_at_risk"][0]["name"], "Handle")
             self.assertEqual(impact["exported_symbols_at_risk"][0]["usage_files"], 3)

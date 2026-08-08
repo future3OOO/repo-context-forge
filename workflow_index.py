@@ -396,7 +396,7 @@ class WorkflowIndex:
         content: str,
         summary_for_symbol: SummaryForSymbol,
     ) -> list[IndexedSymbol]:
-        """Index line-oriented declarations with direct same-line export heuristics."""
+        """Index declarations with direct same-line export heuristics."""
         extension = Path(path).suffix.lower()
         patterns: list[tuple[str, str]] = []
         if extension == ".py":
@@ -406,29 +406,35 @@ class WorkflowIndex:
             ]
         elif extension in SOURCE_EXTENSIONS:
             patterns = [
-                ("function", r"^\s*export\s+(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\("),
+                ("function", r"^\s*export\s+(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\("),
                 ("function", r"^\s*(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\("),
-                ("class", r"^\s*export\s+class\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"),
+                ("class", r"^\s*export\s+(?:default\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"),
                 ("class", r"^\s*class\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"),
-                ("function", r"^\s*export\s+const\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?\("),
-                ("function", r"^\s*const\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?\("),
+                ("arrow", r"^\s*(?:export\s+)?const\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?\("),
             ]
         symbols: list[IndexedSymbol] = []
         seen: set[tuple[str, int]] = set()
-        for line_number, line in enumerate(content.splitlines(), start=1):
+        offset = 0
+        for line_number, raw_line in enumerate(content.splitlines(keepends=True), start=1):
+            line = raw_line.rstrip("\r\n")
             for kind, pattern in patterns:
                 match = re.search(pattern, line)
                 if not match:
+                    continue
+                if kind == "arrow" and not WorkflowIndex._is_arrow_initializer(
+                    content, offset + match.end() - 1
+                ):
                     continue
                 name = match.group(1)
                 key = (name, line_number)
                 if key in seen:
                     continue
                 seen.add(key)
+                symbol_kind = "function" if kind == "arrow" else kind
                 symbols.append(
                     IndexedSymbol(
                         name=name,
-                        kind=kind,
+                        kind=symbol_kind,
                         line=line_number,
                         end_line=line_number,
                         signature=line.strip(),
@@ -437,10 +443,64 @@ class WorkflowIndex:
                             if extension == ".py"
                             else line.lstrip().startswith("export ")
                         ),
-                        summary=summary_for_symbol(path, name, kind),
+                        summary=summary_for_symbol(path, name, symbol_kind),
                     )
                 )
+            offset += len(raw_line)
         return symbols
+
+    @staticmethod
+    def _is_arrow_initializer(content: str, open_paren: int) -> bool:
+        depth = 0
+        quote = ""
+        escaped = False
+        index = open_paren
+        while index < len(content):
+            char = content[index]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = ""
+            elif char in {'"', "'", "`"}:
+                quote = char
+            elif content.startswith("//", index):
+                index = content.find("\n", index)
+                if index < 0:
+                    return False
+            elif content.startswith("/*", index):
+                index = content.find("*/", index + 2)
+                if index < 0:
+                    return False
+                index += 1
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    tail = content[index + 1 :]
+                    direct = re.match(r"\s*=>", tail)
+                    if direct:
+                        return True
+                    annotation = re.match(r"\s*:", tail)
+                    if not annotation:
+                        return False
+                    nesting = 0
+                    for tail_index in range(annotation.end(), len(tail)):
+                        if tail.startswith("=>", tail_index) and nesting == 0:
+                            return True
+                        tail_char = tail[tail_index]
+                        if tail_char in "([{":
+                            nesting += 1
+                        elif tail_char in ")]}" and nesting:
+                            nesting -= 1
+                        elif tail_char in ";=" and nesting == 0:
+                            return False
+                    return False
+            index += 1
+        return False
 
     @staticmethod
     def _base_score(path: str, role: str, line_count: int, symbol_count: int) -> float:
@@ -478,7 +538,7 @@ class WorkflowIndex:
 
     @staticmethod
     def _logical_stem(path: str) -> str:
-        return Path(path).stem.replace(".test", "").replace(".spec", "")
+        return Path(path).stem.replace(".test", "").replace(".spec", "").removeprefix("test_")
 
     @staticmethod
     def _indexed_file(row: tuple[object, ...]) -> IndexedFile:
