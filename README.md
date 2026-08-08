@@ -56,7 +56,8 @@ silently switch to sibling worktrees.
 - output can be Markdown, JSON, or an XML prompt packet for upstream injection.
 - prompt packets default to a 16k token budget and compact optional symbol
   detail before dropping required status, target identity, or GitNexus checks.
-- packets include GitNexus required-check entries for context and impact calls.
+- packets execute their bounded GitNexus context/impact plan serially and include
+  normalized, identity-bound semantic answers plus timing and output metrics.
 - packets include workflow-index and architecture summaries, optional SoulForge
   target-head proof, and packet-authoritative GitNexus exact-head status.
 - `gitnexus-merge` merges real GitNexus findings and blocks stale blast-radius
@@ -166,6 +167,9 @@ For clean exploration, use `mode=repo` or let the plugin bootstrap select it.
 
 GitNexus is not replaced by this tool. In `auto` mode, Repo Context Forge checks
 whether the GitNexus index matches the packet target head and reindexes the
-cache-owned analysis checkout when it is missing or stale. If GitNexus is still
-stale, unavailable, or missing required symbols, the packet blocks blast-radius
-confidence.
+cache-owned analysis checkout when it is missing or stale. It then executes the
+packet plan once. Stale, unavailable, malformed, ambiguous, or identity-mismatched
+results produce one blocker instead of a successful packet. The bootstrap's
+optional `--packet-json-out PATH` atomically writes the same machine packet while
+normal prompt stdout remains unchanged. A blocker is still rendered and written,
+then the production bootstrap exits nonzero.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import importlib.util
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -70,6 +71,36 @@ class RepoContextForgeTests(unittest.TestCase):
         (root / "src" / "a.py").write_text("print('clean')\n", encoding="utf-8")
         repo_context_forge.run_cmd(["git", "add", ".gitignore", "src/a.py"], cwd=root)
         repo_context_forge.run_cmd(["git", "commit", "-m", "initial"], cwd=root)
+
+    def ensure_gitnexus_index(
+        self,
+        state: repo_context_forge.TargetState,
+        repo_name: str,
+        mode: str,
+        **kwargs,
+    ) -> dict[str, object]:
+        return repo_context_forge.gitnexus_analysis.ensure_index(
+            state.analysis_repo,
+            state.head_sha,
+            repo_name,
+            mode,
+            run_command=repo_context_forge.run_cmd,
+            **kwargs,
+        )
+
+    def execute_gitnexus_plan(
+        self,
+        plan: list[dict[str, str]],
+        status: dict[str, object],
+        **kwargs,
+    ) -> dict[str, object]:
+        return repo_context_forge.gitnexus_analysis.execute(
+            plan,
+            status,
+            run_command=repo_context_forge.run_cmd,
+            max_checks=repo_context_forge.MAX_GITNEXUS_CHECKS,
+            **kwargs,
+        )
 
     def build_workflow_index(
         self, repo: Path, source: str | None = None
@@ -148,9 +179,164 @@ class RepoContextForgeTests(unittest.TestCase):
             plan,
             [
                 {"kind": "symbol_context", "target": "handle", "file": "src/a.py"},
-                {"kind": "symbol_impact", "target": "handle", "direction": "upstream"},
+                {
+                    "kind": "symbol_impact",
+                    "target": "handle",
+                    "file": "src/a.py",
+                    "direction": "upstream",
+                },
             ],
         )
+
+    def test_public_bootstrap_keeps_duplicate_symbol_names_file_scoped(self) -> None:
+        self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
+        with (
+            tempfile.TemporaryDirectory() as repo_dir,
+            tempfile.TemporaryDirectory() as cache_dir,
+            tempfile.TemporaryDirectory() as runtime_home,
+        ):
+            repo = Path(repo_dir)
+            packet_path = Path(runtime_home) / "packet.json"
+            self.make_git_repo(repo)
+            (repo / "src" / "a.py").write_text(
+                "def connect():\n    return 'a'\n", encoding="utf-8"
+            )
+            (repo / "src" / "b.py").write_text(
+                "def connect():\n    return 'b'\n", encoding="utf-8"
+            )
+            (repo / "src" / "use.py").write_text(
+                "from a import connect as connect_a\n"
+                "from b import connect as connect_b\n\n"
+                "def use():\n    return connect_a(), connect_b()\n",
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "duplicate symbols"])
+
+            result = repo_context_forge.run_cmd(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "codex_context_bootstrap.py"),
+                    "--repo",
+                    str(repo),
+                    "--mode",
+                    "repo",
+                    "--cache-dir",
+                    cache_dir,
+                    "--map-build",
+                    "never",
+                    "--gitnexus-mode",
+                    "auto",
+                    "--packet-json-out",
+                    str(packet_path),
+                ],
+                env={**os.environ, "HOME": runtime_home},
+                allow_fail=True,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertTrue(packet_path.exists())
+            packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
+            self.assertTrue(packet["blocked"])
+            analysis = packet["gitnexus"]["analysis"]
+            self.assertEqual(analysis["graph_call_count"], 7)
+            self.assertEqual(analysis["process_count"], 7)
+            self.assertLessEqual(
+                analysis["output_bytes"],
+                analysis["graph_call_count"] * repo_context_forge.gitnexus_analysis.MAX_OUTPUT_BYTES,
+            )
+            connect_entries = [
+                entry for entry in analysis["entries"] if entry.get("target") == "connect"
+            ]
+            self.assertEqual(len(connect_entries), 4)
+            self.assertEqual(
+                {(entry["kind"], entry["file"], entry.get("direction", "")) for entry in connect_entries},
+                {
+                    ("symbol_context", "src/a.py", ""),
+                    ("symbol_impact", "src/a.py", "upstream"),
+                    ("symbol_context", "src/b.py", ""),
+                    ("symbol_impact", "src/b.py", "upstream"),
+                },
+            )
+            self.assertEqual(
+                {entry["resolved_identity"] for entry in connect_entries if entry["kind"] == "symbol_context"},
+                {"Function:src/a.py:connect", "Function:src/b.py:connect"},
+            )
+            self.assertEqual(
+                [entry["status"] for entry in connect_entries].count("unresolved"),
+                1,
+            )
+            self.assertIn("<blocker", result.stdout)
+            self.assertIn(
+                '<check kind="symbol_context" target="connect" file="src/a.py"',
+                result.stdout,
+            )
+            self.assertIn(
+                '<check kind="symbol_context" target="connect" file="src/b.py"',
+                result.stdout,
+            )
+            self.assertIn(
+                '<check kind="symbol_impact" target="connect" file="src/a.py" direction="upstream"',
+                result.stdout,
+            )
+            self.assertIn(
+                '<check kind="symbol_impact" target="connect" file="src/b.py" direction="upstream"',
+                result.stdout,
+            )
+
+    def test_public_bootstrap_emits_resolved_graph_analysis(self) -> None:
+        self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
+        with (
+            tempfile.TemporaryDirectory() as repo_dir,
+            tempfile.TemporaryDirectory() as cache_dir,
+            tempfile.TemporaryDirectory() as runtime_home,
+        ):
+            repo = Path(repo_dir)
+            packet_path = Path(runtime_home) / "packet.json"
+            self.make_git_repo(repo)
+            (repo / "src" / "a.py").write_text(
+                "def handle():\n    return 1\n", encoding="utf-8"
+            )
+            (repo / "src" / "use.py").write_text(
+                "from a import handle\n\ndef use():\n    return handle()\n", encoding="utf-8"
+            )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "callable dependency"])
+
+            result = repo_context_forge.run_cmd(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "codex_context_bootstrap.py"),
+                    "--repo",
+                    str(repo),
+                    "--mode",
+                    "repo",
+                    "--top",
+                    "2",
+                    "--cache-dir",
+                    cache_dir,
+                    "--map-build",
+                    "never",
+                    "--gitnexus-mode",
+                    "auto",
+                    "--packet-json-out",
+                    str(packet_path),
+                ],
+                env={**os.environ, "HOME": runtime_home},
+                allow_fail=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
+            self.assertNotIn("blocked", packet)
+            self.assertTrue(packet["gitnexus"]["required_checks_resolved"])
+            self.assertTrue(
+                repo_context_forge.gitnexus_analysis.result_is_resolved(
+                    packet["gitnexus"]["analysis"]
+                )
+            )
+            self.assertGreater(packet["gitnexus"]["analysis"]["graph_call_count"], 0)
+            self.assertIn('<gitnexus_analysis status="resolved"', result.stdout)
 
     def test_rank_target_entry_prioritizes_changed_production_over_broad_test(self) -> None:
         state = repo_context_forge.GitState(
@@ -1282,55 +1468,34 @@ class RepoContextForgeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "targets must be a list"):
             repo_context_forge.render_context_digest_lines(packet)
 
-    def test_make_packet_populates_architecture_and_gitnexus_head_proof(self) -> None:
+    def test_make_packet_populates_architecture_and_gitnexus_expected_head(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
             repo = Path(repo_dir)
             self.make_git_repo(repo)
             (repo / "src" / "a.py").write_text(
                 "def handle():\n    return 1\n", encoding="utf-8"
             )
-            def fake_ensure(target_state, repo_name, _mode, **_kwargs):
-                return {
-                    "status": "fresh",
-                    "repo": repo_name or target_state.analysis_repo.name,
-                    "expected_head_sha": target_state.head_sha,
-                    "indexed_head_sha": target_state.head_sha,
-                    "required_checks_resolved": True,
-                }
-
-            with patch.object(
-                repo_context_forge,
-                "ensure_gitnexus_index",
-                side_effect=fake_ensure,
-            ), patch.object(
-                repo_context_forge,
-                "verify_gitnexus_required_checks",
-                side_effect=lambda _plan, status, **_kwargs: status,
-            ):
-                packet = repo_context_forge.make_packet(
-                    repo,
-                    mode="local",
-                    base_ref="HEAD",
-                    head_ref="HEAD",
-                    intent=None,
-                    top=5,
-                    token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET,
-                    cache_dir=Path(cache_dir),
-                    soulforge_bin=None,
-                    map_build="never",
-                    map_timeout_ms=1,
-                    allow_missing_map=True,
-                    gitnexus_repo=None,
-                )
+            packet = repo_context_forge.make_packet(
+                repo,
+                mode="local",
+                base_ref="HEAD",
+                head_ref="HEAD",
+                intent=None,
+                top=5,
+                token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET,
+                cache_dir=Path(cache_dir),
+                soulforge_bin=None,
+                map_build="never",
+                map_timeout_ms=1,
+                allow_missing_map=True,
+                gitnexus_repo=None,
+            )
 
             self.assertEqual(
                 packet["gitnexus"]["expected_head_sha"],
                 packet["target_state"]["head_sha"],
             )
-            self.assertEqual(
-                packet["gitnexus"]["indexed_head_sha"],
-                packet["target_state"]["head_sha"],
-            )
+            self.assertEqual(packet["gitnexus"]["status"], "disabled")
             self.assertTrue(packet["workflow_index"]["dirty_overlay"])
             self.assertEqual(packet["architecture_summary"]["roles"], {"production": 1})
 
@@ -1573,7 +1738,7 @@ class RepoContextForgeTests(unittest.TestCase):
 
             repo_context_forge.run_cmd = fake_run_cmd
             try:
-                status = repo_context_forge.ensure_gitnexus_index(
+                status = self.ensure_gitnexus_index(
                     state,
                     "analysis",
                     "auto",
@@ -1609,7 +1774,7 @@ class RepoContextForgeTests(unittest.TestCase):
 
             with lock_path.open("a") as lock_file:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                status = repo_context_forge.ensure_gitnexus_index(
+                status = self.ensure_gitnexus_index(
                     state,
                     "analysis",
                     "auto",
@@ -1651,7 +1816,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            status = repo_context_forge.ensure_gitnexus_index(
+            status = self.ensure_gitnexus_index(
                 state,
                 "analysis",
                 "check",
@@ -1688,7 +1853,7 @@ class RepoContextForgeTests(unittest.TestCase):
 
             repo_context_forge.run_cmd = fake_run_cmd
             try:
-                status = repo_context_forge.ensure_gitnexus_index(
+                status = self.ensure_gitnexus_index(
                     state,
                     "analysis",
                     "auto",
@@ -1703,29 +1868,71 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertFalse(status["index_present"])
             self.assertIn("did not create registered index storage", status["warning"])
 
-    def test_gitnexus_required_checks_block_missing_symbols(self) -> None:
-        original_run_cmd = repo_context_forge.run_cmd
-
-        def fake_run_cmd(args, **_kwargs):
-            returncode = 1 if args[-1] == "missing_symbol" else 0
-            return repo_context_forge.subprocess.CompletedProcess(args, returncode, "", "missing")
-
-        repo_context_forge.run_cmd = fake_run_cmd
-        try:
-            status = repo_context_forge.verify_gitnexus_required_checks(
-                [
-                    {"kind": "symbol_context", "target": "present_symbol"},
-                    {"kind": "symbol_context", "target": "missing_symbol"},
-                ],
-                {"status": "fresh", "repo": "analysis"},
-                gitnexus_bin="gitnexus",
-            )
-        finally:
-            repo_context_forge.run_cmd = original_run_cmd
+    def test_gitnexus_command_failure_blocks_required_check(self) -> None:
+        status = self.execute_gitnexus_plan(
+            [{"kind": "symbol_context", "target": "missing_symbol", "file": "src/a.py"}],
+            {"status": "fresh", "repo": "analysis"},
+            gitnexus_bin="/bin/false",
+        )
 
         self.assertEqual(status["status"], "blocked")
         self.assertEqual(status["missing_required_symbols"], ["missing_symbol"])
         self.assertFalse(status["required_checks_resolved"])
+
+    def test_gitnexus_placeholder_is_not_a_resolved_result(self) -> None:
+        self.assertFalse(repo_context_forge.gitnexus_analysis.result_is_resolved({}))
+        self.assertFalse(
+            repo_context_forge.gitnexus_analysis.result_is_resolved({"status": "resolved"})
+        )
+
+    def test_empty_gitnexus_plan_executes_no_semantic_calls(self) -> None:
+        status = self.execute_gitnexus_plan(
+            [],
+            {"status": "fresh", "repo": "unused"},
+            gitnexus_bin="/bin/false",
+        )
+
+        self.assertTrue(status["required_checks_resolved"])
+        self.assertEqual(status["analysis"]["status"], "resolved")
+        self.assertEqual(status["analysis"]["graph_call_count"], 0)
+        self.assertEqual(status["analysis"]["process_count"], 0)
+
+    def test_duplicate_plan_entries_execute_once_with_real_gitnexus(self) -> None:
+        self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as runtime_home:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "a.py").write_text(
+                "def connect():\n    return 1\n", encoding="utf-8"
+            )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "add connect"])
+            env = {**os.environ, "HOME": runtime_home}
+            indexed = repo_context_forge.run_cmd(
+                ["gitnexus", "analyze", "--force", "--skip-agents-md", str(repo)],
+                env=env,
+                suppress_core_dump=True,
+                allow_fail=True,
+            )
+            self.assertEqual(indexed.returncode, 0, indexed.stderr)
+            registry = repo_context_forge.json.loads(
+                (Path(runtime_home) / ".gitnexus" / "registry.json").read_text(encoding="utf-8")
+            )
+            repo_name = next(
+                entry["name"] for entry in registry if Path(entry["path"]).resolve() == repo.resolve()
+            )
+            check = {"kind": "symbol_context", "target": "connect", "file": "src/a.py"}
+
+            with patch.dict(os.environ, {"HOME": runtime_home}):
+                status = self.execute_gitnexus_plan(
+                    [check, dict(check)],
+                    {"status": "fresh", "repo": repo_name},
+                    gitnexus_bin="gitnexus",
+                )
+
+            self.assertTrue(status["required_checks_resolved"])
+            self.assertEqual(status["analysis"]["graph_call_count"], 1)
+            self.assertEqual(len(status["analysis"]["entries"]), 1)
 
     def test_blocker_prompt_renders_worktree_suggestions(self) -> None:
         packet = {
@@ -2154,7 +2361,7 @@ class RepoContextForgeTests(unittest.TestCase):
         )
         self.assertIn("src/a.py", captured["text"])
         self.assertIn(
-            "Run the listed gitnexus_required_checks first; they are the initial GitNexus validation",
+            "Consume gitnexus_analysis first; gitnexus_required_checks records the already-executed packet plan",
             captured["text"],
         )
         self.assertIn("coverage_plan: required=true delegation_required=false", captured["text"])
@@ -2263,7 +2470,7 @@ class RepoContextForgeTests(unittest.TestCase):
             rendered,
         )
         self.assertIn(
-            "Run the listed <gitnexus_required_checks> first as the initial GitNexus validation",
+            "Consume <gitnexus_analysis> first; <gitnexus_required_checks> records the already-executed packet plan",
             rendered,
         )
         self.assertIn("<semantic_sources>", rendered)

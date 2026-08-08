@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import html
 import json
@@ -12,12 +11,13 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Literal
 
+import gitnexus_analysis
 import workflow_index
-
 
 Mode = Literal["pr", "local", "intent", "repo"]
 Scope = Literal["pr", "dirty", "all"]
@@ -27,12 +27,12 @@ GitNexusMode = Literal["off", "check", "auto"]
 
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "repo-context-forge"
-GITNEXUS_REGISTRY = Path.home() / ".gitnexus" / "registry.json"
 TOOL_CACHE_DIRS = (".soulforge", ".codex", ".gitnexus", workflow_index.INDEX_DIR)
 TOOL_CACHE_PREFIXES = tuple(f"{name}/" for name in TOOL_CACHE_DIRS)
 MIN_TOKEN_BUDGET = 16_000
 MAX_TOKEN_BUDGET = 32_000
 DEFAULT_TOKEN_BUDGET = MIN_TOKEN_BUDGET
+MAX_GITNEXUS_CHECKS = 20
 TaskEvent = Literal["read", "search", "edit", "mention"]
 CRITICAL_AREA_STEPS = (
     "State the task or PR contract from the user request, PR title/body when available, and packet targets.",
@@ -101,6 +101,7 @@ def run_cmd(
     allow_fail: bool = False,
     env: dict[str, str] | None = None,
     suppress_core_dump: bool = False,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = args
     if suppress_core_dump:
@@ -119,6 +120,7 @@ def run_cmd(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        timeout=timeout,
     )
     if proc.returncode != 0 and not allow_fail:
         location = f" in {cwd}" if cwd else ""
@@ -1708,36 +1710,49 @@ def build_gitnexus_plan(
     repo_name: str | None = None,
 ) -> list[dict[str, str]]:
     plan: list[dict[str, str]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for entry in target_entries:
         path = str(entry["path"])
         symbols = entry.get("changed_symbols") or entry.get("symbols")
         if not isinstance(symbols, list) or not symbols:
-            if path not in seen:
-                item = {"kind": "file_context", "target": path}
+            key = ("file_context", path, path, "")
+            if key not in seen:
+                item = {"kind": "file_context", "file": path, "target": path}
                 if repo_name:
                     item["repo"] = repo_name
                 plan.append(item)
-                seen.add(path)
+                seen.add(key)
             continue
         for symbol in symbols:
             if not isinstance(symbol, dict):
                 continue
             name = symbol.get("name")
-            if not isinstance(name, str) or not name or name in seen:
+            if not isinstance(name, str) or not name:
                 continue
             if symbol.get("kind") not in {"function", "class", "method"}:
                 continue
             context_item = {"kind": "symbol_context", "target": name, "file": path}
-            impact_item = {"kind": "symbol_impact", "target": name, "direction": "upstream"}
+            impact_item = {
+                "kind": "symbol_impact",
+                "target": name,
+                "file": path,
+                "direction": "upstream",
+            }
             if repo_name:
                 context_item["repo"] = repo_name
                 impact_item["repo"] = repo_name
-            plan.append(context_item)
-            plan.append(impact_item)
-            seen.add(name)
-            if len(plan) >= 20:
-                return plan
+            for item in (context_item, impact_item):
+                key = (
+                    item["kind"],
+                    item.get("file", ""),
+                    item["target"],
+                    item.get("direction", ""),
+                )
+                if key not in seen:
+                    plan.append(item)
+                    seen.add(key)
+            if len(plan) >= MAX_GITNEXUS_CHECKS:
+                return plan[:MAX_GITNEXUS_CHECKS]
     return plan
 
 
@@ -1774,6 +1789,48 @@ def render_coverage_plan_lines(plan: object, indent: str) -> list[str]:
         lines.append(f"{indent}    </files>")
         lines.append(f"{indent}  </area>")
     lines.append(f"{indent}</coverage_plan>")
+    return lines
+
+
+def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> list[str]:
+    analysis = gitnexus.get("analysis")
+    if not isinstance(analysis, dict):
+        return []
+    lines = [
+        f'{indent}<gitnexus_analysis status="{html.escape(str(analysis.get("status") or "unknown"))}" '
+        f'graph_calls="{html.escape(str(analysis.get("graph_call_count") or 0))}" '
+        f'elapsed_ms="{html.escape(str(analysis.get("elapsed_ms") or 0))}" '
+        f'output_bytes="{html.escape(str(analysis.get("output_bytes") or 0))}">'
+    ]
+    entries = analysis.get("entries")
+    if isinstance(entries, list):
+        for entry in entries[:MAX_GITNEXUS_CHECKS]:
+            if not isinstance(entry, dict):
+                continue
+            attrs = " ".join(
+                f'{name}="{html.escape(str(entry.get(name) or ""))}"'
+                for name in ("kind", "file", "target", "direction", "status", "resolved_identity")
+            )
+            lines.append(f"{indent}  <check {attrs}>")
+            for key in ("callers", "references"):
+                facts = entry.get(key)
+                if isinstance(facts, list):
+                    for fact in facts[:5]:
+                        if isinstance(fact, dict):
+                            lines.append(
+                                f'{indent}    <{key[:-1]} identity="{html.escape(str(fact.get("identity") or ""))}" '
+                                f'file="{html.escape(str(fact.get("file") or ""))}"/>'
+                            )
+            impacted = entry.get("impacted_files")
+            if isinstance(impacted, list):
+                for path in impacted[:5]:
+                    lines.append(f'{indent}    <impacted_file path="{html.escape(str(path))}"/>')
+            if entry.get("diagnostic"):
+                lines.append(
+                    f"{indent}    <diagnostic>{html.escape(str(entry['diagnostic']))}</diagnostic>"
+                )
+            lines.append(f"{indent}  </check>")
+    lines.append(f"{indent}</gitnexus_analysis>")
     return lines
 
 
@@ -1838,188 +1895,15 @@ def soulforge_target_metadata(
     }
 
 
-def read_gitnexus_registry(registry_path: Path = GITNEXUS_REGISTRY) -> list[dict[str, object]]:
-    if not registry_path.exists():
-        return []
-    try:
-        raw = json.loads(registry_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"GitNexus registry is not valid JSON: {registry_path}") from exc
-    if not isinstance(raw, list):
-        raise RuntimeError(f"GitNexus registry must contain a list: {registry_path}")
-    return [entry for entry in raw if isinstance(entry, dict)]
-
-
-def find_gitnexus_entry(
-    analysis_repo: Path,
-    repo_name: str | None,
-    *,
-    registry_path: Path = GITNEXUS_REGISTRY,
-) -> dict[str, object] | None:
-    entries = read_gitnexus_registry(registry_path)
-    resolved = str(analysis_repo.resolve())
-    for entry in entries:
-        if str(entry.get("path") or "") == resolved:
-            return entry
-    if repo_name:
-        for entry in entries:
-            if entry.get("name") == repo_name and str(entry.get("path") or "") == resolved:
-                return entry
-    return None
-
-
-def gitnexus_status_from_entry(entry: dict[str, object] | None, target_state: TargetState, repo_name: str) -> dict[str, object]:
-    indexed_head = str(entry.get("lastCommit") or "") if entry else ""
-    index_path = Path(str(entry.get("storagePath") or "")) if entry else None
-    index_path = target_state.analysis_repo / ".gitnexus" if entry and (not index_path or str(index_path) == ".") else index_path
-    if entry and not indexed_head:
-        indexed_path = Path(str(entry.get("path") or ""))
-        if indexed_path.resolve() == target_state.analysis_repo.resolve():
-            indexed_head = run_git(indexed_path, ["rev-parse", "HEAD"], allow_fail=True)
-    index_present = bool(index_path and index_path.exists())
+def producer_revision() -> dict[str, object]:
+    source = Path(__file__).resolve().parent
+    if not is_git_repo(source):
+        return {"commit": "unknown", "dirty": False}
+    root = repo_root(source)
     return {
-        "repo": str(entry.get("name") or repo_name) if entry else repo_name,
-        "expected_repo_path": str(target_state.analysis_repo),
-        "expected_head_sha": target_state.head_sha,
-        "indexed_head_sha": indexed_head,
-        "indexed_at": str(entry.get("indexedAt") or "") if entry else "",
-        "index_path": str(index_path or ""),
-        "index_present": index_present,
-        "index_fresh": indexed_head == target_state.head_sha and index_present,
+        "commit": run_git(root, ["rev-parse", "HEAD"]),
+        "dirty": is_dirty(root, ignore_tool_cache=True),
     }
-
-
-def ensure_gitnexus_index(
-    target_state: TargetState, repo_name: str | None, mode: GitNexusMode, *,
-    registry_path: Path = GITNEXUS_REGISTRY, gitnexus_bin: str | None = None,
-) -> dict[str, object]:
-    chosen_repo_name = repo_name or target_state.analysis_repo.name
-    if mode == "off":
-        return {
-            "status": "disabled",
-            "repo": chosen_repo_name,
-            "expected_repo_path": str(target_state.analysis_repo),
-            "expected_head_sha": target_state.head_sha,
-            "reindex_attempted": False,
-            "required_checks_resolved": False,
-        }
-
-    binary = gitnexus_bin or shutil.which("gitnexus")
-    if not binary:
-        return {
-            "status": "unavailable",
-            "repo": chosen_repo_name,
-            "expected_repo_path": str(target_state.analysis_repo),
-            "expected_head_sha": target_state.head_sha,
-            "reindex_attempted": False,
-            "required_checks_resolved": False,
-            "warning": "GitNexus binary not found; blast-radius claims are blocked",
-        }
-
-    entry = find_gitnexus_entry(target_state.analysis_repo, chosen_repo_name, registry_path=registry_path)
-    status = gitnexus_status_from_entry(entry, target_state, chosen_repo_name)
-    if status["index_fresh"]:
-        status.update({"status": "fresh", "reindex_attempted": False})
-        return status
-
-    if mode != "auto":
-        status.update({"status": "blocked", "reindex_attempted": False})
-        if not status.get("index_present"):
-            status["warning"] = "GitNexus index storage is missing; blast-radius claims are blocked"
-        return status
-
-    lock_path = target_state.analysis_repo.parent / f".{target_state.analysis_repo.name}.gitnexus.lock"
-    try:
-        lock_file = lock_path.open("a")
-    except OSError as exc:
-        status.update(
-            status="blocked",
-            reindex_attempted=False,
-            warning=f"GitNexus reindex lock failed; blast-radius claims are blocked ({exc})",
-        )
-        return status
-
-    try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        status.update(
-            status="blocked",
-            reindex_attempted=False,
-            warning="GitNexus reindex is already running for this analysis checkout",
-        )
-        lock_file.close()
-        return status
-
-    with lock_file:
-        entry = find_gitnexus_entry(target_state.analysis_repo, chosen_repo_name, registry_path=registry_path)
-        status = gitnexus_status_from_entry(entry, target_state, chosen_repo_name)
-        if status["index_fresh"]:
-            status.update({"status": "fresh", "reindex_attempted": False})
-            return status
-
-        proc = run_cmd(
-            [binary, "analyze", "--force", "--skip-agents-md", str(target_state.analysis_repo)],
-            allow_fail=True,
-            suppress_core_dump=True,
-        )
-        entry = find_gitnexus_entry(target_state.analysis_repo, chosen_repo_name, registry_path=registry_path)
-        status = gitnexus_status_from_entry(entry, target_state, chosen_repo_name)
-        status["reindex_attempted"] = True
-        status["reindex_returncode"] = proc.returncode
-        if proc.returncode != 0:
-            status["status"] = "blocked"
-            status["warning"] = "GitNexus reindex failed; blast-radius claims are blocked"
-            status["stderr"] = proc.stderr[-2000:]
-            return status
-        if status["index_fresh"]:
-            status["status"] = "reindexed"
-            return status
-        status["status"] = "blocked"
-        status["warning"] = (
-            "GitNexus reindex did not create registered index storage; blast-radius claims are blocked"
-            if not status.get("index_present")
-            else "GitNexus index is still stale after reindex; blast-radius claims are blocked"
-        )
-        return status
-
-
-def verify_gitnexus_required_checks(
-    plan: list[dict[str, str]],
-    gitnexus_status: dict[str, object],
-    *,
-    gitnexus_bin: str | None = None,
-) -> dict[str, object]:
-    if gitnexus_status.get("status") not in {"fresh", "reindexed"}:
-        gitnexus_status["required_checks_resolved"] = False
-        return gitnexus_status
-
-    binary = gitnexus_bin or shutil.which("gitnexus")
-    if not binary:
-        gitnexus_status["status"] = "unavailable"
-        gitnexus_status["required_checks_resolved"] = False
-        return gitnexus_status
-
-    repo_name = str(gitnexus_status["repo"])
-    missing: list[str] = []
-    checked: list[str] = []
-    for item in plan:
-        if item.get("kind") != "symbol_context":
-            continue
-        symbol = item.get("target")
-        if not symbol or symbol in checked:
-            continue
-        checked.append(symbol)
-        proc = run_cmd([binary, "context", "-r", repo_name, symbol], allow_fail=True)
-        if proc.returncode != 0:
-            missing.append(symbol)
-
-    gitnexus_status["checked_required_symbols"] = checked
-    gitnexus_status["missing_required_symbols"] = missing
-    gitnexus_status["required_checks_resolved"] = not missing
-    if missing:
-        gitnexus_status["status"] = "blocked"
-        gitnexus_status["warning"] = "GitNexus could not resolve required symbols; blast-radius claims are blocked"
-    return gitnexus_status
 
 
 def apply_gitnexus_findings(
@@ -2231,10 +2115,27 @@ def make_packet(
     )
     target_entries = apply_task_state_to_entries(target_entries, task_state)
     coverage_plan = build_coverage_plan(target_entries)
-    gitnexus_status = ensure_gitnexus_index(target_state, gitnexus_repo, gitnexus_mode)
+    gitnexus_status = gitnexus_analysis.ensure_index(
+        target_state.analysis_repo, target_state.head_sha, gitnexus_repo, gitnexus_mode,
+        run_command=run_cmd,
+    )
+    index_freshness_status = str(gitnexus_status.get("status") or "unknown")
     gitnexus_repo_name = str(gitnexus_status.get("repo") or gitnexus_repo or target_state.analysis_repo.name)
     plan = build_gitnexus_plan(target_entries, gitnexus_repo_name)
-    gitnexus_status = verify_gitnexus_required_checks(plan, gitnexus_status)
+    gitnexus_status = gitnexus_analysis.execute(
+        plan, gitnexus_status, run_command=run_cmd, max_checks=MAX_GITNEXUS_CHECKS,
+    )
+    analysis = gitnexus_status.get("analysis")
+    if isinstance(analysis, dict):
+        analysis["authority"] = {
+            "source_repository": str(target_state.source_repo),
+            "analysis_repository": str(target_state.analysis_repo),
+            "expected_head": target_state.head_sha,
+            "indexed_head": str(gitnexus_status.get("indexed_head_sha") or ""),
+            "gitnexus_repository": gitnexus_repo_name,
+            "freshness_status": index_freshness_status,
+        }
+        analysis["producer_revision"] = producer_revision()
     source_status = source_status_proof(
         source_status_before,
         porcelain_status(target_state.source_repo),
@@ -2259,7 +2160,7 @@ def make_packet(
     if not source_status["unchanged"]:
         warnings.append("source checkout status changed during context generation")
 
-    return {
+    packet = {
         "schema_version": 1,
         "repo": str(target_state.source_repo),
         "mode": mode,
@@ -2315,6 +2216,16 @@ def make_packet(
         "gitnexus": build_gitnexus_section(plan, target_state, gitnexus_repo_name, gitnexus_status),
         "gitnexus_plan": plan,
     }
+    if gitnexus_mode != "off" and not gitnexus_analysis.result_is_resolved(analysis):
+        packet["blocked"] = True
+        packet["blocker"] = {
+            "reason": str(
+                gitnexus_status.get("warning")
+                or "GitNexus semantic analysis is unresolved"
+            ),
+            "worktree_suggestions": [],
+        }
+    return packet
 
 
 def render_target_lines(target: dict[str, object], *, max_symbols: int = 8) -> list[str]:
@@ -2591,8 +2502,20 @@ def render_required_intake(packet: dict[str, object]) -> str:
             f"indexed_head_sha={gitnexus.get('indexed_head_sha') or ''}; "
             f"required_checks_resolved={str(gitnexus.get('required_checks_resolved', False)).lower()}"
         ),
-        "gitnexus_tool_discovery: run tool_search for missing required GitNexus capabilities before declaring context, impact, or detect_changes unavailable.",
     ]
+    analysis = gitnexus.get("analysis")
+    if isinstance(analysis, dict):
+        unresolved = analysis.get("unresolved_checks")
+        lines.append(
+            "gitnexus_analysis: "
+            f"status={analysis.get('status') or 'unknown'}; "
+            f"graph_calls={analysis.get('graph_call_count') or 0}; "
+            f"unresolved={len(unresolved) if isinstance(unresolved, list) else 0}; "
+            f"elapsed_ms={analysis.get('elapsed_ms') or 0}"
+        )
+    lines.append(
+        "gitnexus_tool_discovery: run tool_search for missing follow-up GitNexus capabilities before declaring context, impact, or detect_changes unavailable."
+    )
     lines.extend(workflow_index.architecture_lines(architecture))
     lines.append("top_targets:")
     for target in targets[:5]:
@@ -2652,7 +2575,7 @@ def render_required_intake(packet: dict[str, object]) -> str:
             "- Do not spawn sub-agents from Repo Context Forge output alone.",
             "- Cover every required coverage area in the parent session unless the current user turn explicitly asks for delegated agents.",
             "- Satisfy coverage_plan before GitNexus calls, GitHub review comments, review findings, or edits.",
-            "- Run the listed gitnexus_required_checks first; they are the initial GitNexus validation scoped to the SoulForge packet and reindexed GitNexus repo.",
+            "- Consume gitnexus_analysis first; gitnexus_required_checks records the already-executed packet plan.",
             "- If a required GitNexus MCP tool is not loaded, run tool_search for that exact GitNexus capability before falling back or reporting it unavailable.",
             "- Use packet targets plus live base...HEAD, dirty worktree, or intent surface according to packet mode.",
             "- Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",
@@ -2700,8 +2623,13 @@ def render_compact_prompt(packet: dict[str, object]) -> str:
     assert isinstance(semantic, dict)
     targets = packet["targets"]
     assert isinstance(targets, list)
-    lines = [
-        '<repo_context_packet schema_version="1" compacted="true">',
+    lines = ['<repo_context_packet schema_version="1" compacted="true">']
+    blocker = packet.get("blocker")
+    if packet.get("blocked") and isinstance(blocker, dict):
+        lines.append(
+            f'  <blocker reason="{html.escape(str(blocker.get("reason") or ""))}"/>'
+        )
+    lines.extend([
         "  <target_state>",
         f"    <mode>{html.escape(str(packet['mode']))}</mode>",
         f"    <source_repo>{html.escape(str(target_state['source_repo']))}</source_repo>",
@@ -2715,7 +2643,7 @@ def render_compact_prompt(packet: dict[str, object]) -> str:
         f"    <source_status_unchanged>{str(source_status.get('unchanged', False)).lower()}</source_status_unchanged>",
         f"    <token_budget>{html.escape(str(packet.get('token_budget') or DEFAULT_TOKEN_BUDGET))}</token_budget>",
         "  </target_state>",
-    ]
+    ])
     lines.extend(render_context_digest_lines(packet))
     lines.append("  <soulforge_status>")
     soulforge_target = soulforge.get("target")
@@ -2748,6 +2676,9 @@ def render_compact_prompt(packet: dict[str, object]) -> str:
         f"    <reindex_attempted>{str(gitnexus.get('reindex_attempted', False)).lower()}</reindex_attempted>",
         f"    <required_checks_resolved>{str(gitnexus.get('required_checks_resolved', False)).lower()}</required_checks_resolved>",
         "  </gitnexus_status>",
+    ])
+    lines.extend(render_gitnexus_analysis_lines(gitnexus, "  "))
+    lines.extend([
         "  <warnings>",
         "    <warning>prompt compacted to fit token budget; rerun with a larger budget for symbol details</warning>",
     ])
@@ -2915,6 +2846,9 @@ def render_prompt(packet: dict[str, object]) -> str:
     lines.extend([
         "    </missing_required_symbols>",
         "  </gitnexus_status>",
+    ])
+    lines.extend(render_gitnexus_analysis_lines(gitnexus, "  "))
+    lines.extend([
         "  <scope_rules>",
         "    Use files under <targets> as the first-pass edit/review surface.",
         "    Use workflow-index targets and symbols as the packet's source-orientation surface.",
@@ -2923,7 +2857,7 @@ def render_prompt(packet: dict[str, object]) -> str:
         "    Do not spawn sub-agents from Repo Context Forge output alone.",
         "    Cover every required coverage area in the parent session unless the current user turn explicitly asks for delegated agents.",
         "    Satisfy coverage_plan before GitNexus calls, GitHub review comments, review findings, or edits.",
-        "    Run the listed <gitnexus_required_checks> first as the initial GitNexus validation scoped to this packet.",
+        "    Consume <gitnexus_analysis> first; <gitnexus_required_checks> records the already-executed packet plan.",
         "    Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",
         "    Treat source dirty overlaps as warnings, not PR target files, when mode is pr.",
         "    Trust GitNexus blast-radius claims only when <gitnexus_status> is fresh or reindexed and required checks resolve.",
@@ -3272,6 +3206,28 @@ def output_text(text: str, out: Path | None) -> None:
         out.write_text(text, encoding="utf-8")
     else:
         print(text, end="")
+
+
+def write_json_atomic(path: Path, value: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def render_benchmark_markdown(report: dict[str, object]) -> str:

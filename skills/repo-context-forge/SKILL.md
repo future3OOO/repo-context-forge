@@ -54,11 +54,9 @@ rerun the bootstrap.
   first and deterministic synthetic fill is used without live LLM calls
 - use `<gitnexus_status><repo>` as the repo value for every GitNexus MCP call
 - in `pr` mode, do not treat dirty source-worktree files as PR targets
-- run the listed `<gitnexus_required_checks>` as the first GitNexus validation
-  step before editing production code; these checks are scoped to the
-  Forge packet and the freshly indexed analysis repo; if a required GitNexus
-  tool is not loaded, use tool discovery for that capability before reporting it
-  unavailable
+- consume `<gitnexus_analysis>` as the packet-scoped context/impact result; the
+  listed `<gitnexus_required_checks>` are its execution record, not manual calls
+  to repeat
 - for `pr`, use the live `base...HEAD` packet surface; for `local`, use dirty
   worktree packet targets; for `intent`, use the intent-ranked packet targets
 - do not let unscoped `gitnexus_detect_changes(compare)` choose the target
@@ -94,10 +92,15 @@ python3 "$SKILL_DIR/scripts/bootstrap.py" --repo "$PWD" --intent "<task>"
 
 ## GitNexus Follow-Up
 
-For each `<check>` in `<gitnexus_required_checks>`:
+Repo Context Forge already executes each unique check serially and binds results
+to file-resolved identities. Use the normalized `<gitnexus_analysis>` facts for
+the initial decision. Run an additional GitNexus call only for a specific
+follow-up question not answered by that bounded result.
 
-- `kind="symbol_context"` means call `gitnexus_context` for that symbol/file
-- `kind="symbol_impact"` means call `gitnexus_impact` upstream for that symbol
+The bootstrap exits nonzero after rendering and atomically writing a blocker packet.
+
+- `kind="symbol_context"` records file-disambiguated context
+- `kind="symbol_impact"` records impact accepted only against that resolved identity
 - if a GitNexus MCP call says the repo is missing or stale, rerun the bootstrap
   with `--gitnexus-mode auto`, then retry using the new `<gitnexus_status><repo>`
 - do not call `gitnexus_list_repos` during normal recovery; the packet repo is

@@ -196,6 +196,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--enforce-intake", action="store_true")
     parser.add_argument("--allow-stale-pr-head", action="store_true")
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--packet-json-out", type=Path)
     return parser.parse_args(argv)
 
 
@@ -271,9 +272,11 @@ def main(argv: list[str]) -> int:
         gitnexus_repo=args.gitnexus_repo,
         gitnexus_mode=args.gitnexus_mode,
     )
+    if args.packet_json_out:
+        forge.write_json_atomic(args.packet_json_out, packet)
     rendered = render_bootstrap_output(packet, args.enforce_intake)
     forge.output_text(rendered, args.out)
-    return 0
+    return 1 if packet.get("blocked") else 0
 
 
 if __name__ == "__main__":
