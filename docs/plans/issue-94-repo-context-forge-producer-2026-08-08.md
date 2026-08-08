@@ -9,7 +9,7 @@
 ## Objective
 
 - Canonicalize Repo Context Forge on one branch and implement only Issue #94's producer slice.
-- Success means one pushed PR head owns PR #2 behavior, PR #3's demonstrated reindex protection, and semantic GitNexus results from the existing `make_packet` Interface.
+- Success means one pushed Repo Context Forge PR head owns PR #2 behavior, PR #3's demonstrated reindex protection, truthful bounded semantic GitNexus results, and UID-selected impact through the existing `make_packet` Interface.
 
 ## Source Of Truth
 
@@ -27,7 +27,7 @@
 ## Contract And Proof Model
 
 - authoritativeContract: each check is identified by kind, file, target/resolved UID, and direction; results are accepted only against that identity and execute serially once.
-- invariants: maximum 20 checks; empty plan makes zero semantic calls; stale, malformed, failed, ambiguous, or mismatched results block; reindex is single-flight and suppresses core dumps.
+- invariants: maximum 20 selected checks; omitted checks are counted exactly and remain non-blocking; empty plan makes zero semantic calls; selected stale, malformed, failed, ambiguous, or mismatched results block; reindex is single-flight and suppresses core dumps.
 - proofPlan: real GitNexus duplicate-name public-bootstrap RED/GREEN, focused invariant tests, full suite, quality gate, GitNexus reanalysis, code review, Claude challenge, and current-head reviewer audit.
 
 ## Scope In
@@ -53,22 +53,25 @@
 
 ## Delivery Map
 
-- plan type: single-PR consolidation
-- PR count: 1
-- stack depth: 1
+- plan type: cross-repository dependency plus single Repo Context Forge consolidation PR
+- PR count: 2 across repositories
+- stack depth: GitNexus PR #3 is a dependency of Repo Context Forge PR #4; Repo Context Forge PR #4 remains stacked on Repo Context Forge PR #2
 - estimated net implementation: at or below 500 lines; stop and shrink before 1,000.
 - regroup rule: stop if the implementation creates a second owner or exceeds the split threshold.
 - deploy freeze: do not replace either live authority until the exact pushed head passes verification and reviewer audit; preserve each old location independently as a recoverable backup.
+- dependency gate: runtime activation requires GitNexus PR #3 commit `1841c6c` or a reviewed successor containing it; the released/installed 1.5.3 CLI lacks `impact --uid`. This task does not merge either PR and must not add a bare-name compatibility fallback.
 
 ## PR Plan
 
 | PR | Branch | Base | Owner Slice | Commit Structure | Verification | Entry | Exit |
 |---|---|---|---|---|---|---|---|
+| GitNexus #3 | `codex/uid-impact-selector` | GitNexus `main` `cb772b9` | expose existing UID impact through current CLI/MCP Interface | one dependency commit | real duplicate-name DB test, CLI E2E, typecheck/build, reviewer gates | clean isolated clone | pushed clean dependency head; no merge |
 | A | `codex/issue-94-graph-analysis` | PR #2 `0cbbd10` | Repo Context Forge producer only | PR #3 safety; producer TDD/implementation; review fixes if needed | real-seam test, full suite, quality/GitNexus/advisor/reviewer gates | clean isolated clone | pushed clean head and matching clean install |
 
 ## Verification Plan
 
 - targeted tests: duplicate symbol identity, empty plan, canonical dedup, normalization/bounds/failure, packet JSON atomicity.
+- performance evidence: repeated, same-fixture PR #2 versus PR #4 bootstrap timings and graph process counts; the governed DeepSWE benchmark remains deferred to the consumer half of Issue #94.
 - combined workflow proof: public bootstrap against a real temporary Git repository and real GitNexus CLI.
 - focused invariant checks: PR #3 lock/core-dump tests and source-cleanliness tests.
 - full gate: `PYTHONPATH=. python3 tests/test_repo_context_forge.py`, `git diff --check`, production-code gate.
@@ -80,6 +83,10 @@
 - [x] preserve PR #3 safety and produce duplicate-name RED
 - [x] implement producer result and atomic packet output
 - [x] run full verification, review, and Claude challenge
+- [x] publish GitNexus UID-impact dependency PR #3 at `1841c6cbd405e7059b68d456477982a79fbe101c`
+- [x] report exact omitted-check count non-blockingly through analysis, JSON, and prompt
+- [x] consume context-resolved UID through the dependency and make the real duplicate-name test pass
+- [x] record repeated PR #2-versus-PR #4 timing evidence in `docs/plans/issue-94-pr2-pr4-timing-evidence-2026-08-08.md`
 - [ ] commit, push, open/update PR, and close current-head reviewer loop
 - [ ] back up and replace live install with the exact pushed commit
 - [ ] record exact donor/overlay dispositions and final identity proof
@@ -90,3 +97,6 @@
 - 2026-08-08: quality-gate precheck required the touched 3,454-line owner to shrink; moved only its cohesive GitNexus registry/freshness/locking/execution boundary into the issue-specified Graph Analysis Module. Serial process count and runtime behavior remain unchanged.
 - 2026-08-08: precommit advisor findings: fixed missing public exit-0 proof and blocker-exit documentation; rejected weakening duplicate-name blockers because Issue #94 explicitly requires unresolved results to block; rejected removing authority/producer revision because both are required result fields.
 - 2026-08-08: current-head review fixes write machine JSON for early blockers, preserve context/impact pairs and the 20-check cap, align operator wording, and clarify the PR #3 authority/donor disposition. Replaced the two programmed-collaborator reindex tests with an explicit assertion on the real public reindex path. Full suite: 94 passed; producer-donor and review-fix quality gates: `ok: true`; Standards and producer-slice Spec reviews: zero findings.
+- 2026-08-08: OPS follow-up admitted two production occurrences: silent cap omission and duplicate-name impact refusal. Published the minimal GitNexus dependency as future3OOO/GitNexus#3; this plan now governs its Repo Context Forge consumer, truthful non-blocking omission reporting, and focused timing evidence.
+- 2026-08-08: follow-up RED/GREEN complete against exact GitNexus dependency `1841c6c`: 24 canonical checks report 20 selected and 4 omitted without blocking; duplicate-name context and impact resolve both file-scoped UIDs. Full suite: 95 passed. Follow-up and PR #2-base production gates pass; Standards and producer-slice Spec reviews have zero findings.
+- 2026-08-08: precommit challenge confirmed the implementation but blocked live activation on dependency ordering: installed package version 1.5.3 is not the PR #3 build. Recorded the exact-commit gate and rejected a compatibility shim; no merge performed.

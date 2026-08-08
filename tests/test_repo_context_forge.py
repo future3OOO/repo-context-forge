@@ -98,7 +98,6 @@ class RepoContextForgeTests(unittest.TestCase):
             plan,
             status,
             run_command=repo_context_forge.run_cmd,
-            max_checks=repo_context_forge.MAX_GITNEXUS_CHECKS,
             **kwargs,
         )
 
@@ -163,7 +162,7 @@ class RepoContextForgeTests(unittest.TestCase):
         )
 
     def test_build_gitnexus_plan_prefers_callable_symbols(self) -> None:
-        plan = repo_context_forge.build_gitnexus_plan(
+        plan, omitted_checks = repo_context_forge.build_gitnexus_plan(
             [
                 {
                     "path": "src/a.py",
@@ -187,6 +186,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 },
             ],
         )
+        self.assertEqual(omitted_checks, 0)
 
     def test_build_gitnexus_plan_never_splits_context_impact_pair_at_cap(self) -> None:
         entries = [{"path": "README.md", "symbols": []}]
@@ -198,7 +198,7 @@ class RepoContextForgeTests(unittest.TestCase):
             for index in range(10)
         )
 
-        plan = repo_context_forge.build_gitnexus_plan(entries)
+        plan, omitted_checks = repo_context_forge.build_gitnexus_plan(entries)
 
         self.assertLessEqual(len(plan), repo_context_forge.MAX_GITNEXUS_CHECKS)
         symbol_checks = {
@@ -212,11 +212,13 @@ class RepoContextForgeTests(unittest.TestCase):
             if item["kind"] == "symbol_impact"
         }
         self.assertEqual(symbol_checks.keys(), impact_checks.keys())
+        self.assertEqual(omitted_checks, 2)
 
-        file_plan = repo_context_forge.build_gitnexus_plan(
+        file_plan, omitted_file_checks = repo_context_forge.build_gitnexus_plan(
             [{"path": f"docs/{index}.md", "symbols": []} for index in range(21)]
         )
         self.assertEqual(len(file_plan), repo_context_forge.MAX_GITNEXUS_CHECKS)
+        self.assertEqual(omitted_file_checks, 1)
 
     def test_public_bootstrap_keeps_duplicate_symbol_names_file_scoped(self) -> None:
         self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
@@ -251,6 +253,8 @@ class RepoContextForgeTests(unittest.TestCase):
                     str(repo),
                     "--mode",
                     "repo",
+                    "--top",
+                    "3",
                     "--cache-dir",
                     cache_dir,
                     "--map-build",
@@ -264,13 +268,13 @@ class RepoContextForgeTests(unittest.TestCase):
                 allow_fail=True,
             )
 
-            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
             self.assertTrue(packet_path.exists())
             packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
-            self.assertTrue(packet["blocked"])
+            self.assertNotIn("blocked", packet)
             analysis = packet["gitnexus"]["analysis"]
-            self.assertEqual(analysis["graph_call_count"], 7)
-            self.assertEqual(analysis["process_count"], 7)
+            self.assertEqual(analysis["graph_call_count"], 6)
+            self.assertEqual(analysis["process_count"], 6)
             self.assertLessEqual(
                 analysis["output_bytes"],
                 analysis["graph_call_count"] * repo_context_forge.gitnexus_analysis.MAX_OUTPUT_BYTES,
@@ -293,10 +297,14 @@ class RepoContextForgeTests(unittest.TestCase):
                 {"Function:src/a.py:connect", "Function:src/b.py:connect"},
             )
             self.assertEqual(
-                [entry["status"] for entry in connect_entries].count("unresolved"),
-                1,
+                [entry["status"] for entry in connect_entries],
+                ["resolved"] * 4,
             )
-            self.assertIn("<blocker", result.stdout)
+            self.assertEqual(
+                {entry["resolved_identity"] for entry in connect_entries},
+                {"Function:src/a.py:connect", "Function:src/b.py:connect"},
+            )
+            self.assertNotIn("<blocker", result.stdout)
             self.assertIn(
                 '<check kind="symbol_context" target="connect" file="src/a.py"',
                 result.stdout,
@@ -313,6 +321,60 @@ class RepoContextForgeTests(unittest.TestCase):
                 '<check kind="symbol_impact" target="connect" file="src/b.py" direction="upstream"',
                 result.stdout,
             )
+
+    def test_public_bootstrap_reports_exact_omitted_check_count_non_blocking(self) -> None:
+        self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
+        with (
+            tempfile.TemporaryDirectory() as repo_dir,
+            tempfile.TemporaryDirectory() as cache_dir,
+            tempfile.TemporaryDirectory() as runtime_home,
+        ):
+            repo = Path(repo_dir)
+            packet_path = Path(runtime_home) / "packet.json"
+            self.make_git_repo(repo)
+            (repo / "src" / "many.py").write_text(
+                "".join(
+                    f"def handle_{index}():\n    return {index}\n\n" for index in range(12)
+                ),
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "many callables"])
+
+            result = repo_context_forge.run_cmd(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "codex_context_bootstrap.py"),
+                    "--repo",
+                    str(repo),
+                    "--mode",
+                    "repo",
+                    "--top",
+                    "1",
+                    "--cache-dir",
+                    cache_dir,
+                    "--map-build",
+                    "never",
+                    "--gitnexus-mode",
+                    "auto",
+                    "--enforce-intake",
+                    "--packet-json-out",
+                    str(packet_path),
+                ],
+                env={**os.environ, "HOME": runtime_home},
+                allow_fail=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
+            analysis = packet["gitnexus"]["analysis"]
+            self.assertEqual(len(analysis["entries"]), repo_context_forge.MAX_GITNEXUS_CHECKS)
+            self.assertEqual(analysis["omitted_check_count"], 4)
+            self.assertNotIn("plan_capacity_reached", analysis)
+            self.assertTrue(packet["gitnexus"]["required_checks_resolved"])
+            self.assertNotIn("blocked", packet)
+            self.assertIn("omitted_checks=4; omissions_blocking=false", result.stdout)
+            self.assertIn('omitted_checks="4" omissions_blocking="false"', result.stdout)
 
     def test_public_bootstrap_emits_resolved_graph_analysis(self) -> None:
         self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")

@@ -1706,10 +1706,10 @@ def make_target_entries(
 
 
 def build_gitnexus_plan(
-    target_entries: list[dict[str, object]],
-    repo_name: str | None = None,
-) -> list[dict[str, str]]:
+    target_entries: list[dict[str, object]], repo_name: str | None = None
+) -> tuple[list[dict[str, str]], int]:
     plan: list[dict[str, str]] = []
+    omitted_checks = 0
     seen: set[tuple[str, str, str, str]] = set()
     for entry in target_entries:
         path = str(entry["path"])
@@ -1717,13 +1717,14 @@ def build_gitnexus_plan(
         if not isinstance(symbols, list) or not symbols:
             key = ("file_context", path, path, "")
             if key not in seen:
+                seen.add(key)
                 if len(plan) >= MAX_GITNEXUS_CHECKS:
-                    return plan
+                    omitted_checks += 1
+                    continue
                 item = {"kind": "file_context", "file": path, "target": path}
                 if repo_name:
                     item["repo"] = repo_name
                 plan.append(item)
-                seen.add(key)
             continue
         for symbol in symbols:
             if not isinstance(symbol, dict):
@@ -1734,12 +1735,7 @@ def build_gitnexus_plan(
             if symbol.get("kind") not in {"function", "class", "method"}:
                 continue
             context_item = {"kind": "symbol_context", "target": name, "file": path}
-            impact_item = {
-                "kind": "symbol_impact",
-                "target": name,
-                "file": path,
-                "direction": "upstream",
-            }
+            impact_item = dict(kind="symbol_impact", target=name, file=path, direction="upstream")
             if repo_name:
                 context_item["repo"] = repo_name
                 impact_item["repo"] = repo_name
@@ -1747,11 +1743,12 @@ def build_gitnexus_plan(
             impact_key = ("symbol_impact", path, name, "upstream")
             if context_key in seen and impact_key in seen:
                 continue
-            if len(plan) + 2 > MAX_GITNEXUS_CHECKS:
-                return plan
-            plan.extend((context_item, impact_item))
             seen.update((context_key, impact_key))
-    return plan
+            if len(plan) + 2 > MAX_GITNEXUS_CHECKS:
+                omitted_checks += 2
+                continue
+            plan.extend((context_item, impact_item))
+    return plan, omitted_checks
 
 
 semantic_summary_section = workflow_index.semantic_summary
@@ -1797,6 +1794,7 @@ def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> 
     lines = [
         f'{indent}<gitnexus_analysis status="{html.escape(str(analysis.get("status") or "unknown"))}" '
         f'graph_calls="{html.escape(str(analysis.get("graph_call_count") or 0))}" '
+        f'omitted_checks="{html.escape(str(analysis.get("omitted_check_count") or 0))}" omissions_blocking="false" '
         f'elapsed_ms="{html.escape(str(analysis.get("elapsed_ms") or 0))}" '
         f'output_bytes="{html.escape(str(analysis.get("output_bytes") or 0))}">'
     ]
@@ -2119,10 +2117,9 @@ def make_packet(
     )
     index_freshness_status = str(gitnexus_status.get("status") or "unknown")
     gitnexus_repo_name = str(gitnexus_status.get("repo") or gitnexus_repo or target_state.analysis_repo.name)
-    plan = build_gitnexus_plan(target_entries, gitnexus_repo_name)
+    plan, omitted_check_count = build_gitnexus_plan(target_entries, gitnexus_repo_name)
     gitnexus_status = gitnexus_analysis.execute(
-        plan, gitnexus_status, run_command=run_cmd, max_checks=MAX_GITNEXUS_CHECKS,
-    )
+        plan, gitnexus_status, run_command=run_cmd, omitted_check_count=omitted_check_count)
     analysis = gitnexus_status.get("analysis")
     if isinstance(analysis, dict):
         analysis["authority"] = {
@@ -2508,6 +2505,8 @@ def render_required_intake(packet: dict[str, object]) -> str:
             "gitnexus_analysis: "
             f"status={analysis.get('status') or 'unknown'}; "
             f"graph_calls={analysis.get('graph_call_count') or 0}; "
+            f"omitted_checks={analysis.get('omitted_check_count') or 0}; "
+            "omissions_blocking=false; "
             f"unresolved={len(unresolved) if isinstance(unresolved, list) else 0}; "
             f"elapsed_ms={analysis.get('elapsed_ms') or 0}"
         )

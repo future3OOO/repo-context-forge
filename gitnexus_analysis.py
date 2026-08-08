@@ -253,7 +253,7 @@ def execute(
     gitnexus_status: dict[str, object],
     *,
     run_command: RunCommand,
-    max_checks: int,
+    omitted_check_count: int = 0,
     gitnexus_bin: str | None = None,
 ) -> dict[str, object]:
     started = time.monotonic()
@@ -266,7 +266,7 @@ def execute(
         "graph_call_count": 0,
         "output_bytes": 0,
         "estimated_output_tokens": 0,
-        "plan_capacity_reached": len(plan) >= max_checks,
+        "omitted_check_count": omitted_check_count,
     }
     gitnexus_status["analysis"] = analysis
     if gitnexus_status.get("status") not in {"fresh", "reindexed"}:
@@ -307,10 +307,16 @@ def execute(
         elif kind == "symbol_context":
             command = [binary, "context", "-r", repo_name, "-f", file_path, target]
         elif kind == "symbol_impact":
+            expected_identity = resolved_symbols.get((file_path, target))
+            if not expected_identity:
+                entry["diagnostic"] = "GitNexus impact has no file-resolved context identity"
+                unresolved.append(dict(entry))
+                continue
             command = [
                 binary,
                 "impact",
-                target,
+                "--uid",
+                expected_identity,
                 "-d",
                 direction or "upstream",
                 "-r",
