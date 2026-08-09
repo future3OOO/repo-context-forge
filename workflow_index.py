@@ -14,7 +14,7 @@ from typing import Callable, Iterable
 
 INDEX_DIR = ".repo-context-forge"
 INDEX_DB = "workflow-index.sqlite3"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 SOURCE_EXTENSIONS = {".js", ".jsx", ".mjs", ".py", ".ts", ".tsx"}
 STRUCTURED_EXTENSIONS = {".json", ".toml", ".yaml", ".yml"}
 FILE_COLUMNS = "path, base_score, symbol_count, line_count, base_rank"
@@ -407,8 +407,7 @@ class WorkflowIndex:
             ]
         elif extension in SOURCE_EXTENSIONS:
             patterns = [
-                ("function", r"^\s*export\s+(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\("),
-                ("function", r"^\s*(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\("),
+                ("function", r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)(?:<(?:[^<>()]|<[^<>()]*>)+>)?\s*\("),
                 ("class", r"^\s*export\s+(?:default\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"),
                 ("class", r"^\s*class\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"),
                 ("arrow", r"^\s*(?:export\s+)?const\s+([A-Za-z_$][A-Za-z0-9_$]*)(?:\s*:\s*.*?)?\s*=\s*(?:async\s*)?(?:<[^<>()]+>\s*)?\("),

@@ -1393,7 +1393,7 @@ class RepoContextForgeTests(unittest.TestCase):
             with closing(sqlite3.connect(native_index.db_path)) as conn, conn:
                 conn.execute("UPDATE symbols SET end_line = line")
                 conn.execute(
-                    "UPDATE metadata SET value = '5' WHERE key = 'schema_version'"
+                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'"
                 )
 
             head_sha = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
@@ -1640,6 +1640,11 @@ class RepoContextForgeTests(unittest.TestCase):
                 "const generic = <T>(\n"
                 "  value: T,\n"
                 "): T => value;\n\n"
+                "async function fetchAllPages<TItem, TResponse extends PaginatedResponse<TItem>>(\n"
+                "  value: TItem,\n"
+                "): Promise<TItem> {\n"
+                "  return value;\n"
+                "}\n\n"
                 "const single = value => value.trim();\n\n"
                 "const after = () => 0;\n",
                 encoding="utf-8",
@@ -1660,6 +1665,8 @@ class RepoContextForgeTests(unittest.TestCase):
                     "): string => value;", "): string => (value);"
                 ).replace(
                     "): T => value;", "): T => (value);"
+                ).replace(
+                    "return value;", "return await Promise.resolve(value);"
                 ).replace("value.trim()", "value.toUpperCase()"),
                 encoding="utf-8",
             )
@@ -1693,7 +1700,7 @@ class RepoContextForgeTests(unittest.TestCase):
                     symbol["name"]
                     for symbol in by_path["src/transform.ts"]["changed_symbols"]
                 ],
-                ["transform", "generic", "single"],
+                ["transform", "generic", "fetchAllPages", "single"],
             )
 
     def test_packet_does_not_attribute_trailing_module_code(self) -> None:
