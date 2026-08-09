@@ -1393,7 +1393,7 @@ class RepoContextForgeTests(unittest.TestCase):
             with closing(sqlite3.connect(native_index.db_path)) as conn, conn:
                 conn.execute("UPDATE symbols SET end_line = line")
                 conn.execute(
-                    "UPDATE metadata SET value = '2' WHERE key = 'schema_version'"
+                    "UPDATE metadata SET value = '3' WHERE key = 'schema_version'"
                 )
 
             head_sha = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
@@ -1637,6 +1637,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 "const transform = (\n"
                 "  value: string,\n"
                 "): string => value;\n\n"
+                "const single = value => value.trim();\n\n"
                 "const after = () => 0;\n",
                 encoding="utf-8",
             )
@@ -1654,7 +1655,7 @@ class RepoContextForgeTests(unittest.TestCase):
             typescript_path.write_text(
                 typescript_path.read_text(encoding="utf-8").replace(
                     "value: string", "value: number"
-                ),
+                ).replace("value.trim()", "value.toUpperCase()"),
                 encoding="utf-8",
             )
             state = repo_context_forge.read_git_state(repo, "HEAD", "HEAD")
@@ -1687,7 +1688,7 @@ class RepoContextForgeTests(unittest.TestCase):
                     symbol["name"]
                     for symbol in by_path["src/transform.ts"]["changed_symbols"]
                 ],
-                ["transform"],
+                ["transform", "single"],
             )
 
     def test_packet_does_not_attribute_trailing_module_code(self) -> None:
