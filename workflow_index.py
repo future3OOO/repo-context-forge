@@ -6,14 +6,14 @@ import re
 import sqlite3
 import tempfile
 from contextlib import AbstractContextManager, closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
 
 INDEX_DIR = ".repo-context-forge"
 INDEX_DB = "workflow-index.sqlite3"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SOURCE_EXTENSIONS = {".js", ".jsx", ".mjs", ".py", ".ts", ".tsx"}
 STRUCTURED_EXTENSIONS = {".json", ".toml", ".yaml", ".yml"}
 FILE_COLUMNS = "path, base_score, symbol_count, line_count, base_rank"
@@ -413,9 +413,11 @@ class WorkflowIndex:
                 ("arrow", r"^\s*(?:export\s+)?const\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?\("),
             ]
         symbols: list[IndexedSymbol] = []
+        indentations: list[int] = []
         seen: set[tuple[str, int]] = set()
         offset = 0
-        for line_number, raw_line in enumerate(content.splitlines(keepends=True), start=1):
+        lines = content.splitlines(keepends=True)
+        for line_number, raw_line in enumerate(lines, start=1):
             line = raw_line.rstrip("\r\n")
             for kind, pattern in patterns:
                 match = re.search(pattern, line)
@@ -430,6 +432,7 @@ class WorkflowIndex:
                 if key in seen:
                     continue
                 seen.add(key)
+                indentations.append(len(line) - len(line.lstrip()))
                 symbol_kind = "function" if kind == "arrow" else kind
                 symbols.append(
                     IndexedSymbol(
@@ -447,6 +450,13 @@ class WorkflowIndex:
                     )
                 )
             offset += len(raw_line)
+        for index, symbol in enumerate(symbols):
+            end_line = len(lines)
+            for next_index in range(index + 1, len(symbols)):
+                if indentations[next_index] <= indentations[index]:
+                    end_line = symbols[next_index].line - 1
+                    break
+            symbols[index] = replace(symbol, end_line=end_line)
         return symbols
 
     @staticmethod
