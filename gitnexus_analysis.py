@@ -211,7 +211,7 @@ def _references(value: object) -> list[dict[str, str]]:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            identity = str(item.get("uid") or "")
+            identity = str(item.get("uid") or item.get("id") or "")
             if not identity or identity in seen:
                 continue
             references.append(
