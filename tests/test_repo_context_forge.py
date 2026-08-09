@@ -1383,7 +1383,7 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertFalse(status["available"])
             self.assertIn("head_sha", str(status["warning"]))
 
-    def test_workflow_index_rebuilds_pre_span_schema(self) -> None:
+    def test_workflow_index_rebuilds_previous_span_schema(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:
             repo = Path(repo_dir)
             self.make_git_repo(repo)
@@ -1393,7 +1393,7 @@ class RepoContextForgeTests(unittest.TestCase):
             with closing(sqlite3.connect(native_index.db_path)) as conn, conn:
                 conn.execute("UPDATE symbols SET end_line = line")
                 conn.execute(
-                    "UPDATE metadata SET value = '1' WHERE key = 'schema_version'"
+                    "UPDATE metadata SET value = '2' WHERE key = 'schema_version'"
                 )
 
             head_sha = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
@@ -1628,7 +1628,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 "    def test_body(self):\n"
                 "        return 1\n"
                 + "".join(f"    filler_{index} = {index}\n" for index in range(401))
-                + "\ndef after():\n"
+                + "\ndef after():  # body follows\n"
                 "    return 0\n"
             )
             python_path.write_text(python_source, encoding="utf-8")
@@ -1646,7 +1646,10 @@ class RepoContextForgeTests(unittest.TestCase):
             repo_context_forge.run_git(repo, ["commit", "-m", "symbol bodies"])
 
             python_path.write_text(
-                python_source.replace("return 1", "return 2"), encoding="utf-8"
+                python_source.replace("return 1", "return 2").replace(
+                    "return 0", "return 9"
+                ),
+                encoding="utf-8",
             )
             typescript_path.write_text(
                 typescript_path.read_text(encoding="utf-8").replace(
@@ -1673,7 +1676,7 @@ class RepoContextForgeTests(unittest.TestCase):
                     symbol["name"]
                     for symbol in by_path["tests/test_service.py"]["changed_symbols"]
                 ],
-                ["ServiceTests"],
+                ["ServiceTests", "after"],
             )
             self.assertIn(
                 "broad_test_container",
@@ -1685,6 +1688,93 @@ class RepoContextForgeTests(unittest.TestCase):
                     for symbol in by_path["src/transform.ts"]["changed_symbols"]
                 ],
                 ["transform"],
+            )
+
+    def test_packet_does_not_attribute_trailing_module_code(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            python_path = repo / "src" / "service.py"
+            python_path.write_text(
+                'def handle(sep="("):\n    return sep\n\nSETTING = 1\n',
+                encoding="utf-8",
+            )
+            typescript_path = repo / "src" / "service.ts"
+            typescript_path.write_text(
+                "function handle(value: string) {\n"
+                "  return `'${String(value).replace(/'/g, `'\\\"'\\\"'`)}'`;\n"
+                "}\n\n"
+                "const setting = 1;\n",
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "src/service.py", "src/service.ts"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "module code"])
+
+            python_path.write_text(
+                python_path.read_text(encoding="utf-8").replace(
+                    "SETTING = 1", "SETTING = 2"
+                ),
+                encoding="utf-8",
+            )
+            typescript_path.write_text(
+                typescript_path.read_text(encoding="utf-8").replace(
+                    "setting = 1", "setting = 2"
+                ),
+                encoding="utf-8",
+            )
+            state = repo_context_forge.read_git_state(repo, "HEAD", "HEAD")
+            native_index = self.build_workflow_index(repo)
+            entries = repo_context_forge.make_target_entries(
+                mode="local",
+                source_repo=repo,
+                analysis_repo=repo,
+                base_ref="HEAD",
+                head_ref="HEAD",
+                source_git_state=state,
+                soul_map=repo_context_forge.SoulForgeMap(repo, native_index),
+                targets=["src/service.py", "src/service.ts"],
+            )
+
+            self.assertEqual(
+                {str(entry["path"]): entry["changed_symbols"] for entry in entries},
+                {"src/service.py": [], "src/service.ts": []},
+            )
+
+    def test_packet_attributes_python_decorator_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            source = repo / "src" / "decorated.py"
+            source.write_text(
+                "def marker(value):\n"
+                "    return value\n\n"
+                "@marker\n"
+                "def handle():\n"
+                "    return 1\n",
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "src/decorated.py"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "decorated symbol"])
+            source.write_text(
+                source.read_text(encoding="utf-8").replace("@marker", "@marker()"),
+                encoding="utf-8",
+            )
+            state = repo_context_forge.read_git_state(repo, "HEAD", "HEAD")
+            native_index = self.build_workflow_index(repo)
+            entries = repo_context_forge.make_target_entries(
+                mode="local",
+                source_repo=repo,
+                analysis_repo=repo,
+                base_ref="HEAD",
+                head_ref="HEAD",
+                source_git_state=state,
+                soul_map=repo_context_forge.SoulForgeMap(repo, native_index),
+                targets=["src/decorated.py"],
+            )
+
+            self.assertEqual(
+                [symbol["name"] for symbol in entries[0]["changed_symbols"]],
+                ["handle"],
             )
 
     def test_workflow_index_relates_python_test_companions(self) -> None:

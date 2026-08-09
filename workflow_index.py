@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import tokenize
 from contextlib import AbstractContextManager, closing
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import Callable, Iterable
 
 INDEX_DIR = ".repo-context-forge"
 INDEX_DB = "workflow-index.sqlite3"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SOURCE_EXTENSIONS = {".js", ".jsx", ".mjs", ".py", ".ts", ".tsx"}
 STRUCTURED_EXTENSIONS = {".json", ".toml", ".yaml", ".yml"}
 FILE_COLUMNS = "path, base_score, symbol_count, line_count, base_rank"
@@ -451,13 +452,219 @@ class WorkflowIndex:
                 )
             offset += len(raw_line)
         for index, symbol in enumerate(symbols):
-            end_line = len(lines)
-            for next_index in range(index + 1, len(symbols)):
-                if indentations[next_index] <= indentations[index]:
-                    end_line = symbols[next_index].line - 1
+            if extension != ".py":
+                stop_line = len(lines)
+                for next_index in range(index + 1, len(symbols)):
+                    if indentations[next_index] <= indentations[index]:
+                        stop_line = symbols[next_index].line - 1
+                        break
+                symbols[index] = replace(
+                    symbol,
+                    end_line=WorkflowIndex._javascript_end_line(
+                        lines, symbol.line, stop_line
+                    ),
+                )
+                continue
+            start_line = symbol.line
+            cursor = symbol.line - 1
+            while cursor >= 1:
+                candidate = lines[cursor - 1]
+                stripped = candidate.strip()
+                candidate_indentation = len(candidate) - len(candidate.lstrip())
+                if not stripped or candidate_indentation < indentations[index]:
                     break
-            symbols[index] = replace(symbol, end_line=end_line)
+                if candidate_indentation == indentations[index]:
+                    if stripped.startswith("@"):
+                        start_line = cursor
+                    elif not stripped.startswith((")", "]")):
+                        break
+                cursor -= 1
+            header_end, inline_suite = WorkflowIndex._python_header(
+                lines, symbol.line
+            )
+            end_line = header_end
+            if not inline_suite:
+                end_line = len(lines)
+                triple_quote = ""
+                for line_number in range(header_end + 1, len(lines) + 1):
+                    candidate = lines[line_number - 1]
+                    stripped = candidate.strip()
+                    if triple_quote:
+                        if candidate.count(triple_quote) % 2:
+                            triple_quote = ""
+                        continue
+                    if (
+                        stripped
+                        and not stripped.startswith("#")
+                        and len(candidate) - len(candidate.lstrip())
+                        <= indentations[index]
+                    ):
+                        end_line = line_number - 1
+                        break
+                    marker = min(
+                        (
+                            (candidate.find(quote), quote)
+                            for quote in ('"""', "'''")
+                            if candidate.count(quote) % 2
+                        ),
+                        default=(-1, ""),
+                    )[1]
+                    if marker:
+                        triple_quote = marker
+            symbols[index] = replace(
+                symbol, line=start_line, end_line=max(start_line, end_line)
+            )
         return symbols
+
+    @staticmethod
+    def _python_header(lines: list[str], start_line: int) -> tuple[int, bool]:
+        depth = 0
+        for line_number in range(start_line, len(lines) + 1):
+            line = lines[line_number - 1]
+            if any(marker in line for marker in ('"', "'", "#")):
+                break
+            depth += line.count("(") - line.count(")")
+            if depth <= 0 and ":" in line:
+                return line_number, bool(line.rsplit(":", 1)[-1].strip())
+        source = iter(lines[start_line - 1 :])
+        depth = 0
+        try:
+            tokens = tokenize.generate_tokens(lambda: next(source, ""))
+            for token in tokens:
+                if token.type == tokenize.OP:
+                    if token.string in "([{":
+                        depth += 1
+                    elif token.string in ")]}":
+                        depth -= 1
+                    elif token.string == ":" and depth == 0:
+                        header_end = start_line + token.start[0] - 1
+                        for following in tokens:
+                            if following.type in {
+                                tokenize.COMMENT,
+                                tokenize.INDENT,
+                                tokenize.NL,
+                            }:
+                                continue
+                            return header_end, following.type != tokenize.NEWLINE
+                        return header_end, False
+        except (IndentationError, tokenize.TokenError):
+            pass
+        return start_line, False
+
+    @staticmethod
+    def _javascript_end_line(
+        lines: list[str], start_line: int, stop_line: int
+    ) -> int:
+        indentation = len(lines[start_line - 1]) - len(lines[start_line - 1].lstrip())
+        quote = ""
+        escaped = False
+        block_comment = False
+        templates: list[int | None] = []
+        parentheses = 0
+        brackets = 0
+        braces = 0
+        for line_number in range(start_line, stop_line + 1):
+            line = lines[line_number - 1]
+            stripped = line.strip()
+            if (
+                line_number > start_line
+                and not (
+                    quote
+                    or block_comment
+                    or templates
+                    or parentheses
+                    or brackets
+                    or braces
+                )
+                and stripped
+                and len(line) - len(line.lstrip()) <= indentation
+            ):
+                return line_number - 1
+            index = 0
+            while index < len(line):
+                char = line[index]
+                pair = line[index : index + 2]
+                if templates and templates[-1] is None:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == "`":
+                        templates.pop()
+                    elif pair == "${":
+                        templates[-1] = braces
+                        braces += 1
+                        index += 2
+                        continue
+                elif block_comment:
+                    if pair == "*/":
+                        block_comment = False
+                        index += 2
+                        continue
+                elif quote:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == quote:
+                        quote = ""
+                elif pair == "//":
+                    break
+                elif pair == "/*":
+                    block_comment = True
+                    index += 2
+                    continue
+                elif char == "/":
+                    prefix = line[:index].rstrip()
+                    previous = prefix[-1:] if prefix else ""
+                    word = re.search(r"([A-Za-z_$][A-Za-z0-9_$]*)$", prefix)
+                    if (
+                        not prefix
+                        or previous in "([{:;,=!?&|+-*%^~<>"
+                        or (word and word.group(1) in {"case", "return", "throw", "yield"})
+                    ):
+                        regex_end = None
+                        cursor = index + 1
+                        in_character_class = False
+                        while cursor < len(line):
+                            if line[cursor] == "\\":
+                                cursor += 2
+                                continue
+                            if line[cursor] == "[":
+                                in_character_class = True
+                            elif line[cursor] == "]":
+                                in_character_class = False
+                            elif line[cursor] == "/" and not in_character_class:
+                                regex_end = cursor + 1
+                                break
+                            cursor += 1
+                        if regex_end is not None:
+                            index = regex_end
+                            continue
+                elif char in {'"', "'"}:
+                    quote = char
+                elif char == "`":
+                    templates.append(None)
+                elif char == "(":
+                    parentheses += 1
+                elif char == ")" and parentheses:
+                    parentheses -= 1
+                elif char == "[":
+                    brackets += 1
+                elif char == "]" and brackets:
+                    brackets -= 1
+                elif char == "{":
+                    braces += 1
+                elif char == "}" and braces:
+                    braces -= 1
+                    if (
+                        templates
+                        and templates[-1] is not None
+                        and braces == templates[-1]
+                    ):
+                        templates[-1] = None
+                index += 1
+        return stop_line
 
     @staticmethod
     def _is_arrow_initializer(content: str, open_paren: int) -> bool:
