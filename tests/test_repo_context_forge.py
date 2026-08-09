@@ -485,6 +485,14 @@ class RepoContextForgeTests(unittest.TestCase):
                 )
             )
             self.assertGreater(packet["gitnexus"]["analysis"]["graph_call_count"], 0)
+            handle_impact = next(
+                entry
+                for entry in packet["gitnexus"]["analysis"]["entries"]
+                if entry["kind"] == "symbol_impact"
+                and entry["target"] == "handle"
+                and entry["direction"] == "upstream"
+            )
+            self.assertIn("src/use.py", handle_impact["impacted_files"])
             self.assertIn('<gitnexus_analysis status="resolved"', result.stdout)
 
     def test_rank_target_entry_prioritizes_changed_production_over_broad_test(self) -> None:
