@@ -1393,7 +1393,7 @@ class RepoContextForgeTests(unittest.TestCase):
             with closing(sqlite3.connect(native_index.db_path)) as conn, conn:
                 conn.execute("UPDATE symbols SET end_line = line")
                 conn.execute(
-                    "UPDATE metadata SET value = '3' WHERE key = 'schema_version'"
+                    "UPDATE metadata SET value = '4' WHERE key = 'schema_version'"
                 )
 
             head_sha = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
@@ -1634,7 +1634,7 @@ class RepoContextForgeTests(unittest.TestCase):
             python_path.write_text(python_source, encoding="utf-8")
             typescript_path = repo / "src" / "transform.ts"
             typescript_path.write_text(
-                "const transform = (\n"
+                "const transform: (value: string) => string = (\n"
                 "  value: string,\n"
                 "): string => value;\n\n"
                 "const single = value => value.trim();\n\n"
