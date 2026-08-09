@@ -2,9 +2,11 @@
 
 ## Status
 
-- current state: in progress
+- current state: canonical producer implementation complete; merge and dependency activation remain
 - governing artifact: this file
 - last updated: 2026-08-09
+- canonical PR: Repo Context Forge PR #4, branch `codex/issue-94-graph-analysis`, targets `main`
+- canonical producer/runtime commit/tree: `68819f7135f517e4a23b97e4b2c6a0413a5a012b` / `07377bb7d83abebc9eac7a385922b1cbd27c1531`
 
 ## Objective
 
@@ -14,9 +16,9 @@
 ## Source Of Truth
 
 - authority: Issue #94 and the user's bounded producer-slice request
-- trusted base: Repo Context Forge PR #2 head `0cbbd10fb7b4d0c98244a0fccb61f6de0a6913b2`
-- initial live authorities: Claude executed clean `/home/prop_/projects/repo-context-forge` at PR #3 head `63be87513ec51b05976726977e3a43a0ce5bb774`; Codex executed separate dirty `/home/prop_/.codex/plugins/cache/local-codex-plugins/repo-context-forge/0.1.0` at `b5910a6c772c5640eed254c9d66ef8928e882837` plus its overlay. Both active paths are now clean at the prior canonical PR #4 head `ec4ee237f4c643e5bfda54654dc8a81b8e8f80f6`; final-candidate activation remains frozen until the new pushed head passes review.
-- donors: PR #3 `f5b6f9421b2e76169614c42588b7ed0ce2803f9a` for single-flight/core-dump protection; both live authorities are comparison evidence and must be reconciled, not described as one install.
+- base: Repo Context Forge `main`; PR #4 contains PR #2's complete ancestry through `0cbbd10fb7b4d0c98244a0fccb61f6de0a6913b2`
+- initial live authorities: Claude executed clean PR #3 head `63be87513ec51b05976726977e3a43a0ce5bb774`; Codex executed dirty cache head `b5910a6c772c5640eed254c9d66ef8928e882837` plus an overlay. Both installations are now clean at canonical commit `68819f7135f517e4a23b97e4b2c6a0413a5a012b` and tree `07377bb7d83abebc9eac7a385922b1cbd27c1531`; no runtime overlay remains.
+- donor disposition: PR #4 reconciles PR #3 commit `f5b6f9421b2e76169614c42588b7ed0ce2803f9a` for demonstrated single-flight/core-dump protection. PR #3's unrelated cache-retirement remainder was deliberately excluded.
 
 ## Affected Surface
 
@@ -39,12 +41,12 @@
 
 ## Scope Out
 
-- claude-skills Issue #95 and manual workflow bookkeeping changes.
+- manual workflow bookkeeping changes.
 - New graph frameworks, coverage scorers, repository resolvers, query languages, or Adapter hierarchies.
 - PR #3's second cache-retention/docs delta in `63be875` and the installed overlay's duplicate
-  `architecture_summary.py`; `63be875` is also the Claude runtime authority because it contains
-  the accepted `f5b6f94` single-flight/crash-dump ancestor.
+  `architecture_summary.py`.
 - Merge actions.
+- The claude-skills consumer half of Issue #94 and Issue #95.
 
 ## Authority And Conflict Rule
 
@@ -55,11 +57,11 @@
 
 - plan type: cross-repository dependency plus single Repo Context Forge consolidation PR
 - PR count: 2 across repositories
-- stack depth: Repo Context Forge PR #4 is stacked directly on Repo Context Forge PR #2; GitNexus PR #3 is a separate cross-repository runtime dependency of PR #4
-- active order: merge Repo Context Forge PR #2 when authorized, then retarget PR #4 to `main`; GitNexus PR #3 must merge and ship before PR #4 runtime activation
-- estimated net implementation: PR #4 is 464 net human-authored source lines over PR #2, within the ~500-line review target; stop and shrink before 1,000.
+- ancestry: Repo Context Forge PR #4 targets `main` and contains PR #2's complete ancestry; after PR #4 merges, PR #2 may close as included and PR #3 may close as superseded, not merged
+- dependency order: GitNexus PR #3 is a separate-repository dependency at `255896f08b645384551b3143917248c90b4e7f95` and must merge and ship before UID-dependent activation
+- review-size disposition: the combined main-based size/quality-gate complaint is accepted as a non-blocker; do not split or refactor PR #4 on that basis
 - regroup rule: stop if the implementation creates a second owner or exceeds the split threshold.
-- deploy freeze: do not replace either live authority until the exact pushed head passes verification and reviewer audit; preserve each old location independently as a recoverable backup.
+- installations: Claude and Codex are clean at canonical commit/tree `68819f7135f517e4a23b97e4b2c6a0413a5a012b` / `07377bb7d83abebc9eac7a385922b1cbd27c1531`; no runtime overlay remains.
 - dependency gate: runtime activation requires GitNexus PR #3 commit `255896f` or a reviewed successor containing it; the released/installed 1.5.3 CLI lacks `impact --uid`. This task does not merge either PR and must not add a bare-name compatibility fallback.
 
 ## PR Plan
@@ -67,7 +69,7 @@
 | PR | Branch | Base | Owner Slice | Commit Structure | Verification | Entry | Exit |
 |---|---|---|---|---|---|---|---|
 | GitNexus #3 | `codex/uid-impact-selector` | GitNexus `main` `cb772b9` | expose existing UID impact through current CLI/MCP Interface | one dependency commit | real duplicate-name DB test, CLI E2E, typecheck/build, reviewer gates | clean isolated clone | pushed clean dependency head; no merge |
-| A | `codex/issue-94-graph-analysis` | Repo Context Forge PR #2 branch `codex/app-grade-forge-consolidation` at `0cbbd10` | Repo Context Forge producer only | PR #3 safety; producer TDD/implementation; review fixes if needed | real-seam test, full suite, quality/GitNexus/advisor/reviewer gates | clean isolated clone | pushed clean head; PR #2 merges first, then PR #4 retargets to `main`; matching clean install only after final review |
+| A | `codex/issue-94-graph-analysis` | Repo Context Forge `main` | Repo Context Forge producer only | PR #2 ancestry; PR #3 demonstrated safety; producer implementation and accepted review fixes | real-seam test, full suite, quality/GitNexus/advisor/reviewer gates | clean isolated clone | canonical producer/runtime commit `68819f7`; both installations clean and identical; no merge performed |
 
 ## Verification Plan
 
@@ -97,9 +99,11 @@
 - [x] validate the final parser over 1,470 content-deduplicated captured files: 197 false callables removed, 12 named default exports added, demonstrated multiline/deeply nested arrows retained, and zero unexpected additions
 - [x] refresh final-candidate timing, verification, code review, and Claude challenge after OPS remediation
 - [x] close the demonstrated Cubic file-context UID mismatch and three operator-contract defects without adding code for zero-occurrence findings
-- [ ] close the PR #2-stacked PR #4 exact-head reviewer loop
-- [ ] replace both live Repo Context Forge checkouts only after the pushed head passes review
-- [ ] record exact donor/overlay dispositions and final identity proof
+- [x] close the exact-head reviewer loop: 103/103 tests; Cubic success; OPS terminal neutral/unavailable; CodeRabbit rate-limited; zero unresolved non-outdated threads
+- [x] install canonical commit/tree cleanly for Claude and Codex with no runtime overlay
+- [x] record exact PR #2 ancestry, PR #3 donor/cache-remainder disposition, and final identity proof
+- [ ] merge PR #4 when authorized; then close Repo Context Forge PR #2 as included and PR #3 as superseded, not merged
+- [ ] implement Issue #94's claude-skills consumer half and Issue #95 in their own scopes
 
 ## Change Log
 
@@ -118,3 +122,4 @@
 - 2026-08-09: the resumed Claude challenge first blocked the one-line parser correction after reproducing lost multiline and deeply nested arrow declarations. The matching-parenthesis RED/GREEN and corpus validation closed that regression; the resumed final verdict was commit-ready. Its requested packet-field assertion now proves the same authoritative dependent count through `make_target_entries`. The refreshed timing is a new exact-candidate baseline, not an attribution against the earlier run because the recorded method now states `--allow-missing-map` and the shared active GitNexus registry explicitly.
 - 2026-08-09: current-head Cubic triage reproduced one Issue #94 identity defect: a `file_context` result with `Method:docs/ARCHITECTURE.md:render` and the planned file path was accepted as resolved. The existing executor now requires exact `File:<repository-path>` identity inline. The existing real-CLI nested-file bootstrap remains the non-regression proof; no fake GitNexus test was added. Three operator corrections use the verified installed `$SKILL_DIR` layout and align two inherited plans with real symbols/fail-closed behavior. Failed fetch, timeout metrics, malformed registry, and machine-local fixture paths remain measured report lines after zero demonstrated occurrence.
 - 2026-08-09: per operator correction, PR #4 was restored from `main` to PR #2's branch `codex/app-grade-forge-consolidation`. The resulting PR #4 diff is 11 files and 464 net human-authored source lines over PR #2, restoring reviewability. PR #2 now merges first when authorized; PR #4 is then retargeted to `main`. No merge was performed.
+- 2026-08-09: final wording reconciliation records canonical PR #4 at `68819f7135f517e4a23b97e4b2c6a0413a5a012b` / tree `07377bb7d83abebc9eac7a385922b1cbd27c1531`, targeting `main` with PR #2's complete ancestry. PR #3's demonstrated single-flight/core-dump protection is reconciled; its unrelated cache-retirement remainder remains deliberately excluded. Current acceptance is 103/103 tests, exact-head Cubic success, OPS terminal neutral/unavailable, CodeRabbit rate-limited, and zero unresolved non-outdated threads. The recorded final-head timing is PR #2 median 14.18s versus PR #4 median 15.56s, a +1.38s / 9.7% delta. Both installations are clean and identical with no runtime overlay. The combined main-based size/quality-gate complaint is accepted as non-blocking; no split or refactor is required.
