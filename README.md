@@ -3,9 +3,11 @@
 Standalone context orchestrator for giving coding agents the right repository
 map before they reason, edit, or run GitNexus.
 
-The tool is dependency-free Python and can be run against any git repository. It
-uses SoulForge as the first map engine through an adapter, but keeps SoulForge's
-map separate from the target-selection and prompt-packet contracts.
+The tool is dependency-free Python and can be run against any git repository.
+Its workflow index owns deterministic target ranking and source symbols. It
+indexes an exact head for PR/repo mode and the explicit dirty overlay for
+local/intent mode. Optional SoulForge data enriches graph impact without
+becoming a startup dependency.
 
 ## Codex Plugin
 
@@ -25,22 +27,47 @@ The plugin startup path is:
 1. Codex loads `repo-context-forge`.
 2. The plugin skill runs `scripts/codex_context_bootstrap.py` for the current
    git repo.
-3. The bootstrap script auto-selects `pr`, `local`, or `intent` mode.
-4. The generated XML packet becomes the initial repo context for the task.
-5. Codex runs the packet's GitNexus checks before editing when GitNexus MCP is
-   available.
+3. The bootstrap script auto-selects `pr`, `local`, `intent`, or `repo` mode.
+4. Forge builds an atomic workflow index in the cache-owned analysis checkout.
+5. The generated XML packet becomes the initial repo context for the task.
+6. GitNexus freshness is checked for the exact target head before blast-radius
+   claims are trusted.
+
+In production plugin mode, the current git folder is the target. Clean folders
+with no diff use `repo` mode for whole-repo context. Repo Context Forge does not
+silently switch to sibling worktrees.
 
 ## What It Does
 
-- `pr` mode creates or reuses a clean cached git worktree at the target head.
-- `local` mode analyzes the current dirty worktree and marks dirty state.
-- `intent` mode searches the ambient map from a user-described change request.
+- `pr` mode creates or reuses a clean cached git checkout at the target head.
+- `local` mode copies dirty local files into a cached analysis checkout and
+  marks dirty state.
+- `intent` mode searches a cached analysis map from a user-described change
+  request.
+- `repo` mode maps a clean current project folder for ambient whole-repo
+  context.
+- native ranking combines changed hunks, production/test role, workflow-index
+  relevance, optional SoulForge graph/co-change data, semantic summaries, and
+  task refresh signals.
+- semantic summaries run in `full_cached` mode during bootstrap: cached
+  LLM/LSP/AST/native summaries are used first, deterministic synthetic summaries
+  fill missing symbols, and live LLM generation is not performed on routine
+  prompt injection.
 - output can be Markdown, JSON, or an XML prompt packet for upstream injection.
-- packets include GitNexus required-check entries for context and impact calls.
+- prompt packets default to a 16k token budget and compact optional symbol
+  detail before dropping required status, target identity, or GitNexus checks.
+- packets execute their bounded GitNexus context/impact plan serially and include
+  normalized, identity-bound semantic answers plus timing and output metrics.
+- packets include workflow-index and architecture summaries, optional SoulForge
+  target-head proof, and packet-authoritative GitNexus exact-head status.
+- `gitnexus-merge` merges real GitNexus findings and blocks stale blast-radius
+  claims.
 - `wrap` writes the prompt packet and can pass it to another command before
   that command starts reasoning.
 - `scripts/codex_context_bootstrap.py` is the plugin entrypoint Codex uses to
   avoid manual per-project commands.
+- `context-start`, `context-record-*`, and `context-refresh` provide the
+  per-turn personalization layer.
 - `benchmark` generates no-map, ambient-map, and clean-target-map comparison
   inputs for testing agent behavior.
 
@@ -117,20 +144,32 @@ python3 repo_context_forge.py wrap \
 --cache-dir ~/.cache/repo-context-forge
 --soulforge-bin /path/to/soulforge
 --gitnexus-repo fork_google_workspace_mcp
+--gitnexus-mode off|check|auto
 --format markdown|json|prompt
 ```
 
-By default, `analyze` requires a SoulForge map. Use `--allow-missing-map` only
-when testing failure paths or no-map baselines.
+By default, `analyze` requires a SoulForge map for backward compatibility. The
+Codex bootstrap permits a missing map because the workflow index
+still provides targets and symbols; only optional native graph impact is absent.
 
 ## Production Contract
 
 For PR review, use `mode=pr`. It builds/reads the map from a clean cached target
-worktree, not the dirty root checkout.
+checkout, not the dirty root checkout.
 
 For active implementation before a PR exists, use `mode=local` or `mode=intent`.
-These modes intentionally use ambient current-worktree context and mark dirty
-state in the packet.
+These modes intentionally use ambient current-worktree context, but SoulForge
+runs against a cached analysis checkout. The target repository is an input only:
+Repo Context Forge must not add `.soulforge`, edit `.gitignore`, or run cleanup
+checkouts in the source checkout.
 
-GitNexus is not replaced by this tool. The packet tells the agent which GitNexus
-context and impact checks must run after the target map has been injected.
+For clean exploration, use `mode=repo` or let the plugin bootstrap select it.
+
+GitNexus is not replaced by this tool. In `auto` mode, Repo Context Forge checks
+whether the GitNexus index matches the packet target head and reindexes the
+cache-owned analysis checkout when it is missing or stale. It then executes the
+packet plan once. Stale, unavailable, malformed, ambiguous, or identity-mismatched
+results produce one blocker instead of a successful packet. The bootstrap's
+optional `--packet-json-out PATH` atomically writes the same machine packet while
+normal prompt stdout remains unchanged. A blocker is still rendered and written,
+then the production bootstrap exits nonzero.
