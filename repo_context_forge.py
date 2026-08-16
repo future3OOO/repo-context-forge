@@ -1412,16 +1412,24 @@ def target_files_for_mode(
         if not is_generated_or_cache_path(path)
         and not is_reference_only_path(path, reference_prefixes)
     ]
-    directory_refs = intent_path_references(intent or "")
+    path_references = intent_path_references(intent or "")
+    mapped_references = soul_map.files_by_path(path_references)
+    exact_files = [
+        reference
+        for reference in path_references
+        if reference in mapped_references
+        and not is_generated_or_cache_path(reference)
+        and not is_reference_only_path(reference, reference_prefixes)
+    ]
     directory_matches = [
         path
         for path in candidates
-        if any(path.startswith(f"{reference}/") for reference in directory_refs)
+        if any(path.startswith(f"{reference}/") for reference in path_references)
     ]
     return [
         path
-        for path in unique_ordered([*directory_matches, *candidates])
-        if Path(path).name not in INTENT_GRAPH_EXCLUDED_NAMES or path not in directory_matches or path in directory_refs
+        for path in unique_ordered([*exact_files, *directory_matches, *candidates])
+        if Path(path).name not in INTENT_GRAPH_EXCLUDED_NAMES or path not in directory_matches or path in path_references
     ][:top]
 
 

@@ -463,6 +463,13 @@ class RepoContextForgeTests(unittest.TestCase):
                 "def connect():\n    return None\n",
                 encoding="utf-8",
             )
+            (repo / "src" / "add_pkg_safeimporter_helpers.py").write_text(
+                "".join(
+                    f"def add_pkg_safeimporter_{index}():\n    return {index}\n\n"
+                    for index in range(20)
+                ),
+                encoding="utf-8",
+            )
             repo_context_forge.run_git(repo, ["add", "-A"])
             repo_context_forge.run_git(repo, ["commit", "-m", "future symbol target"])
 
@@ -475,6 +482,7 @@ class RepoContextForgeTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            self.assertEqual([target["path"] for target in packet["targets"]], ["src/db.py"])
             analysis = packet["gitnexus"]["analysis"]
             self.assertEqual(analysis["status"], "resolved")
             self.assertEqual(analysis["unresolved_checks"], [])
