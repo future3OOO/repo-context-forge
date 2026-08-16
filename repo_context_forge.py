@@ -1686,6 +1686,46 @@ def make_target_entries(
 ) -> list[dict[str, object]]:
     intent = intent if mode == "intent" else None
     map_files = soul_map.files_by_path(targets)
+    symbols_by_path = {
+        path: soul_map.symbols_for_file(
+            path,
+            limit=max(80, int(map_files[path].symbol_count or 0))
+            if path in map_files
+            else 80,
+        )
+        for path in targets
+    }
+    qualified_references = [
+        (parts[-2], parts[-1])
+        for match in re.findall(
+            r"(?<![/A-Za-z0-9_])(?:[A-Za-z_][A-Za-z0-9_]*\.)+[A-Za-z_][A-Za-z0-9_]*\b",
+            intent or "",
+        )
+        if len(parts := match.split(".")) >= 2
+    ]
+    required_symbol_keys: set[tuple[str, int, str]] = set()
+    for qualifier, name in qualified_references:
+        candidates = [
+            (path, symbol)
+            for path, symbols in symbols_by_path.items()
+            for symbol in symbols
+            if symbol.name == name
+        ]
+        qualifier_words = set(identifier_words(qualifier))
+        file_matches = [
+            candidate
+            for candidate in candidates
+            if qualifier_words <= set(identifier_words(candidate[0]))
+        ]
+        if len(file_matches) == 1:
+            selected = file_matches
+        elif len(candidates) == 1:
+            selected = candidates
+        else:
+            selected = []
+        required_symbol_keys.update(
+            (path, symbol.line, symbol.name) for path, symbol in selected
+        )
     directory_owner_paths: set[str] = set()
     for reference in intent_path_references(intent or ""):
         owner = next(
@@ -1703,19 +1743,14 @@ def make_target_entries(
             if mode not in {"intent", "repo"}
             else []
         )
-        symbol_limit = max(80, int(map_file.symbol_count or 0)) if map_file else 80
-        symbols = soul_map.symbols_for_file(path, limit=symbol_limit)
+        symbols = symbols_by_path[path]
         changed_symbols = remove_nested_symbols(
             [symbol for symbol in symbols if symbol_overlaps(symbol, ranges)]
         )
         intent_required_symbols = [
             symbol
             for symbol in symbols
-            if intent
-            and re.search(
-                rf"(?<![/A-Za-z0-9_])(?:[A-Za-z_][A-Za-z0-9_]*\.)+{re.escape(symbol.name)}\b",
-                intent,
-            )
+            if (path, symbol.line, symbol.name) in required_symbol_keys
         ]
         intent_symbols = [
             *intent_required_symbols,

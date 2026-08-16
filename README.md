@@ -162,10 +162,13 @@ These modes intentionally use ambient current-worktree context, but SoulForge
 runs against a cached analysis checkout. The target repository is an input only:
 Repo Context Forge must not add `.soulforge`, edit `.gitignore`, or run cleanup
 checkouts in the source checkout. Intent-mode graph checks require explicitly named
-existing files and explicitly qualified existing symbols; symbol names are matched
-only against the selected file's complete extracted inventory, so a planned symbol
-that does not exist yet falls back to its existing file context. Required checks
-omitted by the bounded plan block through `unresolved_checks`, while optional omissions remain non-blocking. Directory-derived `go.sum` and `Cargo.lock` are excluded; explicitly named lockfiles remain required anchors.
+existing files. A qualified symbol reference becomes required when its immediate
+qualifier identifies one selected file path or its terminal name is unique across
+selected targets. Matching uses each selected file's complete extracted inventory,
+so a planned symbol that does not exist yet falls back to its existing file context.
+Required checks omitted by the bounded plan block through `unresolved_checks`, while
+optional omissions remain non-blocking. Directory-derived `go.sum` and `Cargo.lock`
+are excluded; explicitly named lockfiles remain required anchors.
 
 For clean exploration, use `mode=repo` or let the plugin bootstrap select it.
 

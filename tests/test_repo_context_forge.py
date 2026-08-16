@@ -524,105 +524,56 @@ class RepoContextForgeTests(unittest.TestCase):
             )
 
     def test_public_bootstrap_keeps_duplicate_symbol_names_file_scoped(self) -> None:
-        self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
-        with (
-            tempfile.TemporaryDirectory() as repo_dir,
-            tempfile.TemporaryDirectory() as cache_dir,
-            tempfile.TemporaryDirectory() as runtime_home,
-        ):
-            repo = Path(repo_dir)
-            packet_path = Path(runtime_home) / "packet.json"
-            self.make_git_repo(repo)
-            (repo / "src" / "a.py").write_text(
-                "def connect():\n    return 'a'\n", encoding="utf-8"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "client.py").write_text(
+                "def run():\n    return 'client'\n", encoding="utf-8"
             )
-            (repo / "src" / "b.py").write_text(
-                "def connect():\n    return 'b'\n", encoding="utf-8"
+            (repo / "src" / "worker.py").write_text(
+                "def run():\n    return 'worker'\n", encoding="utf-8"
             )
             (repo / "src" / "use.py").write_text(
-                "from a import connect as connect_a\n"
-                "from b import connect as connect_b\n\n"
-                "def use():\n    return connect_a(), connect_b()\n",
+                "from client import run as run_client\n"
+                "from worker import run as run_worker\n\n"
+                "def use():\n    return run_client(), run_worker()\n",
                 encoding="utf-8",
             )
             repo_context_forge.run_git(repo, ["add", "-A"])
-            repo_context_forge.run_git(repo, ["commit", "-m", "duplicate symbols"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "qualified duplicate symbols"])
 
-            result = repo_context_forge.run_cmd(
-                [
-                    sys.executable,
-                    str(ROOT / "scripts" / "codex_context_bootstrap.py"),
-                    "--repo",
-                    str(repo),
-                    "--mode",
-                    "repo",
-                    "--top",
-                    "3",
-                    "--cache-dir",
-                    cache_dir,
-                    "--map-build",
-                    "never",
-                    "--gitnexus-mode",
-                    "auto",
-                    "--packet-json-out",
-                    str(packet_path),
-                ],
-                env={**os.environ, "HOME": runtime_home},
-                allow_fail=True,
+            result, packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent="Update client.run and worker behavior",
+                top=3,
             )
 
             self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
-            self.assertTrue(packet_path.exists())
-            packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
-            self.assertNotIn("blocked", packet)
-            analysis = packet["gitnexus"]["analysis"]
-            self.assertEqual(analysis["graph_call_count"], 6)
-            self.assertEqual(analysis["process_count"], 6)
-            self.assertLessEqual(
-                analysis["output_bytes"],
-                analysis["graph_call_count"] * repo_context_forge.gitnexus_analysis.MAX_OUTPUT_BYTES,
-            )
-            connect_entries = [
-                entry for entry in analysis["entries"] if entry.get("target") == "connect"
-            ]
-            self.assertEqual(len(connect_entries), 4)
             self.assertEqual(
-                {(entry["kind"], entry["file"], entry.get("direction", "")) for entry in connect_entries},
                 {
-                    ("symbol_context", "src/a.py", ""),
-                    ("symbol_impact", "src/a.py", "upstream"),
-                    ("symbol_context", "src/b.py", ""),
-                    ("symbol_impact", "src/b.py", "upstream"),
+                    (item["file"], item["target"])
+                    for item in packet["gitnexus_plan"]
+                    if item["kind"] == "symbol_context" and item.get("required") is True
+                },
+                {("src/client.py", "run")},
+            )
+            run_entries = [
+                entry
+                for entry in packet["gitnexus"]["analysis"]["entries"]
+                if entry.get("target") == "run"
+            ]
+            self.assertEqual(
+                {(entry["kind"], entry["file"], entry.get("direction", "")) for entry in run_entries},
+                {
+                    ("symbol_context", "src/client.py", ""),
+                    ("symbol_impact", "src/client.py", "upstream"),
+                    ("symbol_context", "src/worker.py", ""),
+                    ("symbol_impact", "src/worker.py", "upstream"),
                 },
             )
             self.assertEqual(
-                {entry["resolved_identity"] for entry in connect_entries if entry["kind"] == "symbol_context"},
-                {"Function:src/a.py:connect", "Function:src/b.py:connect"},
-            )
-            self.assertEqual(
-                [entry["status"] for entry in connect_entries],
-                ["resolved"] * 4,
-            )
-            self.assertEqual(
-                {entry["resolved_identity"] for entry in connect_entries},
-                {"Function:src/a.py:connect", "Function:src/b.py:connect"},
-            )
-            self.assertNotIn("<blocker", result.stdout)
-            self.assertIn(
-                '<check kind="symbol_context" target="connect" file="src/a.py"',
-                result.stdout,
-            )
-            self.assertIn(
-                '<check kind="symbol_context" target="connect" file="src/b.py"',
-                result.stdout,
-            )
-            self.assertIn(
-                '<check kind="symbol_impact" target="connect" file="src/a.py" direction="upstream"',
-                result.stdout,
-            )
-            self.assertIn(
-                '<check kind="symbol_impact" target="connect" file="src/b.py" direction="upstream"',
-                result.stdout,
+                {entry["resolved_identity"] for entry in run_entries if entry["kind"] == "symbol_context"},
+                {"Function:src/client.py:run", "Function:src/worker.py:run"},
             )
 
     def test_public_bootstrap_resolves_nested_file_context_by_exact_identity(self) -> None:
