@@ -191,12 +191,12 @@ def ensure_index(
         return status
 
 
-def _check_key(item: dict[str, str]) -> tuple[str, str, str, str]:
+def _check_key(item: dict[str, object]) -> tuple[str, str, str, str]:
     return (
-        item.get("kind", ""),
-        item.get("file", ""),
-        item.get("target", ""),
-        item.get("direction", ""),
+        str(item.get("kind") or ""),
+        str(item.get("file") or ""),
+        str(item.get("target") or ""),
+        str(item.get("direction") or ""),
     )
 
 
@@ -249,18 +249,32 @@ def result_is_resolved(value: object) -> bool:
 
 
 def execute(
-    plan: list[dict[str, str]],
+    plan: list[dict[str, object]],
     gitnexus_status: dict[str, object],
     *,
     run_command: RunCommand,
     omitted_check_count: int = 0,
+    omitted_required_checks: list[dict[str, object]] | None = None,
     gitnexus_bin: str | None = None,
 ) -> dict[str, object]:
     started = time.monotonic()
+    unresolved_required_checks: list[dict[str, object]] = []
+    for item in omitted_required_checks or []:
+        kind, file_path, target, direction = _check_key(item)
+        unresolved_required_checks.append(
+            {
+                "kind": kind,
+                "file": file_path,
+                "target": target,
+                "direction": direction,
+                "status": "omitted",
+                "diagnostic": "required intent check exceeded the GitNexus call cap",
+            }
+        )
     analysis: dict[str, object] = {
         "status": "blocked",
         "entries": [],
-        "unresolved_checks": [],
+        "unresolved_checks": unresolved_required_checks,
         "elapsed_ms": 0,
         "process_count": 0,
         "graph_call_count": 0,
@@ -332,6 +346,7 @@ def execute(
                 command,
                 allow_fail=True,
                 suppress_core_dump=True,
+                capture_output_to_file=True,
                 timeout=min(CALL_TIMEOUT_SECONDS, TOTAL_TIMEOUT_SECONDS - elapsed),
             )
         except subprocess.TimeoutExpired:
