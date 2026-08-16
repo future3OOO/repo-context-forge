@@ -523,6 +523,51 @@ class RepoContextForgeTests(unittest.TestCase):
                 {"src/alpha_feature.py", "src/beta_feature.py"},
             )
 
+    def test_public_bootstrap_requires_unique_enclosing_class_method(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "handlers.py").write_text(
+                "class Service:\n    def run(self):\n        return 'service'\n",
+                encoding="utf-8",
+            )
+            for index in range(10):
+                (repo / "src" / f"job_{index}.py").write_text(
+                    f"class Worker{index}:\n    def run(self):\n        return {index}\n",
+                    encoding="utf-8",
+                )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "class-qualified method"])
+
+            result, packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent="Update Service.run behavior",
+                top=11,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            self.assertEqual(
+                {
+                    (item["file"], item["target"])
+                    for item in packet["gitnexus_plan"]
+                    if item["kind"] == "symbol_context" and item.get("required") is True
+                },
+                {("src/handlers.py", "run")},
+            )
+            analysis = packet["gitnexus"]["analysis"]
+            self.assertEqual(analysis["status"], "resolved")
+            self.assertEqual(analysis["unresolved_checks"], [])
+            self.assertGreater(analysis["omitted_check_count"], 0)
+            run_context = next(
+                entry
+                for entry in analysis["entries"]
+                if entry["kind"] == "symbol_context" and entry["target"] == "run"
+            )
+            self.assertEqual(
+                run_context["resolved_identity"],
+                "Function:src/handlers.py:Service.run",
+            )
+
     def test_public_bootstrap_keeps_duplicate_symbol_names_file_scoped(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             (repo / "src" / "client.py").write_text(

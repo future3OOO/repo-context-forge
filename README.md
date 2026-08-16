@@ -161,11 +161,12 @@ For active implementation before a PR exists, use `mode=local` or `mode=intent`.
 These modes intentionally use ambient current-worktree context, but SoulForge
 runs against a cached analysis checkout. The target repository is an input only:
 Repo Context Forge must not add `.soulforge`, edit `.gitignore`, or run cleanup
-checkouts in the source checkout. Intent-mode graph checks require explicitly named
-existing files. A qualified symbol reference becomes required when its immediate
-qualifier identifies one selected file path or its terminal name is unique across
-selected targets. Matching uses each selected file's complete extracted inventory,
-so a planned symbol that does not exist yet falls back to its existing file context.
+checkouts in the source checkout. Intent-mode graph checks apply only to existing
+selected files. A qualified symbol reference becomes required when its immediate
+qualifier identifies one exact-name direct enclosing class candidate or one selected
+file path, or when its terminal name is unique across selected targets. Matching uses
+each selected file's complete extracted inventory, so a planned symbol that does not
+exist yet falls back to its existing file context.
 Required checks omitted by the bounded plan block through `unresolved_checks`, while
 optional omissions remain non-blocking. Directory-derived `go.sum` and `Cargo.lock`
 are excluded; explicitly named lockfiles remain required anchors.

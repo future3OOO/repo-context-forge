@@ -1711,13 +1711,31 @@ def make_target_entries(
             for symbol in symbols
             if symbol.name == name
         ]
+        class_matches = []
+        for path, symbol in candidates:
+            owner = min(
+                (
+                    container
+                    for container in symbols_by_path[path]
+                    if container.line < symbol.line
+                    and symbol.end_line <= container.end_line
+                ),
+                key=lambda container: container.end_line - container.line,
+                default=None,
+            )
+            if owner is not None and owner.kind == "class" and owner.name == qualifier:
+                class_matches.append((path, symbol))
         qualifier_words = set(identifier_words(qualifier))
         file_matches = [
             candidate
             for candidate in candidates
             if qualifier_words <= set(identifier_words(candidate[0]))
         ]
-        if len(file_matches) == 1:
+        if len(class_matches) == 1:
+            selected = class_matches
+        elif class_matches:
+            selected = []
+        elif len(file_matches) == 1:
             selected = file_matches
         elif len(candidates) == 1:
             selected = candidates
