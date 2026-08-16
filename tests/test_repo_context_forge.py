@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 from collections import namedtuple
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -101,6 +101,93 @@ class RepoContextForgeTests(unittest.TestCase):
             **kwargs,
         )
 
+    def run_public_intent_bootstrap(
+        self,
+        repo: Path,
+        cache_dir: str,
+        runtime_home: str,
+        *,
+        intent: str,
+        top: int,
+    ):
+        packet_path = Path(runtime_home) / "packet.json"
+        result = repo_context_forge.run_cmd(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "codex_context_bootstrap.py"),
+                "--repo",
+                str(repo),
+                "--mode",
+                "intent",
+                "--intent",
+                intent,
+                "--top",
+                str(top),
+                "--cache-dir",
+                cache_dir,
+                "--map-build",
+                "never",
+                "--gitnexus-mode",
+                "auto",
+                "--enforce-intake",
+                "--packet-json-out",
+                str(packet_path),
+            ],
+            env={**os.environ, "HOME": runtime_home},
+            allow_fail=True,
+        )
+        packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
+        return result, packet
+
+    @contextmanager
+    def public_intent_repo(self):
+        self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
+        with (
+            tempfile.TemporaryDirectory() as repo_dir,
+            tempfile.TemporaryDirectory() as cache_dir,
+            tempfile.TemporaryDirectory() as runtime_home,
+        ):
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            yield repo, cache_dir, runtime_home
+
+    def assert_public_intent_symbol_checked(
+        self,
+        *,
+        file_name: str,
+        helper_count: int,
+        symbol_name: str,
+        intent: str,
+    ) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            relative_path = f"src/{file_name}"
+            (repo / relative_path).write_text(
+                "".join(
+                    f"def helper_{index}():\n    return {index}\n\n"
+                    for index in range(helper_count)
+                )
+                + f"class {symbol_name}:\n    pass\n",
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "intent symbol target"])
+
+            result, packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent=intent,
+                top=1,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            checks = {
+                (entry["kind"], entry["file"], entry["target"])
+                for entry in packet["gitnexus"]["analysis"]["entries"]
+            }
+            self.assertIn(("symbol_context", relative_path, symbol_name), checks)
+            self.assertIn(("symbol_impact", relative_path, symbol_name), checks)
+
     def build_workflow_index(
         self, repo: Path, source: str | None = None
     ) -> repo_context_forge.workflow_index.WorkflowIndex:
@@ -123,6 +210,21 @@ class RepoContextForgeTests(unittest.TestCase):
         )
 
         self.assertEqual(result.stdout.strip(), "00000000")
+
+    def test_run_cmd_file_capture_preserves_large_process_output(self) -> None:
+        self.assertIsNotNone(shutil.which("node"), "GitNexus Node runtime is required")
+        expected_bytes = 72_459
+
+        result = repo_context_forge.run_cmd(
+            [
+                "node",
+                "-e",
+                f'process.stdout.write("x".repeat({expected_bytes})); process.exit(0)',
+            ],
+            capture_output_to_file=True,
+        )
+
+        self.assertEqual(len(result.stdout.encode()), expected_bytes)
 
     def test_unique_sorted_deduplicates_and_sorts(self) -> None:
         self.assertEqual(
@@ -162,7 +264,7 @@ class RepoContextForgeTests(unittest.TestCase):
         )
 
     def test_build_gitnexus_plan_prefers_callable_symbols(self) -> None:
-        plan, omitted_checks = repo_context_forge.build_gitnexus_plan(
+        plan, omitted_checks, omitted_required = repo_context_forge.build_gitnexus_plan(
             [
                 {
                     "path": "src/a.py",
@@ -187,6 +289,7 @@ class RepoContextForgeTests(unittest.TestCase):
             ],
         )
         self.assertEqual(omitted_checks, 0)
+        self.assertEqual(omitted_required, [])
 
     def test_build_gitnexus_plan_never_splits_context_impact_pair_at_cap(self) -> None:
         entries = [{"path": "README.md", "symbols": []}]
@@ -198,7 +301,7 @@ class RepoContextForgeTests(unittest.TestCase):
             for index in range(10)
         )
 
-        plan, omitted_checks = repo_context_forge.build_gitnexus_plan(entries)
+        plan, omitted_checks, omitted_required = repo_context_forge.build_gitnexus_plan(entries)
 
         self.assertLessEqual(len(plan), repo_context_forge.MAX_GITNEXUS_CHECKS)
         symbol_checks = {
@@ -213,12 +316,212 @@ class RepoContextForgeTests(unittest.TestCase):
         }
         self.assertEqual(symbol_checks.keys(), impact_checks.keys())
         self.assertEqual(omitted_checks, 2)
+        self.assertEqual(omitted_required, [])
 
-        file_plan, omitted_file_checks = repo_context_forge.build_gitnexus_plan(
+        file_plan, omitted_file_checks, omitted_required = repo_context_forge.build_gitnexus_plan(
             [{"path": f"docs/{index}.md", "symbols": []} for index in range(21)]
         )
         self.assertEqual(len(file_plan), repo_context_forge.MAX_GITNEXUS_CHECKS)
         self.assertEqual(omitted_file_checks, 1)
+        self.assertEqual(omitted_required, [])
+
+        required_names = [f"Anchor{index}" for index in range(13)]
+        required_symbols = [
+            {"name": name, "kind": "class"} for name in required_names[:12]
+        ]
+        _, omitted_checks, omitted_required = repo_context_forge.build_gitnexus_plan(
+            [{"path": "src/deep.py", "symbols": required_symbols, "intent_required_symbols": required_names}],
+            intent_mode=True,
+        )
+        self.assertEqual(omitted_checks, 6)
+        self.assertEqual(
+            {item["target"] for item in omitted_required},
+            set(required_names[10:]),
+        )
+
+    def test_public_bootstrap_prioritizes_explicit_database_anchor(self) -> None:
+        self.assert_public_intent_symbol_checked(
+            file_name="db.py",
+            helper_count=13,
+            symbol_name="Database",
+            intent="Update sqlite_utils.Database import checkpoints in src/db.py",
+        )
+
+    def test_public_bootstrap_prioritizes_explicit_symbol_after_eightieth_symbol(self) -> None:
+        self.assert_public_intent_symbol_checked(
+            file_name="deep.py",
+            helper_count=81,
+            symbol_name="DeepAnchor",
+            intent="Update pkg.DeepAnchor in src/deep.py",
+        )
+
+    def test_public_bootstrap_blocks_omitted_required_anchor(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            for index in range(11):
+                (repo / "src" / f"model_{index}.py").write_text(
+                    f"class Anchor{index}:\n    pass\n",
+                    encoding="utf-8",
+                )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "required anchors"])
+
+            result, packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent=" ".join(f"pkg.Anchor{index}" for index in range(11)),
+                top=11,
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stdout or result.stderr)
+            analysis = packet["gitnexus"]["analysis"]
+            omitted = [
+                item for item in analysis["unresolved_checks"]
+                if item.get("status") == "omitted"
+            ]
+            self.assertEqual(analysis["status"], "blocked")
+            self.assertEqual(analysis["omitted_check_count"], 2)
+            self.assertEqual({item["kind"] for item in omitted}, {"symbol_context", "symbol_impact"})
+            self.assertEqual(len({(item["file"], item["target"]) for item in omitted}), 1)
+            self.assertFalse(packet["gitnexus"]["required_checks_resolved"])
+            self.assertIn("blocked", packet)
+            self.assertIn("omitted_checks=2; omissions_blocking=true", result.stdout)
+            self.assertIn('omitted_checks="2" omissions_blocking="true"', result.stdout)
+
+    def test_public_bootstrap_excludes_directory_matched_go_sum(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            go_dir = repo / "examples" / "plugin" / "codex-service-tier" / "go"
+            go_dir.mkdir(parents=True)
+            (go_dir / "main.go").write_text(
+                "package main\n\nfunc main() {}\n",
+                encoding="utf-8",
+            )
+            (go_dir / "go.mod").write_text(
+                "module example.com/codex-service-tier\n",
+                encoding="utf-8",
+            )
+            (go_dir / "go.sum").write_text(
+                "".join(
+                    f"example.com/dependency{index} v1.0.0 h1:checksum{index}\n"
+                    for index in range(200)
+                ),
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "go plugin"])
+
+            result, packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent="Change examples/plugin/codex-service-tier/",
+                top=1,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            main_go = "examples/plugin/codex-service-tier/go/main.go"
+            go_sum = "examples/plugin/codex-service-tier/go/go.sum"
+            self.assertEqual([target["path"] for target in packet["targets"]], [main_go])
+            self.assertTrue(any(
+                item["file"] == main_go and item.get("required") is True
+                for item in packet["gitnexus_plan"]
+            ))
+            self.assertTrue(all(item["file"] != go_sum for item in packet["gitnexus_plan"]))
+            self.assertTrue(packet["gitnexus"]["required_checks_resolved"])
+
+            explicit_result, explicit_packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent=f"Change {go_sum}",
+                top=1,
+            )
+
+            self.assertNotEqual(explicit_result.returncode, 0, explicit_result.stdout)
+            self.assertEqual(
+                (
+                    [target["path"] for target in explicit_packet["targets"]],
+                    [
+                        (item["kind"], item["file"], item["target"], item.get("required"))
+                        for item in explicit_packet["gitnexus_plan"]
+                    ],
+                    [
+                        (item["kind"], item["file"], item["target"])
+                        for item in explicit_packet["gitnexus"]["analysis"]["unresolved_checks"]
+                    ],
+                ),
+                (
+                    [go_sum],
+                    [("file_context", go_sum, go_sum, True)],
+                    [("file_context", go_sum, go_sum)],
+                ),
+            )
+
+    def test_public_bootstrap_resolves_when_intent_names_future_symbol(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "db.py").write_text(
+                "def connect():\n    return None\n",
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "future symbol target"])
+
+            result, packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent="Add pkg.SafeImporter to src/db.py",
+                top=1,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            analysis = packet["gitnexus"]["analysis"]
+            self.assertEqual(analysis["status"], "resolved")
+            self.assertEqual(analysis["unresolved_checks"], [])
+            self.assertTrue(any(
+                item["kind"] == "file_context"
+                and item["file"] == "src/db.py"
+                and item.get("required") is True
+                for item in packet["gitnexus_plan"]
+            ))
+            self.assertTrue(all(
+                item["target"] != "SafeImporter"
+                for item in [*packet["gitnexus_plan"], *analysis["entries"]]
+            ))
+
+    def test_public_bootstrap_allocates_optional_checks_across_targets(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            for stem in ("alpha_feature", "beta_feature"):
+                (repo / "src" / f"{stem}.py").write_text(
+                    "".join(
+                        f"def {stem}_{index}():\n    return {index}\n\n"
+                        for index in range(12)
+                    ),
+                    encoding="utf-8",
+                )
+            workflow = repo / ".github/workflows/feature.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text("name: feature handling\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "optional breadth"])
+
+            result, packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent="Update feature handling",
+                top=3,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            self.assertIn(".github/workflows/feature.yml", [target["path"] for target in packet["targets"]])
+            checked_files = {
+                entry["file"] for entry in packet["gitnexus"]["analysis"]["entries"]
+            }
+            self.assertEqual(
+                checked_files,
+                {"src/alpha_feature.py", "src/beta_feature.py"},
+            )
 
     def test_public_bootstrap_keeps_duplicate_symbol_names_file_scoped(self) -> None:
         self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
@@ -378,7 +681,7 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertEqual(entries[0]["file"], "docs/ARCHITECTURE.md")
             self.assertEqual(entries[0]["resolved_identity"], "File:docs/ARCHITECTURE.md")
 
-    def test_public_bootstrap_reports_exact_omitted_check_count_non_blocking(self) -> None:
+    def test_public_bootstrap_keeps_optional_omissions_non_blocking(self) -> None:
         self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
         with (
             tempfile.TemporaryDirectory() as repo_dir,
@@ -897,6 +1200,12 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertEqual(
             repo_context_forge.tokenize_intent("Update the Gmail draft lifecycle"),
             ["update", "gmail", "draft", "lifecycle"],
+        )
+
+    def test_tokenize_intent_stable_deduplicates_terms(self) -> None:
+        self.assertEqual(
+            repo_context_forge.tokenize_intent("Update Gmail update gmail drafts"),
+            ["update", "gmail", "drafts"],
         )
 
     def test_dirty_paths_can_ignore_tool_cache(self) -> None:
@@ -1689,6 +1998,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 source_git_state=state,
                 soul_map=repo_context_forge.SoulForgeMap(repo, native_index),
                 targets=["tests/test_service.py", "src/transform.ts"],
+                intent="Update pkg.after in tests/test_service.py",
             )
             by_path = {str(entry["path"]): entry for entry in entries}
 
@@ -1710,6 +2020,10 @@ class RepoContextForgeTests(unittest.TestCase):
                 ],
                 ["transform", "generic", "fetchAllPages", "single"],
             )
+            self.assertEqual(
+                by_path["tests/test_service.py"]["intent_required_symbols"], []
+            )
+            self.assertFalse(by_path["tests/test_service.py"]["intent_required_file"])
 
     def test_packet_does_not_attribute_trailing_module_code(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:

@@ -33,6 +33,7 @@ MIN_TOKEN_BUDGET = 16_000
 MAX_TOKEN_BUDGET = 32_000
 DEFAULT_TOKEN_BUDGET = MIN_TOKEN_BUDGET
 MAX_GITNEXUS_CHECKS = 20
+INTENT_GRAPH_EXCLUDED_NAMES = {"Cargo.lock", "go.sum"}
 TaskEvent = Literal["read", "search", "edit", "mention"]
 CRITICAL_AREA_STEPS = (
     "State the task or PR contract from the user request, PR title/body when available, and packet targets.",
@@ -101,6 +102,7 @@ def run_cmd(
     allow_fail: bool = False,
     env: dict[str, str] | None = None,
     suppress_core_dump: bool = False,
+    capture_output_to_file: bool = False,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = args
@@ -112,16 +114,42 @@ def run_cmd(
             "sh",
             *args,
         ]
-    proc = subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=timeout,
+    stdout_file = (
+        tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        if capture_output_to_file
+        else None
     )
+    stderr_file = (
+        tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        if capture_output_to_file
+        else None
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            text=True,
+            stdout=stdout_file or subprocess.PIPE,
+            stderr=stderr_file or subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+        )
+        if stdout_file and stderr_file:
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            proc = subprocess.CompletedProcess(
+                completed.args,
+                completed.returncode,
+                stdout_file.read(),
+                stderr_file.read(),
+            )
+        else:
+            proc = completed
+    finally:
+        for output_file in (stdout_file, stderr_file):
+            if output_file:
+                output_file.close()
     if proc.returncode != 0 and not allow_fail:
         location = f" in {cwd}" if cwd else ""
         raise RuntimeError(
@@ -444,11 +472,19 @@ def tokenize_intent(intent: str) -> list[str]:
         "we",
         "with",
     }
-    return [
+    return list(dict.fromkeys(
         token
         for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]+", intent.lower())
         if len(token) > 2 and token not in stop
-    ]
+    ))
+
+
+def intent_path_references(intent: str) -> list[str]:
+    return unique_ordered(
+        match.rstrip("/")
+        for match in re.findall(r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]*", intent)
+        if match.rstrip("/")
+    )
 
 
 def identifier_words(value: str) -> list[str]:
@@ -1370,11 +1406,22 @@ def target_files_for_mode(
             and not is_reference_only_path(entry.path, reference_prefixes)
         ][:top]
     tokens = tokenize_intent(intent or "")
-    return [
+    candidates = [
         path
         for path in soul_map.intent_files(tokens, max(top * 3, top + 20))
         if not is_generated_or_cache_path(path)
         and not is_reference_only_path(path, reference_prefixes)
+    ]
+    directory_refs = intent_path_references(intent or "")
+    directory_matches = [
+        path
+        for path in candidates
+        if any(path.startswith(f"{reference}/") for reference in directory_refs)
+    ]
+    return [
+        path
+        for path in unique_ordered([*directory_matches, *candidates])
+        if Path(path).name not in INTENT_GRAPH_EXCLUDED_NAMES or path not in directory_matches or path in directory_refs
     ][:top]
 
 
@@ -1635,8 +1682,18 @@ def make_target_entries(
     source_git_state: GitState,
     soul_map: SoulForgeMap,
     targets: list[str],
+    intent: str | None = None,
 ) -> list[dict[str, object]]:
+    intent = intent if mode == "intent" else None
     map_files = soul_map.files_by_path(targets)
+    directory_owner_paths: set[str] = set()
+    for reference in intent_path_references(intent or ""):
+        owner = next(
+            (path for path in targets if path.startswith(f"{reference}/")),
+            None,
+        )
+        if owner:
+            directory_owner_paths.add(owner)
     target_entries: list[dict[str, object]] = []
     for path in targets:
         map_file = map_files.get(path)
@@ -1646,11 +1703,35 @@ def make_target_entries(
             if mode not in {"intent", "repo"}
             else []
         )
-        symbols = soul_map.symbols_for_file(path, limit=80)
+        symbol_limit = max(80, int(map_file.symbol_count or 0)) if map_file else 80
+        symbols = soul_map.symbols_for_file(path, limit=symbol_limit)
         changed_symbols = remove_nested_symbols(
             [symbol for symbol in symbols if symbol_overlaps(symbol, ranges)]
         )
-        display_symbols = changed_symbols[:12] if changed_symbols else symbols[:12]
+        intent_required_symbols = [
+            symbol
+            for symbol in symbols
+            if intent
+            and re.search(
+                rf"(?<![/A-Za-z0-9_])(?:[A-Za-z_][A-Za-z0-9_]*\.)+{re.escape(symbol.name)}\b",
+                intent,
+            )
+        ]
+        intent_symbols = [
+            *intent_required_symbols,
+            *(symbol for symbol in symbols if symbol not in intent_required_symbols),
+        ]
+        intent_names_file = bool(intent) and any(
+            re.search(
+                rf"(?<![A-Za-z0-9_./-]){re.escape(candidate)}(?![A-Za-z0-9_./-])",
+                intent,
+            )
+            for candidate in (path, Path(path).name)
+        )
+        intent_required_file = not intent_required_symbols and (
+            intent_names_file or path in directory_owner_paths
+        )
+        display_symbols = changed_symbols[:12] if changed_symbols else intent_symbols[:12]
         dirty_kinds = []
         if path in source_git_state.staged_files:
             dirty_kinds.append("staged")
@@ -1671,6 +1752,8 @@ def make_target_entries(
             "line_count": map_file.line_count if map_file else None,
             "changed_symbols": [symbol.__dict__ for symbol in changed_symbols],
             "symbols": [symbol.__dict__ for symbol in display_symbols],
+            "intent_required_symbols": [symbol.name for symbol in intent_required_symbols],
+            "intent_required_file": intent_required_file,
             "dependent_count": soul_map.dependent_count_for_file(path),
             "graph_neighbors": soul_map.graph_neighbors_for_file(path),
             "cochanges": soul_map.cochanges_for_file(path),
@@ -1692,36 +1775,76 @@ def make_target_entries(
 
 
 def build_gitnexus_plan(
-    target_entries: list[dict[str, object]], repo_name: str | None = None
-) -> tuple[list[dict[str, str]], int]:
-    plan: list[dict[str, str]] = []
-    omitted_checks = 0
+    target_entries: list[dict[str, object]],
+    repo_name: str | None = None,
+    *,
+    intent_mode: bool = False,
+) -> tuple[list[dict[str, object]], int, list[dict[str, object]]]:
+    required_groups: list[list[dict[str, object]]] = []
+    optional_queues: list[list[list[dict[str, object]]]] = []
     seen: set[tuple[str, str, str, str]] = set()
     for entry in target_entries:
+        entry_optional_groups: list[list[dict[str, object]]] = []
         path = str(entry["path"])
         symbols = entry.get("changed_symbols") or entry.get("symbols")
+        required_file = entry.get("intent_required_file") is True
+        file_key = ("file_context", path, path, "")
+        if required_file and file_key not in seen:
+            seen.add(file_key)
+            file_item: dict[str, object] = {
+                "kind": "file_context",
+                "file": path,
+                "target": path,
+                "required": True,
+            }
+            if repo_name:
+                file_item["repo"] = repo_name
+            required_groups.append([file_item])
         if not isinstance(symbols, list) or not symbols:
-            key = ("file_context", path, path, "")
-            if key not in seen:
-                seen.add(key)
-                if len(plan) >= MAX_GITNEXUS_CHECKS:
-                    omitted_checks += 1
-                    continue
-                item = {"kind": "file_context", "file": path, "target": path}
+            if not required_file and not intent_mode and file_key not in seen:
+                seen.add(file_key)
+                file_item = {
+                    "kind": "file_context",
+                    "file": path,
+                    "target": path,
+                }
                 if repo_name:
-                    item["repo"] = repo_name
-                plan.append(item)
+                    file_item["repo"] = repo_name
+                entry_optional_groups.append([file_item])
+            if entry_optional_groups:
+                optional_queues.append(entry_optional_groups)
             continue
+        required_names = unique_ordered(
+            name
+            for name in entry.get("intent_required_symbols") or []
+            if isinstance(name, str) and name
+        )
+        required_name_set = set(required_names)
+        planned_symbols = [(name, True) for name in required_names]
         for symbol in symbols:
             if not isinstance(symbol, dict):
                 continue
             name = symbol.get("name")
-            if not isinstance(name, str) or not name:
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in required_name_set
+                or symbol.get("kind") not in {"function", "class", "method"}
+            ):
                 continue
-            if symbol.get("kind") not in {"function", "class", "method"}:
-                continue
-            context_item = {"kind": "symbol_context", "target": name, "file": path}
-            impact_item = dict(kind="symbol_impact", target=name, file=path, direction="upstream")
+            planned_symbols.append((name, False))
+        for name, required in planned_symbols:
+            context_item: dict[str, object] = {
+                "kind": "symbol_context",
+                "target": name,
+                "file": path,
+            }
+            impact_item: dict[str, object] = {
+                "kind": "symbol_impact",
+                "target": name,
+                "file": path,
+                "direction": "upstream",
+            }
             if repo_name:
                 context_item["repo"] = repo_name
                 impact_item["repo"] = repo_name
@@ -1730,11 +1853,33 @@ def build_gitnexus_plan(
             if context_key in seen and impact_key in seen:
                 continue
             seen.update((context_key, impact_key))
-            if len(plan) + 2 > MAX_GITNEXUS_CHECKS:
-                omitted_checks += 2
-                continue
-            plan.extend((context_item, impact_item))
-    return plan, omitted_checks
+            group = [context_item, impact_item]
+            if required:
+                context_item["required"] = True
+                impact_item["required"] = True
+                required_groups.append(group)
+            else:
+                entry_optional_groups.append(group)
+        if entry_optional_groups:
+            optional_queues.append(entry_optional_groups)
+
+    optional_groups = [
+        queue[index]
+        for index in range(max((len(queue) for queue in optional_queues), default=0))
+        for queue in optional_queues
+        if index < len(queue)
+    ]
+    plan: list[dict[str, object]] = []
+    omitted_checks = 0
+    omitted_required_checks: list[dict[str, object]] = []
+    for group in [*required_groups, *optional_groups]:
+        if len(plan) + len(group) > MAX_GITNEXUS_CHECKS:
+            omitted_checks += len(group)
+            if any(item.get("required") is True for item in group):
+                omitted_required_checks.extend(dict(item) for item in group)
+            continue
+        plan.extend(group)
+    return plan, omitted_checks, omitted_required_checks
 
 
 semantic_summary_section = workflow_index.semantic_summary
@@ -1773,14 +1918,24 @@ def render_coverage_plan_lines(plan: object, indent: str) -> list[str]:
     return lines
 
 
+def _omissions_are_blocking(analysis: dict[str, object]) -> bool:
+    unresolved = analysis.get("unresolved_checks")
+    return isinstance(unresolved, list) and any(
+        isinstance(item, dict) and item.get("status") == "omitted"
+        for item in unresolved
+    )
+
+
 def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> list[str]:
     analysis = gitnexus.get("analysis")
     if not isinstance(analysis, dict):
         return []
+    omissions_blocking = _omissions_are_blocking(analysis)
     lines = [
         f'{indent}<gitnexus_analysis status="{html.escape(str(analysis.get("status") or "unknown"))}" '
         f'graph_calls="{html.escape(str(analysis.get("graph_call_count") or 0))}" '
-        f'omitted_checks="{html.escape(str(analysis.get("omitted_check_count") or 0))}" omissions_blocking="false" '
+        f'omitted_checks="{html.escape(str(analysis.get("omitted_check_count") or 0))}" '
+        f'omissions_blocking="{str(omissions_blocking).lower()}" '
         f'elapsed_ms="{html.escape(str(analysis.get("elapsed_ms") or 0))}" '
         f'output_bytes="{html.escape(str(analysis.get("output_bytes") or 0))}">'
     ]
@@ -1817,7 +1972,7 @@ def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> 
 
 
 def build_gitnexus_section(
-    plan: list[dict[str, str]],
+    plan: list[dict[str, object]],
     target_state: TargetState,
     repo_name: str | None,
     status: dict[str, object] | None = None,
@@ -2094,6 +2249,7 @@ def make_packet(
         source_git_state=source_git_state,
         soul_map=soul_map,
         targets=targets,
+        intent=intent,
     )
     target_entries = apply_task_state_to_entries(target_entries, task_state)
     coverage_plan = build_coverage_plan(target_entries)
@@ -2103,9 +2259,18 @@ def make_packet(
     )
     index_freshness_status = str(gitnexus_status.get("status") or "unknown")
     gitnexus_repo_name = str(gitnexus_status.get("repo") or gitnexus_repo or target_state.analysis_repo.name)
-    plan, omitted_check_count = build_gitnexus_plan(target_entries, gitnexus_repo_name)
+    plan, omitted_check_count, omitted_required_checks = build_gitnexus_plan(
+        target_entries,
+        gitnexus_repo_name,
+        intent_mode=mode == "intent",
+    )
     gitnexus_status = gitnexus_analysis.execute(
-        plan, gitnexus_status, run_command=run_cmd, omitted_check_count=omitted_check_count)
+        plan,
+        gitnexus_status,
+        run_command=run_cmd,
+        omitted_check_count=omitted_check_count,
+        omitted_required_checks=omitted_required_checks,
+    )
     analysis = gitnexus_status.get("analysis")
     if isinstance(analysis, dict):
         analysis["authority"] = {
@@ -2487,13 +2652,15 @@ def render_required_intake(packet: dict[str, object]) -> str:
     analysis = gitnexus.get("analysis")
     if isinstance(analysis, dict):
         unresolved = analysis.get("unresolved_checks")
+        unresolved_items = unresolved if isinstance(unresolved, list) else []
+        omissions_blocking = _omissions_are_blocking(analysis)
         lines.append(
             "gitnexus_analysis: "
             f"status={analysis.get('status') or 'unknown'}; "
             f"graph_calls={analysis.get('graph_call_count') or 0}; "
             f"omitted_checks={analysis.get('omitted_check_count') or 0}; "
-            "omissions_blocking=false; "
-            f"unresolved={len(unresolved) if isinstance(unresolved, list) else 0}; "
+            f"omissions_blocking={str(omissions_blocking).lower()}; "
+            f"unresolved={len(unresolved_items)}; "
             f"elapsed_ms={analysis.get('elapsed_ms') or 0}"
         )
     lines.append(
