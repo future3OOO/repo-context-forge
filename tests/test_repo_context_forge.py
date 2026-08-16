@@ -629,6 +629,92 @@ class RepoContextForgeTests(unittest.TestCase):
                 {"Function:src/client.py:run", "Function:src/worker.py:run"},
             )
 
+    def test_public_bootstrap_ignores_python_declarations_inside_strings(self) -> None:
+        self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
+        with (
+            tempfile.TemporaryDirectory() as repo_dir,
+            tempfile.TemporaryDirectory() as cache_dir,
+            tempfile.TemporaryDirectory() as runtime_home,
+        ):
+            repo = Path(repo_dir)
+            packet_path = Path(runtime_home) / "packet.json"
+            self.make_git_repo(repo)
+            (repo / "src" / "a.py").write_text(
+                "MID_GATE_MUTATOR = '''\n"
+                "def identity(pid):\n"
+                "    return pid\n\n"
+                "def gate_child():\n"
+                "    return None\n"
+                "'''\n\n"
+                "FSTRING_MUTATOR = f'''\n"
+                "def rendered_helper():\n"
+                "    return {1}\n"
+                "'''\n\n"
+                "def actual_handler(value='('):\n"
+                "    return value\n",
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "src/a.py"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "embedded helper script"])
+
+            result = repo_context_forge.run_cmd(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "codex_context_bootstrap.py"),
+                    "--repo",
+                    str(repo),
+                    "--mode",
+                    "pr",
+                    "--base",
+                    "HEAD~1",
+                    "--intent",
+                    "reconfirm",
+                    "--top",
+                    "1",
+                    "--cache-dir",
+                    cache_dir,
+                    "--map-build",
+                    "never",
+                    "--gitnexus-mode",
+                    "auto",
+                    "--allow-stale-pr-head",
+                    "--packet-json-out",
+                    str(packet_path),
+                ],
+                env={**os.environ, "HOME": runtime_home},
+                allow_fail=True,
+            )
+
+            packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
+            analysis = packet["gitnexus"]["analysis"]
+            actual_handler_entries = {
+                (entry["kind"], entry.get("resolved_identity"))
+                for entry in analysis["entries"]
+                if entry["target"] == "actual_handler"
+            }
+            self.assertEqual(
+                (
+                    result.returncode,
+                    analysis["status"],
+                    sorted(
+                        (entry["kind"], entry["file"], entry["target"])
+                        for entry in analysis["unresolved_checks"]
+                    ),
+                    packet["gitnexus"]["required_checks_resolved"],
+                    actual_handler_entries,
+                ),
+                (
+                    0,
+                    "resolved",
+                    [],
+                    True,
+                    {
+                        ("symbol_context", "Function:src/a.py:actual_handler"),
+                        ("symbol_impact", "Function:src/a.py:actual_handler"),
+                    },
+                ),
+            )
+
     def test_public_bootstrap_resolves_nested_file_context_by_exact_identity(self) -> None:
         self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
         with (
@@ -1704,7 +1790,7 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertFalse(status["available"])
             self.assertIn("head_sha", str(status["warning"]))
 
-    def test_workflow_index_rebuilds_previous_span_schema(self) -> None:
+    def test_workflow_index_rebuilds_previous_schema(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:
             repo = Path(repo_dir)
             self.make_git_repo(repo)
@@ -1714,7 +1800,7 @@ class RepoContextForgeTests(unittest.TestCase):
             with closing(sqlite3.connect(native_index.db_path)) as conn, conn:
                 conn.execute("UPDATE symbols SET end_line = line")
                 conn.execute(
-                    "UPDATE metadata SET value = '6' WHERE key = 'schema_version'"
+                    "UPDATE metadata SET value = '7' WHERE key = 'schema_version'"
                 )
 
             head_sha = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
@@ -1728,6 +1814,7 @@ class RepoContextForgeTests(unittest.TestCase):
 
             symbol = native_index.file_symbols("src/a.py", 1)[0]
             self.assertEqual((symbol.line, symbol.end_line), (1, 2))
+            self.assertEqual(native_index.status()["schema_version"], 8)
 
     def test_workflow_index_corrupt_database_fails_closed_for_all_readers(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:
