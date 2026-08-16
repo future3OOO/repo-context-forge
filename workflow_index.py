@@ -14,7 +14,7 @@ from typing import Callable, Iterable
 
 INDEX_DIR = ".repo-context-forge"
 INDEX_DB = "workflow-index.sqlite3"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 SOURCE_EXTENSIONS = {".js", ".jsx", ".mjs", ".py", ".ts", ".tsx"}
 STRUCTURED_EXTENSIONS = {".json", ".toml", ".yaml", ".yml"}
 FILE_COLUMNS = "path, base_score, symbol_count, line_count, base_rank"
@@ -418,11 +418,27 @@ class WorkflowIndex:
         seen: set[tuple[str, int]] = set()
         offset = 0
         lines = content.splitlines(keepends=True)
+        string_spans: list[tuple[tuple[int, int], tuple[int, int]]] = []
+        if extension == ".py":
+            source = iter(lines)
+            string_token_types = {
+                tokenize.STRING,
+                getattr(tokenize, "FSTRING_MIDDLE", tokenize.STRING),
+            }
+            try:
+                for token in tokenize.generate_tokens(lambda: next(source, "")):
+                    if token.type in string_token_types:
+                        string_spans.append((token.start, token.end))
+            except (IndentationError, tokenize.TokenError):
+                pass
         for line_number, raw_line in enumerate(lines, start=1):
             line = raw_line.rstrip("\r\n")
             for kind, pattern in patterns:
                 match = re.search(pattern, line)
                 if not match:
+                    continue
+                match_start = (line_number, match.start(1))
+                if any(start <= match_start < end for start, end in string_spans):
                     continue
                 if kind == "arrow" and not WorkflowIndex._is_arrow_initializer(
                     content, offset + match.end() - 1
