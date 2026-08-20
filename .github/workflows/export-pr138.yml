@@ -1,0 +1,22 @@
+name: export repo context forge
+
+on:
+  push:
+    branches:
+      - automation/export-for-pr138
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive source
+        run: tar --exclude=.git -czf /tmp/repo-context-forge.tgz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repo-context-forge-source
+          path: /tmp/repo-context-forge.tgz
+          retention-days: 1
