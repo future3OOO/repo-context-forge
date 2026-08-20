@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - automation/export-for-pr138
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
