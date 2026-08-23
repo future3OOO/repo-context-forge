@@ -638,8 +638,12 @@ def candidate_tree(repo: Path) -> str:
         env = {**os.environ, "GIT_INDEX_FILE": str(index_path)}
         run_cmd(["git", "read-tree", "HEAD"], cwd=repo, env=env)
         run_cmd(["git", "add", "-A", "--", "."], cwd=repo, env=env)
+        generated_paths = run_cmd(
+            ["git", "ls-files", "-z"], cwd=repo, env=env).stdout.split("\0")
         run_cmd(
-            ["git", "rm", "-r", "--cached", "--ignore-unmatch", "--", *TOOL_CACHE_PATHS],
+            ["git", "rm", "-r", "--cached", "--ignore-unmatch", "--",
+             *TOOL_CACHE_PATHS, *(path for path in generated_paths
+                                  if path and is_generated_or_cache_path(path))],
             cwd=repo,
             env=env,
             allow_fail=True,
@@ -1706,8 +1710,11 @@ def make_target_entries(
     intent: str | None = None,
     intent_resolution: workflow_index.IntentResolution | None = None,
 ) -> list[dict[str, object]]:
-    intent = intent if mode == "intent" else None
-    intent_resolution = intent_resolution or soul_map.native_index.resolve_intent(intent or "")
+    if mode == "intent":
+        intent_resolution = intent_resolution or soul_map.native_index.resolve_intent(intent or "")
+    else:
+        intent = None
+        intent_resolution = workflow_index.IntentResolution((), (), (), ())
     relevance_by_symbol = {
         (item.path, item.line, item.name): item.score
         for item in intent_resolution.symbol_relevance
@@ -2401,7 +2408,10 @@ def make_packet(
 
     source_git_state = read_git_state(target_state.source_repo, base_ref, head_ref)
     reference_only = reference_only_prefixes(target_state.source_repo)
-    intent_resolution = native_index.resolve_intent(intent or "")
+    intent_resolution = (
+        native_index.resolve_intent(intent or "")
+        if mode == "intent" else workflow_index.IntentResolution((), (), (), ())
+    )
     targets = target_files_for_mode(
         mode,
         source_git_state,
@@ -2440,11 +2450,23 @@ def make_packet(
     )
     index_freshness_status = str(gitnexus_status.get("status") or "unknown")
     gitnexus_repo_name = str(gitnexus_status.get("repo") or gitnexus_repo or target_state.analysis_repo.name)
+    graph_targets = [
+        entry for entry in target_entries
+        if (target_state.analysis_repo / str(entry["path"])).exists()
+        or (target_state.analysis_repo / str(entry["path"])).is_symlink()
+    ]
+    unavailable_targets = [entry for entry in target_entries if entry not in graph_targets]
     plan, omitted_check_count, omitted_required_checks = build_gitnexus_plan(
-        target_entries,
-        gitnexus_repo_name,
-        intent_mode=mode == "intent",
-    )
+        graph_targets, gitnexus_repo_name, intent_mode=mode == "intent")
+    unavailable_plan, unavailable_omitted, unavailable_required = build_gitnexus_plan(
+        unavailable_targets, gitnexus_repo_name, intent_mode=mode == "intent")
+    omitted_check_count += unavailable_omitted
+    for item in unavailable_plan:
+        if item.get("required") is True:
+            omitted_required_checks.append(item)
+        else:
+            omitted_check_count += 1
+    omitted_required_checks.extend(unavailable_required)
     gitnexus_status = gitnexus_analysis.execute(
         plan,
         gitnexus_status,

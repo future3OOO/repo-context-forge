@@ -336,7 +336,11 @@ class WorkflowIndex:
             if ("_" in match.group(0) or any(character.isupper()
                                                for character in match.group(0)[1:])) and not (
                 (match.start() > 0 and intent[match.start() - 1] in "./`")
-                or (match.end() < len(intent) and intent[match.end()] in "./`")
+                or (match.end() < len(intent) and (
+                    intent[match.end()] in "/`" or (
+                        intent[match.end()] == "." and match.end() + 1 < len(intent)
+                        and re.match(r"[A-Za-z_]", intent[match.end() + 1]))
+                ))
             )
         ))
         identifiers = list(dict.fromkeys([*code_identifiers, *bare_identifiers]))

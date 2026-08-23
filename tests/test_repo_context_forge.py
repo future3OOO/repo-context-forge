@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from collections import namedtuple
 from contextlib import closing, contextmanager
@@ -102,48 +103,36 @@ class RepoContextForgeTests(unittest.TestCase):
             **kwargs,
         )
 
-    def run_public_intent_bootstrap(
-        self,
-        repo: Path,
-        cache_dir: str,
-        runtime_home: str,
-        *,
-        intent: str = "Update src/a.py",
-        top: int = 1,
-        gitnexus_mode: str = "auto",
+    def run_public_bootstrap(
+        self, repo: Path, cache_dir: str, runtime_home: str, *,
+        mode: str, intent: str | None = None, base: str | None = None,
+        top: int = 1, gitnexus_mode: str = "auto",
     ):
         packet_path = Path(runtime_home) / "packet.json"
+        command = [
+            sys.executable, str(ROOT / "scripts" / "codex_context_bootstrap.py"),
+            "--repo", str(repo), "--mode", mode, "--top", str(top),
+            "--cache-dir", cache_dir, "--map-build", "never",
+            "--gitnexus-mode", gitnexus_mode, "--enforce-intake",
+            "--packet-json-out", str(packet_path),
+        ]
+        if intent is not None:
+            command.extend(("--intent", intent))
+        if base is not None:
+            command.extend(("--base", base, "--allow-stale-pr-head"))
         result = repo_context_forge.run_cmd(
-            [
-                sys.executable,
-                str(ROOT / "scripts" / "codex_context_bootstrap.py"),
-                "--repo",
-                str(repo),
-                "--mode",
-                "intent",
-                "--intent",
-                intent,
-                "--top",
-                str(top),
-                "--cache-dir",
-                cache_dir,
-                "--map-build",
-                "never",
-                "--gitnexus-mode",
-                gitnexus_mode,
-                "--enforce-intake",
-                "--packet-json-out",
-                str(packet_path),
-            ],
-            env={**os.environ, "HOME": runtime_home},
-            allow_fail=True,
-        )
-        packet = (
-            repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
-            if packet_path.exists()
-            else {}
-        )
+            command, env={**os.environ, "HOME": runtime_home}, allow_fail=True)
+        packet = repo_context_forge.json.loads(
+            packet_path.read_text(encoding="utf-8")) if packet_path.exists() else {}
         return result, packet
+
+    def run_public_intent_bootstrap(
+        self, repo: Path, cache_dir: str, runtime_home: str, *,
+        intent: str = "Update src/a.py", top: int = 1, gitnexus_mode: str = "auto",
+    ):
+        return self.run_public_bootstrap(
+            repo, cache_dir, runtime_home, mode="intent", intent=intent, top=top,
+            gitnexus_mode=gitnexus_mode)
 
     def run_off_mode_bootstrap(
         self,
@@ -729,32 +718,118 @@ class RepoContextForgeTests(unittest.TestCase):
             and status.get("reindex_attempted") is False,
             "CONTEXTVAR_TRANSACTION_OWNERSHIP_ESCAPED")
 
-    def test_public_bootstrap_candidate_tree_tracks_dirty_overlay(self) -> None:
+    def test_public_bootstrap_blocks_graph_time_candidate_mutation(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
-            trees = []
-            for source in (None, "def dirty_anchor():\n    return 'dirty'\n"):
-                if source is not None:
-                    (repo / "src" / "a.py").write_text(source, encoding="utf-8")
-                result, packet = self.run_off_mode_bootstrap(
-                    repo, cache_dir, runtime_home
-                )
-                self.assertEqual(
-                    result.returncode,
-                    0,
-                    "CANDIDATE_TREE_DID_NOT_IDENTIFY_ANALYZED_CONTENT",
-                )
-                trees.append(packet["target_state"].get("candidate_tree"))
+            names = [f"MutationAnchor{index}" for index in range(12)]
+            (repo / "src" / "a.py").write_text(
+                "".join(f"class {name}:\n    pass\n" for name in names), encoding="utf-8")
+            head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+            analysis_repo, _key = repo_context_forge.analysis_checkout_path(
+                repo, head, Path(cache_dir), "intent")
+            packet_path = Path(runtime_home) / "packet.json"
+            command = [
+                sys.executable, str(ROOT / "scripts" / "codex_context_bootstrap.py"),
+                "--repo", str(repo), "--mode", "intent", "--intent", "Update " + " ".join(names),
+                "--cache-dir", cache_dir, "--map-build", "never", "--gitnexus-mode", "auto",
+                "--enforce-intake", "--packet-json-out", str(packet_path)]
+            process = repo_context_forge.subprocess.Popen(
+                command, env={**os.environ, "HOME": runtime_home},
+                stdout=repo_context_forge.subprocess.PIPE,
+                stderr=repo_context_forge.subprocess.PIPE, text=True)
+            deadline = time.monotonic() + 30
+            while not (analysis_repo / ".gitnexus" / "meta.json").exists():
+                self.assertIsNone(process.poll(), "GRAPH_TIME_CANDIDATE_MUTATION_VALIDATED")
+                self.assertLess(time.monotonic(), deadline, "GRAPH_TIME_CANDIDATE_MUTATION_VALIDATED")
+                time.sleep(0.01)
+            (analysis_repo / "src" / "a.py").write_text("MUTATED = True\n", encoding="utf-8")
+            process.communicate(timeout=60)
+            packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
+            self.assertTrue(
+                process.returncode != 0 and not packet["gitnexus"]["required_checks_resolved"]
+                and not (analysis_repo / ".gitnexus" / "repo-context-forge-receipt.json").exists(),
+                "GRAPH_TIME_CANDIDATE_MUTATION_VALIDATED")
 
-            self.assertEqual(
-                trees[0],
-                repo_context_forge.run_git(repo, ["rev-parse", "HEAD^{tree}"]),
-                "CANDIDATE_TREE_DID_NOT_IDENTIFY_ANALYZED_CONTENT",
-            )
-            self.assertNotEqual(
-                trees[1],
-                trees[0],
-                "CANDIDATE_TREE_DID_NOT_IDENTIFY_ANALYZED_CONTENT",
-            )
+    def test_public_bootstrap_candidate_tree_tracks_supported_git_shapes(self) -> None:
+        def untracked(repo):
+            (repo / "src" / "new.py").write_text("NEW = 1\n", encoding="utf-8")
+        cases = {
+            "untracked": untracked,
+            "deletion": lambda repo: (repo / "src" / "a.py").unlink(),
+            "rename": lambda repo: (repo / "src" / "a.py").rename(repo / "src" / "b.py"),
+            "executable": lambda repo: (repo / "src" / "a.py").chmod(0o755),
+            "symlink": lambda repo: (repo / "src" / "link.py").symlink_to("a.py"),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name), self.public_intent_repo() as (
+                repo, cache_dir, runtime_home
+            ):
+                mutate(repo)
+                status = repo_context_forge.porcelain_status(repo)
+                index_tree = repo_context_forge.run_git(repo, ["write-tree"])
+                expected_tree = repo_context_forge.candidate_tree(repo)
+                result, packet = self.run_public_bootstrap(
+                    repo, cache_dir, runtime_home, mode="local")
+                projection = packet["advisorProjection"]
+                self.assertEqual(
+                    (result.returncode, projection["expectedCandidateTree"],
+                     projection["indexedCandidateTree"],
+                     packet["gitnexus"]["analysis"]["omitted_check_count"],
+                     repo_context_forge.porcelain_status(repo),
+                     repo_context_forge.run_git(repo, ["write-tree"])),
+                    (0, expected_tree, expected_tree,
+                     int(name in {"deletion", "rename"}), status, index_tree),
+                    "DELETED_GRAPH_OMISSION_ERASED")
+
+    def test_public_local_bootstrap_aligns_generated_candidate_exclusions(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "a.py").write_text("print('dirty')\n", encoding="utf-8")
+            cache = repo / "src" / "__pycache__"
+            cache.mkdir()
+            (cache / "a.cpython-311.pyc").write_bytes(b"bytes")
+            result, _packet = self.run_public_bootstrap(
+                repo, cache_dir, runtime_home, mode="local")
+            self.assertEqual(result.returncode, 0, "GENERATED_CANDIDATE_EXCLUSIONS_DIVERGED")
+
+    def test_public_bootstrap_requires_symbol_before_sentence_period(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "deep.py").write_text(
+                "class DeepAnchor:\n    pass\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "deep anchor"])
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, intent="Update DeepAnchor.")
+            target = next(item for item in packet["targets"] if item["path"] == "src/deep.py")
+            self.assertTrue(
+                result.returncode == 0 and "DeepAnchor" in target["intent_required_symbols"],
+                "SENTENCE_FINAL_EXACT_SYMBOL_NOT_REQUIRED")
+
+    def test_public_non_intent_modes_ignore_intent(self) -> None:
+        for mode in ("pr", "local", "repo"):
+            with self.subTest(mode=mode), self.public_intent_repo() as (
+                repo, cache_dir, runtime_home
+            ):
+                base = None
+                if mode == "pr":
+                    (repo / "src" / "a.py").write_text("print('changed')\n", encoding="utf-8")
+                    repo_context_forge.run_git(repo, ["add", "-A"])
+                    repo_context_forge.run_git(repo, ["commit", "-m", "changed"])
+                    base = "HEAD~1"
+                elif mode == "local":
+                    (repo / "src" / "a.py").write_text("print('dirty')\n", encoding="utf-8")
+                baseline_result, baseline = self.run_public_bootstrap(
+                    repo, cache_dir, runtime_home, mode=mode, base=base)
+                result, supplied = self.run_public_bootstrap(
+                    repo, cache_dir, runtime_home, mode=mode, base=base,
+                    intent="Update MissingAnchor")
+                signature = lambda packet: (
+                    [item["path"] for item in packet["targets"]],
+                    packet["gitnexus_plan"], packet["coverage_gaps"])
+                self.assertTrue(
+                    result.returncode == baseline_result.returncode
+                    and signature(supplied) == signature(baseline)
+                    and all("intent_evidence" not in item and not item["intent_required_symbols"]
+                            for item in supplied["targets"]),
+                    "NON_INTENT_PACKET_CONSUMED_INTENT")
 
     def test_public_bootstrap_blocks_absent_qualified_symbol(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -1142,7 +1217,6 @@ class RepoContextForgeTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as runtime_home,
         ):
             repo = Path(repo_dir)
-            packet_path = Path(runtime_home) / "packet.json"
             self.make_git_repo(repo)
             (repo / "src" / "a.py").write_text(
                 "MID_GATE_MUTATOR = '''\n"
@@ -1162,35 +1236,9 @@ class RepoContextForgeTests(unittest.TestCase):
             repo_context_forge.run_git(repo, ["add", "src/a.py"])
             repo_context_forge.run_git(repo, ["commit", "-m", "embedded helper script"])
 
-            result = repo_context_forge.run_cmd(
-                [
-                    sys.executable,
-                    str(ROOT / "scripts" / "codex_context_bootstrap.py"),
-                    "--repo",
-                    str(repo),
-                    "--mode",
-                    "pr",
-                    "--base",
-                    "HEAD~1",
-                    "--intent",
-                    "reconfirm",
-                    "--top",
-                    "1",
-                    "--cache-dir",
-                    cache_dir,
-                    "--map-build",
-                    "never",
-                    "--gitnexus-mode",
-                    "auto",
-                    "--allow-stale-pr-head",
-                    "--packet-json-out",
-                    str(packet_path),
-                ],
-                env={**os.environ, "HOME": runtime_home},
-                allow_fail=True,
-            )
-
-            packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
+            result, packet = self.run_public_bootstrap(
+                repo, cache_dir, runtime_home, mode="pr", base="HEAD~1",
+                intent="reconfirm")
             analysis = packet["gitnexus"]["analysis"]
             actual_handler_entries = {
                 (entry["kind"], entry.get("resolved_identity"))
@@ -1228,7 +1276,6 @@ class RepoContextForgeTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as runtime_home,
         ):
             repo = Path(repo_dir)
-            packet_path = Path(runtime_home) / "packet.json"
             self.make_git_repo(repo)
             (repo / "ARCHITECTURE.md").write_text("# Root architecture\n", encoding="utf-8")
             repo_context_forge.run_git(repo, ["add", "ARCHITECTURE.md"])
@@ -1240,34 +1287,9 @@ class RepoContextForgeTests(unittest.TestCase):
             repo_context_forge.run_git(repo, ["add", "docs/ARCHITECTURE.md"])
             repo_context_forge.run_git(repo, ["commit", "-m", "nested architecture"])
 
-            result = repo_context_forge.run_cmd(
-                [
-                    sys.executable,
-                    str(ROOT / "scripts" / "codex_context_bootstrap.py"),
-                    "--repo",
-                    str(repo),
-                    "--mode",
-                    "pr",
-                    "--base",
-                    "HEAD~1",
-                    "--top",
-                    "1",
-                    "--cache-dir",
-                    cache_dir,
-                    "--map-build",
-                    "never",
-                    "--gitnexus-mode",
-                    "auto",
-                    "--allow-stale-pr-head",
-                    "--packet-json-out",
-                    str(packet_path),
-                ],
-                env={**os.environ, "HOME": runtime_home},
-                allow_fail=True,
-            )
-
+            result, packet = self.run_public_bootstrap(
+                repo, cache_dir, runtime_home, mode="pr", base="HEAD~1")
             self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
-            packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
             self.assertNotIn("blocked", packet)
             self.assertTrue(packet["gitnexus"]["required_checks_resolved"])
             entries = packet["gitnexus"]["analysis"]["entries"]
@@ -1284,43 +1306,16 @@ class RepoContextForgeTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as runtime_home,
         ):
             repo = Path(repo_dir)
-            packet_path = Path(runtime_home) / "packet.json"
             self.make_git_repo(repo)
             (repo / "src" / "many.py").write_text(
-                "".join(
-                    f"def handle_{index}():\n    return {index}\n\n" for index in range(12)
-                ),
-                encoding="utf-8",
-            )
+                "".join(f"def handle_{index}():\n    return {index}\n\n" for index in range(12)),
+                encoding="utf-8")
             repo_context_forge.run_git(repo, ["add", "-A"])
             repo_context_forge.run_git(repo, ["commit", "-m", "many callables"])
 
-            result = repo_context_forge.run_cmd(
-                [
-                    sys.executable,
-                    str(ROOT / "scripts" / "codex_context_bootstrap.py"),
-                    "--repo",
-                    str(repo),
-                    "--mode",
-                    "repo",
-                    "--top",
-                    "1",
-                    "--cache-dir",
-                    cache_dir,
-                    "--map-build",
-                    "never",
-                    "--gitnexus-mode",
-                    "auto",
-                    "--enforce-intake",
-                    "--packet-json-out",
-                    str(packet_path),
-                ],
-                env={**os.environ, "HOME": runtime_home},
-                allow_fail=True,
-            )
-
+            result, packet = self.run_public_bootstrap(
+                repo, cache_dir, runtime_home, mode="repo")
             self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
-            packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
             analysis = packet["gitnexus"]["analysis"]
             self.assertEqual(len(analysis["entries"]), repo_context_forge.MAX_GITNEXUS_CHECKS)
             self.assertEqual(analysis["omitted_check_count"], 4)
@@ -1338,42 +1333,17 @@ class RepoContextForgeTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as runtime_home,
         ):
             repo = Path(repo_dir)
-            packet_path = Path(runtime_home) / "packet.json"
             self.make_git_repo(repo)
             (repo / "src" / "a.py").write_text(
-                "def handle():\n    return 1\n", encoding="utf-8"
-            )
+                "def handle():\n    return 1\n", encoding="utf-8")
             (repo / "src" / "use.py").write_text(
-                "from a import handle\n\ndef use():\n    return handle()\n", encoding="utf-8"
-            )
+                "from a import handle\n\ndef use():\n    return handle()\n", encoding="utf-8")
             repo_context_forge.run_git(repo, ["add", "-A"])
             repo_context_forge.run_git(repo, ["commit", "-m", "callable dependency"])
 
-            result = repo_context_forge.run_cmd(
-                [
-                    sys.executable,
-                    str(ROOT / "scripts" / "codex_context_bootstrap.py"),
-                    "--repo",
-                    str(repo),
-                    "--mode",
-                    "repo",
-                    "--top",
-                    "2",
-                    "--cache-dir",
-                    cache_dir,
-                    "--map-build",
-                    "never",
-                    "--gitnexus-mode",
-                    "auto",
-                    "--packet-json-out",
-                    str(packet_path),
-                ],
-                env={**os.environ, "HOME": runtime_home},
-                allow_fail=True,
-            )
-
+            result, packet = self.run_public_bootstrap(
+                repo, cache_dir, runtime_home, mode="repo", top=2)
             self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
-            packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
             self.assertNotIn("blocked", packet)
             self.assertEqual(packet["gitnexus"]["status"], "reindexed")
             self.assertTrue(packet["gitnexus"]["required_checks_resolved"])
