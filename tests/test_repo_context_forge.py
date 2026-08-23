@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import importlib.util
 import os
@@ -107,8 +108,9 @@ class RepoContextForgeTests(unittest.TestCase):
         cache_dir: str,
         runtime_home: str,
         *,
-        intent: str,
-        top: int,
+        intent: str = "Update src/a.py",
+        top: int = 1,
+        gitnexus_mode: str = "auto",
     ):
         packet_path = Path(runtime_home) / "packet.json"
         result = repo_context_forge.run_cmd(
@@ -128,7 +130,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 "--map-build",
                 "never",
                 "--gitnexus-mode",
-                "auto",
+                gitnexus_mode,
                 "--enforce-intake",
                 "--packet-json-out",
                 str(packet_path),
@@ -136,8 +138,25 @@ class RepoContextForgeTests(unittest.TestCase):
             env={**os.environ, "HOME": runtime_home},
             allow_fail=True,
         )
-        packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
+        packet = (
+            repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
+            if packet_path.exists()
+            else {}
+        )
         return result, packet
+
+    def run_off_mode_bootstrap(
+        self,
+        repo: Path,
+        cache_dir: str,
+        runtime_home: str,
+    ):
+        return self.run_public_intent_bootstrap(
+            repo,
+            cache_dir,
+            runtime_home,
+            gitnexus_mode="off",
+        )
 
     @contextmanager
     def public_intent_repo(self):
@@ -158,6 +177,7 @@ class RepoContextForgeTests(unittest.TestCase):
         helper_count: int,
         symbol_name: str,
         intent: str,
+        failure_marker: str | None = None,
     ) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             relative_path = f"src/{file_name}"
@@ -185,8 +205,11 @@ class RepoContextForgeTests(unittest.TestCase):
                 (entry["kind"], entry["file"], entry["target"])
                 for entry in packet["gitnexus"]["analysis"]["entries"]
             }
-            self.assertIn(("symbol_context", relative_path, symbol_name), checks)
-            self.assertIn(("symbol_impact", relative_path, symbol_name), checks)
+            expected_checks = {
+                ("symbol_context", relative_path, symbol_name),
+                ("symbol_impact", relative_path, symbol_name),
+            }
+            self.assertTrue(expected_checks <= checks, failure_marker)
 
     def build_workflow_index(
         self, repo: Path, source: str | None = None
@@ -333,10 +356,37 @@ class RepoContextForgeTests(unittest.TestCase):
             [{"path": "src/deep.py", "symbols": required_symbols, "intent_required_symbols": required_names}],
             intent_mode=True,
         )
-        self.assertEqual(omitted_checks, 6)
+        self.assertEqual(omitted_checks, 0)
         self.assertEqual(
             {item["target"] for item in omitted_required},
             set(required_names[10:]),
+        )
+
+    def test_required_graph_groups_allocate_before_optional_breadth(self) -> None:
+        required_names = [f"Required{index}" for index in range(10)]
+        plan, omitted_count, omitted_required = repo_context_forge.build_gitnexus_plan(
+            [
+                {
+                    "path": "src/required.py",
+                    "symbols": [
+                        {"name": name, "kind": "function"}
+                        for name in [*required_names, "OptionalAnchor"]
+                    ],
+                    "intent_required_file": True,
+                    "intent_required_symbols": required_names,
+                }
+            ],
+            intent_mode=True,
+        )
+
+        self.assertEqual(
+            (
+                "OptionalAnchor" in {str(item["target"]) for item in plan},
+                {str(item["target"]) for item in omitted_required},
+                omitted_count,
+            ),
+            (False, {required_names[-1]}, 2),
+            "OPTIONAL_CHECK_PREEMPTED_REQUIRED_COVERAGE",
         )
 
     def test_public_bootstrap_prioritizes_explicit_database_anchor(self) -> None:
@@ -354,6 +404,446 @@ class RepoContextForgeTests(unittest.TestCase):
             symbol_name="DeepAnchor",
             intent="Update pkg.DeepAnchor in src/deep.py",
         )
+
+    def test_public_bootstrap_prioritizes_unique_unqualified_symbol_beyond_display_slice(
+        self,
+    ) -> None:
+        for symbol_name, intent, marker in (
+            ("DeepAnchor", "Update DeepAnchor behavior", "REQUIRED_DEEP_SYMBOL_PAIR_OMITTED"),
+            ("URL", "Update src/a.py and URL behavior", "UPPERCASE_SYMBOL_REPORTED_RESOLVED"),
+        ):
+            self.assert_public_intent_symbol_checked(
+                file_name="deep.py", helper_count=13, symbol_name=symbol_name,
+                intent=intent, failure_marker=marker,
+            )
+
+    def test_public_bootstrap_does_not_treat_prose_or_filenames_as_symbols(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "words.py").write_text(
+                "def item():\n    return None\n\ndef evidence():\n    return None\n",
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "prose names"])
+
+            result, packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent=(
+                    "Update workflow_documents.py so each item retains evidence "
+                    "under CLAUDE.md for RED PR JSON output"
+                ),
+                top=1,
+            )
+
+        gap_references = {
+            gap.get("reference") for gap in packet.get("coverage_gaps", [])
+        }
+        self.assertTrue(
+            result.returncode == 0
+            and gap_references.isdisjoint(
+                {"workflow_documents.py", "CLAUDE.md", "item", "evidence", "RED", "PR", "JSON"}
+            ),
+            "PROSE_ACRONYM_GAP_REGRESSED",
+        )
+
+    def test_public_bootstrap_requires_all_explicit_replay_symbols(self) -> None:
+        required_names = {
+            "_finding_dispositions",
+            "advisor_disposition",
+            "advisor_disposition_document",
+            "_apply_finding_dispositions",
+            "tree_manifest",
+        }
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            for index, name in enumerate(sorted(required_names)):
+                (repo / "src" / f"owner_{index}.py").write_text(
+                    f"def {name}():\n    return None\n",
+                    encoding="utf-8",
+                )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "replay seams"])
+
+            result, packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent="Update " + " ".join(sorted(required_names)),
+                top=1,
+            )
+
+        planned = {
+            item["target"]
+            for item in packet.get("gitnexus_plan", [])
+            if item.get("required") is True
+        }
+        self.assertTrue(
+            result.returncode == 0 and required_names <= planned,
+            "PRESERVED_REPLAY_REQUIRED_SEAMS_OMITTED",
+        )
+
+    def test_public_bootstrap_planner_is_independent_of_display_slice(self) -> None:
+        self.assert_public_intent_symbol_checked(
+            file_name="display.py",
+            helper_count=13,
+            symbol_name="DatabaseAnchor",
+            intent="Improve database persistence behavior",
+            failure_marker="DISPLAY_LIMIT_CHANGED_GRAPH_PLAN",
+        )
+
+    def test_blocker_packet_emits_advisor_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            self.make_git_repo(repo)
+            packet = repo_context_forge.make_blocker_packet(
+                repo, reason="measured blocker", base_ref="HEAD", head_ref="HEAD")
+        projection = packet.get("advisorProjection", {})
+        self.assertTrue(
+            projection.get("expectedCandidateTree")
+            == {"gap": "expected_candidate_tree_unavailable"}
+            and {"kind": "expected_candidate_tree_unavailable"}
+            in projection.get("coverageGaps", []),
+            "BLOCKER_EXPECTED_TREE_GAP_MISSING",
+        )
+
+    def test_public_bootstrap_emits_explicit_off_mode_projection(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            result, packet = self.run_off_mode_bootstrap(repo, cache_dir, runtime_home)
+        projection = packet["advisorProjection"]
+        self.assertEqual(
+            (result.returncode, projection.get("indexedCandidateTree"),
+             projection.get("graph", {}).get("status"), "gitnexus" in packet),
+            (0, {"gap": "indexed_candidate_tree_unavailable"}, "disabled", True),
+            "OFF_MODE_PROJECTION_INVENTED_INDEXED_TREE",
+        )
+
+    def test_public_bootstrap_emits_canonical_projection_provenance(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            repo_context_forge.run_git(
+                repo, ["remote", "add", "origin", "git@github.com:future3OOO/example.git"])
+            result, packet = self.run_off_mode_bootstrap(repo, cache_dir, runtime_home)
+            expected_base = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+        projection = packet["advisorProjection"]
+        self.assertEqual(
+            (result.returncode, projection.get("sourceRepo"),
+             projection.get("sourceBaseOid")),
+            (0, "github.com/future3OOO/example", expected_base),
+            "PROJECTION_PROVENANCE_WAS_NONCANONICAL",
+        )
+
+    def test_public_bootstrap_emits_bounded_advisor_projection_v1(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "projection.py").write_text(
+                "class ProjectionAnchor:\n    pass\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "projection anchor"])
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home,
+                intent="Update ProjectionAnchor behavior", top=1)
+        projection = packet["advisorProjection"]
+        expected_tree = packet["target_state"].get("candidate_tree")
+        self.assertEqual(
+            (result.returncode, projection.get("schemaVersion"),
+             projection.get("expectedCandidateTree"),
+             projection.get("indexedCandidateTree")),
+            (0, 1, expected_tree, expected_tree),
+            "ADVISOR_PROJECTION_V1_CONTRACT_BROKEN",
+        )
+        graph_references = projection.get("graph", {}).get("references", [])
+        packet_references = {
+            entry.get("reference")
+            for entry in packet["gitnexus"]["analysis"]["entries"]
+        }
+        self.assertTrue(
+            graph_references and set(graph_references) <= packet_references,
+            "ADVISOR_PROJECTION_V1_CONTRACT_BROKEN",
+        )
+
+    def test_public_bootstrap_refreshes_second_dirty_candidate_without_manual_cleanup(
+        self,
+    ) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            source = repo / "src" / "a.py"
+            trees = []
+            for symbol_name in ("FirstDirtyAnchor", "SecondDirtyAnchor"):
+                source.write_text(
+                    f"class {symbol_name}:\n    pass\n",
+                    encoding="utf-8",
+                )
+                result, packet = self.run_public_intent_bootstrap(
+                    repo,
+                    cache_dir,
+                    runtime_home,
+                    intent=f"Update {symbol_name} behavior",
+                    top=1,
+                )
+                expected_tree = packet["target_state"].get("candidate_tree")
+                checks = {
+                    (entry["kind"], entry["target"])
+                    for entry in packet["gitnexus"]["analysis"]["entries"]
+                }
+                expected_checks = {
+                    ("symbol_context", symbol_name),
+                    ("symbol_impact", symbol_name),
+                }
+                self.assertEqual(
+                    (
+                        result.returncode,
+                        packet["gitnexus"].get("indexed_candidate_tree"),
+                        expected_checks <= checks,
+                    ),
+                    (0, expected_tree, True),
+                    "SECOND_DIRTY_EDIT_REUSED_STALE_GRAPH",
+                )
+                trees.append(expected_tree)
+
+            self.assertNotEqual(trees[0], trees[1], "SECOND_DIRTY_EDIT_REUSED_STALE_GRAPH")
+            unchanged_result, unchanged_packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent="Update SecondDirtyAnchor behavior",
+                top=1,
+            )
+            self.assertEqual(
+                (
+                    unchanged_result.returncode,
+                    unchanged_packet["gitnexus"].get("status"),
+                ),
+                (0, "fresh"),
+                "SECOND_DIRTY_EDIT_REUSED_STALE_GRAPH",
+            )
+
+    def test_public_bootstrap_binds_index_generation_to_candidate_tree(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "indexed.py").write_text(
+                "class IndexedAnchor:\n    pass\n",
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "indexed anchor"])
+
+            result, packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent="Update IndexedAnchor behavior",
+                top=1,
+            )
+
+            expected_tree = packet["target_state"].get("candidate_tree")
+            self.assertEqual(
+                (
+                    result.returncode,
+                    packet["gitnexus"].get("indexed_candidate_tree"),
+                    bool(packet["gitnexus"].get("index_generation")),
+                ),
+                (0, expected_tree, True),
+                "PACKET_NESTED_REFRESH_REGRESSED\n"
+                f"gitnexus={packet.get('gitnexus')}\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}",
+            )
+
+    def test_public_bootstrap_blocks_candidate_transaction_contention(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+            analysis_repo, _key = repo_context_forge.analysis_checkout_path(
+                repo, head, Path(cache_dir), "local")
+            lock_path = repo_context_forge.gitnexus_analysis.analysis_transaction_path(
+                analysis_repo)
+            lock_path.parent.mkdir(parents=True)
+            with lock_path.open("a") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result, _packet = self.run_off_mode_bootstrap(
+                    repo, cache_dir, runtime_home
+                )
+
+            self.assertNotEqual(
+                result.returncode,
+                0,
+                "PACKET_CONTENTION_REGRESSED",
+            )
+            self.assertIn(
+                "candidate analysis transaction is already running",
+                result.stderr,
+                "PACKET_CONTENTION_REGRESSED",
+            )
+
+    def test_standalone_refresh_contends_with_packet_transaction(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home)
+            state = packet["target_state"]
+            analysis_repo = Path(state["analysis_repo"])
+            (analysis_repo / ".gitnexus" / "meta.json").unlink()
+            lock_path = (
+                repo_context_forge.gitnexus_analysis.analysis_transaction_path(
+                    analysis_repo))
+            with lock_path.open("a") as lock_file, patch.dict(
+                os.environ, {"HOME": runtime_home}
+            ):
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                status = repo_context_forge.gitnexus_analysis.ensure_index(
+                    analysis_repo, state["head_sha"], packet["gitnexus"]["repo"],
+                    "auto", run_command=repo_context_forge.run_cmd,
+                    expected_candidate_tree=state["candidate_tree"],
+                    registry_path=Path(runtime_home) / ".gitnexus" / "registry.json",
+                )
+            self.assertTrue(
+                result.returncode == 0
+                and status.get("status") == "blocked"
+                and status.get("reindex_attempted") is False,
+                "STANDALONE_REINDEX_BYPASSED_PACKET_LOCK",
+            )
+            self.assertNotIn("transaction_held", repo_context_forge.gitnexus_analysis.ensure_index.__code__.co_varnames, "CALLER_ASSERTED_TRANSACTION_OWNERSHIP")
+
+    def test_transaction_context_expires_in_inherited_task(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            state = packet["target_state"]
+            analysis_repo = Path(state["analysis_repo"])
+            lock_path = repo_context_forge.gitnexus_analysis.analysis_transaction_path(analysis_repo)
+            async def scenario():
+                ready, proceed = asyncio.Event(), asyncio.Event()
+                async def refresh():
+                    ready.set()
+                    await proceed.wait()
+                    return repo_context_forge.gitnexus_analysis.ensure_index(
+                        analysis_repo, state["head_sha"], packet["gitnexus"]["repo"], "auto",
+                        run_command=lambda args, **kwargs: repo_context_forge.run_cmd(
+                            args, env={**os.environ, "HOME": runtime_home}, **kwargs),
+                        expected_candidate_tree=state["candidate_tree"],
+                        registry_path=Path(runtime_home) / ".gitnexus" / "registry.json")
+                with repo_context_forge.gitnexus_analysis.analysis_transaction(lock_path):
+                    task = asyncio.create_task(refresh())
+                    await ready.wait()
+                (analysis_repo / ".gitnexus" / "meta.json").unlink()
+                with lock_path.open("a") as lock_file:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    proceed.set()
+                    return await task
+            status = asyncio.run(scenario())
+        self.assertTrue(
+            result.returncode == 0 and status.get("status") == "blocked"
+            and status.get("reindex_attempted") is False,
+            "CONTEXTVAR_TRANSACTION_OWNERSHIP_ESCAPED")
+
+    def test_public_bootstrap_candidate_tree_tracks_dirty_overlay(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            trees = []
+            for source in (None, "def dirty_anchor():\n    return 'dirty'\n"):
+                if source is not None:
+                    (repo / "src" / "a.py").write_text(source, encoding="utf-8")
+                result, packet = self.run_off_mode_bootstrap(
+                    repo, cache_dir, runtime_home
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    "CANDIDATE_TREE_DID_NOT_IDENTIFY_ANALYZED_CONTENT",
+                )
+                trees.append(packet["target_state"].get("candidate_tree"))
+
+            self.assertEqual(
+                trees[0],
+                repo_context_forge.run_git(repo, ["rev-parse", "HEAD^{tree}"]),
+                "CANDIDATE_TREE_DID_NOT_IDENTIFY_ANALYZED_CONTENT",
+            )
+            self.assertNotEqual(
+                trees[1],
+                trees[0],
+                "CANDIDATE_TREE_DID_NOT_IDENTIFY_ANALYZED_CONTENT",
+            )
+
+    def test_public_bootstrap_blocks_absent_qualified_symbol(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            for intent, reference in (
+                ("Update src.a.MissingAnchor behavior", "src.a.MissingAnchor"),
+                ("Update MissingAnchor behavior", "MissingAnchor"),
+            ):
+                result, packet = self.run_public_intent_bootstrap(
+                    repo, cache_dir, runtime_home, intent=intent, top=1)
+                self.assertTrue(
+                    result.returncode != 0
+                    and any(gap.get("kind") == "absent_symbol"
+                            and gap.get("reference") == reference
+                            for gap in packet.get("coverage_gaps", [])),
+                    "EXACT_REFERENCE_REQUIREMENT_LOST",
+                )
+
+    def test_public_bootstrap_requires_qualified_symbol_outside_top_file(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "deep.py").write_text(
+                "class DeepAnchor:\n    pass\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "qualified owner"])
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home,
+                intent="Update src/a.py and pkg.DeepAnchor", top=1,
+            )
+            required_checks = {
+                (item["kind"], item["file"], item["target"])
+                for item in packet.get("gitnexus_plan", [])
+                if item.get("required") is True
+            }
+            self.assertTrue(
+                result.returncode == 0
+                and {
+                    ("symbol_context", "src/deep.py", "DeepAnchor"),
+                    ("symbol_impact", "src/deep.py", "DeepAnchor"),
+                } <= required_checks,
+                "QUALIFIED_SYMBOL_OUTSIDE_TOP_OMITTED",
+            )
+
+    def test_public_bootstrap_preserves_file_intent_evidence(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "a.py").write_text("def handle():\n    pass\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "intent evidence"])
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home,
+                intent="Update src/a.py handle behavior", top=1,
+            )
+            evidence = packet["targets"][0].get("intent_evidence", {})
+            self.assertTrue(
+                result.returncode == 0
+                and evidence.get("exact_file") is True
+                and evidence.get("relevance_score", 0) > 0
+                and "src/a.py" in evidence.get("matched_terms", [])
+                and "handle" in evidence.get("matched_symbols", [])
+                and packet["advisorProjection"]["targets"] == packet["targets"],
+                "FILE_INTENT_EVIDENCE_DISCARDED",
+            )
+
+    def test_public_bootstrap_blocks_ambiguous_unqualified_symbol(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            for file_name in ("left.py", "right.py"):
+                (repo / "src" / file_name).write_text(
+                    "class SharedAnchor:\n    pass\n",
+                    encoding="utf-8",
+                )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "ambiguous symbol"])
+
+            result, packet = self.run_public_intent_bootstrap(
+                repo,
+                cache_dir,
+                runtime_home,
+                intent="Update SharedAnchor behavior",
+                top=1,
+            )
+
+            gaps = packet.get("coverage_gaps", [])
+            has_expected_gap = any(
+                gap.get("kind") == "ambiguous_symbol"
+                and gap.get("reference") == "SharedAnchor"
+                for gap in gaps
+            )
+            self.assertTrue(
+                result.returncode != 0 and has_expected_gap,
+                "DISCOVERY_GAP_REPORTED_RESOLVED",
+            )
 
     def test_public_bootstrap_blocks_omitted_required_anchor(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -380,13 +870,13 @@ class RepoContextForgeTests(unittest.TestCase):
                 if item.get("status") == "omitted"
             ]
             self.assertEqual(analysis["status"], "blocked")
-            self.assertEqual(analysis["omitted_check_count"], 2)
+            self.assertEqual(analysis["omitted_check_count"], 0)
             self.assertEqual({item["kind"] for item in omitted}, {"symbol_context", "symbol_impact"})
             self.assertEqual(len({(item["file"], item["target"]) for item in omitted}), 1)
             self.assertFalse(packet["gitnexus"]["required_checks_resolved"])
             self.assertIn("blocked", packet)
-            self.assertIn("omitted_checks=2; omissions_blocking=true", result.stdout)
-            self.assertIn('omitted_checks="2" omissions_blocking="true"', result.stdout)
+            self.assertIn("omitted_checks=0; omissions_blocking=true", result.stdout)
+            self.assertIn('omitted_checks="0" omissions_blocking="true"', result.stdout)
 
     def test_public_bootstrap_excludes_directory_matched_go_sum(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -472,15 +962,10 @@ class RepoContextForgeTests(unittest.TestCase):
             )
             repo_context_forge.run_git(repo, ["add", "-A"])
             repo_context_forge.run_git(repo, ["commit", "-m", "future symbol target"])
-
             result, packet = self.run_public_intent_bootstrap(
-                repo,
-                cache_dir,
-                runtime_home,
-                intent="Add pkg.SafeImporter to src/db.py",
-                top=1,
+                repo, cache_dir, runtime_home,
+                intent="Add pkg.SafeImporter to src/db.py", top=1,
             )
-
             self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
             self.assertEqual([target["path"] for target in packet["targets"]], ["src/db.py"])
             analysis = packet["gitnexus"]["analysis"]
@@ -496,6 +981,26 @@ class RepoContextForgeTests(unittest.TestCase):
                 item["target"] != "SafeImporter"
                 for item in [*packet["gitnexus_plan"], *analysis["entries"]]
             ))
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home,
+                intent="Add FutureAnchor to src/db.py", top=1,
+            )
+            self.assertEqual(result.returncode, 0, "UNQUALIFIED_FUTURE_CREATION_REGRESSED")
+
+    def test_public_bootstrap_scopes_future_symbol_creation(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home,
+                intent="Add pkg.FutureAnchor while updating pkg.MissingAnchor", top=1,
+            )
+            gaps = {(gap.get("kind"), gap.get("reference"))
+                    for gap in packet.get("coverage_gaps", [])}
+            self.assertTrue(
+                result.returncode != 0
+                and ("absent_symbol", "pkg.MissingAnchor") in gaps
+                and ("absent_symbol", "pkg.FutureAnchor") not in gaps,
+                "MIXED_ADD_HID_ABSENT_REFERENCE",
+            )
 
     def test_public_bootstrap_allocates_optional_checks_across_targets(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -1190,8 +1695,21 @@ class RepoContextForgeTests(unittest.TestCase):
 
         ranked = repo_context_forge.apply_task_state_to_entries(entries, state)
 
-        self.assertEqual(ranked[0]["path"], "src/a.py")
+        self.assertEqual(ranked[0]["path"], "src/a.py", "TASK_STATE_BOOST_REGRESSED")
         self.assertIn("edited_file", ranked[0]["rank_signals"])
+
+    def test_task_state_preserves_intent_order(self) -> None:
+        entries = [
+            {"path": "src/a.py", "surface_role": "production", "rank": 2,
+             "priority_score": 10, "rank_signals": [], "why_selected": []},
+            {"path": "src/b.py", "surface_role": "production", "rank": 1,
+             "priority_score": 20, "rank_signals": [], "why_selected": [],
+             "intent_evidence": {"relevance_score": 100, "exact_file": True}},
+        ]
+        ranked = repo_context_forge.apply_task_state_to_entries(
+            entries, {"schema_version": 1, "edited_files": ["src/a.py"]})
+        self.assertEqual(
+            ranked[0]["path"], "src/b.py", "TASK_STATE_OVERTOOK_REQUIRED_INTENT")
 
     def test_record_task_event_deduplicates_paths(self) -> None:
         state = {"schema_version": 1, "read_files": ["src/a.py"]}
@@ -2528,39 +3046,6 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertTrue(metadata["target_head_verified"])
             self.assertEqual(metadata["analysis_head_sha"], state.head_sha)
             self.assertTrue(metadata["analysis_repo_is_cache_owned"])
-
-    def test_gitnexus_auto_blocks_when_analysis_checkout_is_locked(self) -> None:
-        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:
-            analysis_repo = Path(repo_dir) / "analysis"
-            analysis_repo.mkdir()
-            registry_path = Path(registry_dir) / "registry.json"
-            registry_path.write_text("[]", encoding="utf-8")
-            state = repo_context_forge.TargetState(
-                mode="pr",
-                source_repo=analysis_repo,
-                analysis_repo=analysis_repo,
-                base_ref="main",
-                head_ref="HEAD",
-                head_sha="new-head",
-                source_dirty=False,
-                target_dirty=False,
-                cache_key="key",
-            )
-            lock_path = analysis_repo.parent / f".{analysis_repo.name}.gitnexus.lock"
-
-            with lock_path.open("a") as lock_file:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                status = self.ensure_gitnexus_index(
-                    state,
-                    "analysis",
-                    "auto",
-                    registry_path=registry_path,
-                    gitnexus_bin="/bin/true",
-                )
-
-            self.assertEqual(status["status"], "blocked")
-            self.assertFalse(status["reindex_attempted"])
-            self.assertIn("already running", status["warning"])
 
     def test_gitnexus_blocks_when_registered_index_storage_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:

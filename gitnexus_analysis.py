@@ -5,8 +5,10 @@ import json
 import shutil
 import subprocess
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator, TextIO
 
 
 GITNEXUS_REGISTRY = Path.home() / ".gitnexus" / "registry.json"
@@ -16,6 +18,30 @@ MAX_OUTPUT_BYTES = 256_000
 MAX_FACTS = 50
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
+ACTIVE_TRANSACTION: ContextVar[tuple[str, TextIO] | None] = ContextVar("active_analysis_transaction", default=None)
+
+
+def analysis_transaction_path(analysis_repo: Path) -> Path:
+    return analysis_repo.parent / f".{analysis_repo.name}.gitnexus.lock"
+
+
+@contextmanager
+def analysis_transaction(lock_path: Path) -> Iterator[None]:
+    key = str(lock_path.resolve())
+    if (active := ACTIVE_TRANSACTION.get()) is not None and active[0] == key and not active[1].closed:
+        yield
+        return
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("candidate analysis transaction is already running") from exc
+        token = ACTIVE_TRANSACTION.set((key, lock_file))
+        try:
+            yield
+        finally:
+            ACTIVE_TRANSACTION.reset(token)
 
 
 def _read_registry(registry_path: Path) -> list[dict[str, object]]:
@@ -47,10 +73,21 @@ def _find_entry(
     return None
 
 
+def _read_json_object(path: Path) -> dict[str, object] | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _status_from_entry(
     entry: dict[str, object] | None,
     analysis_repo: Path,
     expected_head: str,
+    expected_candidate_tree: str | None,
     repo_name: str,
     run_command: RunCommand,
 ) -> dict[str, object]:
@@ -67,21 +104,49 @@ def _status_from_entry(
             )
             indexed_head = proc.stdout.strip() if proc.returncode == 0 else ""
     index_present = bool(index_path and index_path.exists())
+    indexed_at = str(entry.get("indexedAt") or "") if entry else ""
+    local_meta = _read_json_object(index_path / "meta.json") if index_path else None
+    local_indexed_at = str(local_meta.get("indexedAt") or "") if local_meta else ""
+    generation_fresh = bool(
+        indexed_head == expected_head
+        and index_present
+        and indexed_at
+        and indexed_at == local_indexed_at
+        and str(local_meta.get("repoPath") or "") == str(analysis_repo.resolve())
+    )
+    receipt_path = index_path / "repo-context-forge-receipt.json" if index_path else None
+    receipt = _read_json_object(receipt_path) if receipt_path else None
+    receipt_fresh = bool(
+        generation_fresh
+        and expected_candidate_tree
+        and receipt
+        and receipt.get("schemaVersion") == 1
+        and receipt.get("analysisRepo") == str(analysis_repo.resolve())
+        and receipt.get("committedHeadOid") == expected_head
+        and receipt.get("candidateTree") == expected_candidate_tree
+        and receipt.get("indexedAt") == indexed_at
+    )
     return {
         "repo": str(entry.get("name") or repo_name) if entry else repo_name,
         "expected_repo_path": str(analysis_repo),
         "expected_head_sha": expected_head,
+        "expected_candidate_tree": expected_candidate_tree or "",
         "indexed_head_sha": indexed_head,
-        "indexed_at": str(entry.get("indexedAt") or "") if entry else "",
+        "indexed_at": indexed_at,
+        "local_indexed_at": local_indexed_at,
+        "index_generation": indexed_at if generation_fresh else "",
         "index_path": str(index_path or ""),
         "index_present": index_present,
-        "index_fresh": indexed_head == expected_head and index_present,
+        "index_generation_fresh": generation_fresh,
+        "indexed_candidate_tree": expected_candidate_tree if receipt_fresh else "",
+        "index_fresh": receipt_fresh,
     }
 
 
 def _current_status(
     analysis_repo: Path,
     expected_head: str,
+    expected_candidate_tree: str | None,
     repo_name: str,
     registry_path: Path,
     run_command: RunCommand,
@@ -90,6 +155,7 @@ def _current_status(
         _find_entry(analysis_repo, repo_name, registry_path),
         analysis_repo,
         expected_head,
+        expected_candidate_tree,
         repo_name,
         run_command,
     )
@@ -109,6 +175,7 @@ def ensure_index(
     mode: str,
     *,
     run_command: RunCommand,
+    expected_candidate_tree: str | None = None,
     registry_path: Path = GITNEXUS_REGISTRY,
     gitnexus_bin: str | None = None,
 ) -> dict[str, object]:
@@ -117,6 +184,7 @@ def ensure_index(
         "repo": chosen_repo_name,
         "expected_repo_path": str(analysis_repo),
         "expected_head_sha": expected_head,
+        "expected_candidate_tree": expected_candidate_tree or "",
         "reindex_attempted": False,
         "required_checks_resolved": False,
     }
@@ -131,7 +199,14 @@ def ensure_index(
             "warning": "GitNexus binary not found; blast-radius claims are blocked",
         }
 
-    status_args = (analysis_repo, expected_head, chosen_repo_name, registry_path, run_command)
+    status_args = (
+        analysis_repo,
+        expected_head,
+        expected_candidate_tree,
+        chosen_repo_name,
+        registry_path,
+        run_command,
+    )
     status = _current_status(*status_args)
     if _accept_fresh(status):
         return status
@@ -141,54 +216,105 @@ def ensure_index(
             status["warning"] = "GitNexus index storage is missing; blast-radius claims are blocked"
         return status
 
-    lock_path = analysis_repo.parent / f".{analysis_repo.name}.gitnexus.lock"
+    def reindex() -> dict[str, object]:
+        current = _current_status(*status_args)
+        if _accept_fresh(current):
+            return current
+        proc = run_command(
+            [binary, "analyze", "--force", "--skip-agents-md", str(analysis_repo)],
+            allow_fail=True,
+            suppress_core_dump=True,
+        )
+        current = _current_status(*status_args)
+        current.update(reindex_attempted=True, reindex_returncode=proc.returncode)
+        if proc.returncode != 0:
+            current.update(
+                status="blocked",
+                warning="GitNexus reindex failed; blast-radius claims are blocked",
+                stderr=proc.stderr[-2000:],
+            )
+        elif current["index_generation_fresh"]:
+            current.update(status="reindexed", receipt_pending=True)
+        else:
+            current["status"] = "blocked"
+            failure = "did not create registered index storage" if not current.get(
+                "index_present"
+            ) else "index generation is stale after reindex"
+            current["warning"] = f"GitNexus reindex {failure}; blast-radius claims are blocked"
+        return current
+
     try:
-        lock_file = lock_path.open("a")
+        with analysis_transaction(analysis_transaction_path(analysis_repo)):
+            return reindex()
     except OSError as exc:
         status.update(
             status="blocked",
             reindex_attempted=False,
             warning=f"GitNexus reindex lock failed; blast-radius claims are blocked ({exc})",
         )
-        return status
-    try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+    except RuntimeError:
         status.update(
             status="blocked",
             reindex_attempted=False,
             warning="GitNexus reindex is already running for this analysis checkout",
         )
-        lock_file.close()
-        return status
+    return status
 
-    with lock_file:
-        status = _current_status(*status_args)
-        fresh_after_lock = _accept_fresh(status)
-        if fresh_after_lock:
-            return status
-        proc = run_command(
-            [binary, "analyze", "--force", "--skip-agents-md", str(analysis_repo)],
-            allow_fail=True,
-            suppress_core_dump=True,
+
+def publish_receipt(
+    gitnexus_status: dict[str, object],
+    analysis_repo: Path,
+    expected_head: str,
+    expected_candidate_tree: str,
+    *,
+    run_command: RunCommand,
+    registry_path: Path = GITNEXUS_REGISTRY,
+) -> dict[str, object]:
+    status_args = (
+        analysis_repo,
+        expected_head,
+        expected_candidate_tree,
+        str(gitnexus_status.get("repo") or analysis_repo.name),
+        registry_path,
+        run_command,
+    )
+    current = _current_status(*status_args)
+    warning = "GitNexus index generation changed before receipt publication"
+    if current.get("index_generation_fresh"):
+        index_path = Path(str(current["index_path"]))
+        receipt_path = index_path / "repo-context-forge-receipt.json"
+        temporary_path = receipt_path.with_suffix(".tmp")
+        temporary_path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "analysisRepo": str(analysis_repo.resolve()),
+                    "committedHeadOid": expected_head,
+                    "candidateTree": expected_candidate_tree,
+                    "indexedAt": current["indexed_at"],
+                },
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
         )
-        status = _current_status(*status_args)
-        status.update(reindex_attempted=True, reindex_returncode=proc.returncode)
-        if proc.returncode != 0:
-            status.update(
-                status="blocked",
-                warning="GitNexus reindex failed; blast-radius claims are blocked",
-                stderr=proc.stderr[-2000:],
-            )
-        elif status["index_fresh"]:
-            status["status"] = "reindexed"
-        else:
-            status["status"] = "blocked"
-            failure = "did not create registered index storage" if not status.get(
-                "index_present"
-            ) else "index is still stale after reindex"
-            status["warning"] = f"GitNexus reindex {failure}; blast-radius claims are blocked"
-        return status
+        temporary_path.replace(receipt_path)
+        current = _current_status(*status_args)
+        warning = "GitNexus receipt validation failed after publication"
+
+    if current.get("index_fresh"):
+        gitnexus_status.update(
+            index_generation=current["index_generation"],
+            indexed_candidate_tree=expected_candidate_tree,
+            index_fresh=True,
+            receipt_pending=False,
+        )
+    else:
+        gitnexus_status.update(
+            status="blocked",
+            required_checks_resolved=False,
+            warning=warning,
+        )
+    return gitnexus_status
 
 
 def _check_key(item: dict[str, object]) -> tuple[str, str, str, str]:
