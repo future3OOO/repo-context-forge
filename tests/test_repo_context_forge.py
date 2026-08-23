@@ -134,6 +134,11 @@ class RepoContextForgeTests(unittest.TestCase):
             repo, cache_dir, runtime_home, mode="intent", intent=intent, top=top,
             gitnexus_mode=gitnexus_mode)
 
+    def assert_public_intent_gap(self, intent: str, gap: dict[str, object], marker: str) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent=intent, top=1)
+        self.assertEqual((result.returncode == 0, packet["coverage_gaps"], packet["gitnexus"]["required_checks_resolved"]), (False, [gap], False), marker)
+
     def run_off_mode_bootstrap(
         self,
         repo: Path,
@@ -189,7 +194,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 top=1,
             )
 
-            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            self.assertEqual(result.returncode, 0, failure_marker or result.stdout or result.stderr)
             checks = {
                 (entry["kind"], entry["file"], entry["target"])
                 for entry in packet["gitnexus"]["analysis"]["entries"]
@@ -384,6 +389,7 @@ class RepoContextForgeTests(unittest.TestCase):
             helper_count=13,
             symbol_name="Database",
             intent="Update sqlite_utils.Database import checkpoints in src/db.py",
+            failure_marker="QUALIFIED_SYMBOL_REPORTED_AS_ABSENT_FILE",
         )
 
     def test_public_bootstrap_prioritizes_explicit_symbol_after_eightieth_symbol(self) -> None:
@@ -408,34 +414,43 @@ class RepoContextForgeTests(unittest.TestCase):
 
     def test_public_bootstrap_does_not_treat_prose_or_filenames_as_symbols(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
-            (repo / "src" / "words.py").write_text(
-                "def item():\n    return None\n\ndef evidence():\n    return None\n",
-                encoding="utf-8",
-            )
+            (repo / "src" / "words.py").write_text("def item():\n    return None\n\ndef evidence():\n    return None\n", encoding="utf-8")
             repo_context_forge.run_git(repo, ["add", "-A"])
             repo_context_forge.run_git(repo, ["commit", "-m", "prose names"])
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent="Update workflow_documents.py so each item retains evidence under CLAUDE.md for RED PR JSON output, premise/occurrence checks, and https://example.com/missing.py", top=1)
+        references = {gap.get("reference") for gap in packet.get("coverage_gaps", [])}
+        self.assertTrue(result.returncode == 0 and references.isdisjoint({"workflow_documents.py", "CLAUDE.md", "item", "evidence", "RED", "PR", "JSON", "example.com/missing.py"}), "ROOT_PROSE_REPORTED_ABSENT_FILE")
 
-            result, packet = self.run_public_intent_bootstrap(
-                repo,
-                cache_dir,
-                runtime_home,
-                intent=(
-                    "Update workflow_documents.py so each item retains evidence "
-                    "under CLAUDE.md for RED PR JSON output"
-                ),
-                top=1,
-            )
+    def test_public_bootstrap_blocks_intent_without_relevant_seam(self) -> None:
+        intent = "Update Frobnicator behavior"
+        self.assert_public_intent_gap(intent, {"kind": "no_relevant_seam", "reference": intent, "candidates": []}, "BM_R2_NO_RELEVANT_SEAM_CONTRACT_FAILED")
 
-        gap_references = {
-            gap.get("reference") for gap in packet.get("coverage_gaps", [])
-        }
-        self.assertTrue(
-            result.returncode == 0
-            and gap_references.isdisjoint(
-                {"workflow_documents.py", "CLAUDE.md", "item", "evidence", "RED", "PR", "JSON"}
-            ),
-            "PROSE_ACRONYM_GAP_REGRESSED",
-        )
+    def test_public_bootstrap_blocks_absent_root_file(self) -> None:
+        for path in ("workflow_documents.py", "CLAUDE.md"):
+            self.assert_public_intent_gap(f"Update {path} behavior", {"kind": "absent_file", "reference": path, "candidates": []}, "ROOT_EXACT_FILE_NOT_ABSENT_FILE")
+
+    def test_public_bootstrap_blocks_backticked_absent_root_file(self) -> None:
+        self.assert_public_intent_gap("Update `missing.py` behavior", {"kind": "absent_file", "reference": "missing.py", "candidates": []}, "BACKTICK_ROOT_FILE_NOT_ABSENT_FILE")
+
+    def test_public_bootstrap_blocks_hidden_absent_root_file(self) -> None:
+        self.assert_public_intent_gap("Update `.env` behavior", {"kind": "absent_file", "reference": ".env", "candidates": []}, "HIDDEN_ROOT_FILE_NOT_ABSENT_FILE")
+
+    def test_public_bootstrap_blocks_punctuated_absent_root_file(self) -> None:
+        self.assert_public_intent_gap("Update missing.py.", {"kind": "absent_file", "reference": "missing.py", "candidates": []}, "PUNCTUATED_ROOT_FILE_NOT_ABSENT_FILE")
+
+    def test_public_bootstrap_does_not_treat_ambiguous_slash_as_file(self) -> None:
+        for intent in ("Update premise/occurrence checks", "Update missing/tool behavior", "Update missing/Makefile behavior"):
+            self.assert_public_intent_gap(intent, {"kind": "no_relevant_seam", "reference": intent, "candidates": []}, "AMBIGUOUS_UNQUOTED_SLASH_REPORTED_ABSENT_FILE")
+
+    def test_public_bootstrap_does_not_reject_missing_creation_path(self) -> None:
+        for intent in ("Add new.py", "Create new.py", "Add src/new.py", "Create src/new.py", "Add `new.py`", "Create `new.py`", "Add `.env`", "Create `.env`", "Add `src/new.py`", "Create `src/new.py`"):
+            with self.subTest(intent=intent), self.public_intent_repo() as (repo, cache_dir, runtime_home):
+                _result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent=intent, top=1)
+            self.assertFalse(any(gap.get("kind") == "absent_file" for gap in packet["coverage_gaps"]), "CREATION_PATH_REPORTED_ABSENT_FILE")
+
+    def test_public_bootstrap_blocks_absent_exact_file(self) -> None:
+        for reference, path, marker in (("src/missing.py", "src/missing.py", "ABSENT_EXACT_FILE_REPORTED_RESOLVED"), ("src/Makefile", "src/Makefile", "EXTENSIONLESS_ABSENT_FILE_REPORTED_RESOLVED"), ("missing/missing.py", "missing/missing.py", "MISSING_PARENT_ABSENT_FILE_REPORTED_OTHER_GAP"), ("missing/missing.py.", "missing/missing.py", "PUNCTUATED_MISSING_FILE_REPORTED_OTHER_GAP"), ("`missing/missing.py`", "missing/missing.py", "EXPLICIT_DOTTED_ABSENT_FILE_REPORTED_OTHER_GAP"), ("`missing/tool`", "missing/tool", "EXPLICIT_LOWERCASE_ABSENT_FILE_REPORTED_OTHER_GAP"), ("`missing/Makefile`", "missing/Makefile", "EXPLICIT_EXTENSIONLESS_ABSENT_FILE_REPORTED_OTHER_GAP")):
+            self.assert_public_intent_gap(f"Update {reference} behavior", {"kind": "absent_file", "reference": path, "candidates": []}, marker)
 
     def test_public_bootstrap_requires_all_explicit_replay_symbols(self) -> None:
         required_names = {
@@ -589,12 +604,7 @@ class RepoContextForgeTests(unittest.TestCase):
 
             self.assertNotEqual(trees[0], trees[1], "SECOND_DIRTY_EDIT_REUSED_STALE_GRAPH")
             unchanged_result, unchanged_packet = self.run_public_intent_bootstrap(
-                repo,
-                cache_dir,
-                runtime_home,
-                intent="Update SecondDirtyAnchor behavior",
-                top=1,
-            )
+                repo, cache_dir, runtime_home, intent="Update SecondDirtyAnchor behavior", top=1)
             self.assertEqual(
                 (
                     unchanged_result.returncode,
@@ -607,20 +617,12 @@ class RepoContextForgeTests(unittest.TestCase):
     def test_public_bootstrap_binds_index_generation_to_candidate_tree(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             (repo / "src" / "indexed.py").write_text(
-                "class IndexedAnchor:\n    pass\n",
-                encoding="utf-8",
-            )
+                "class IndexedAnchor:\n    pass\n", encoding="utf-8")
             repo_context_forge.run_git(repo, ["add", "-A"])
             repo_context_forge.run_git(repo, ["commit", "-m", "indexed anchor"])
 
             result, packet = self.run_public_intent_bootstrap(
-                repo,
-                cache_dir,
-                runtime_home,
-                intent="Update IndexedAnchor behavior",
-                top=1,
-            )
-
+                repo, cache_dir, runtime_home, intent="Update IndexedAnchor behavior", top=1)
             expected_tree = packet["target_state"].get("candidate_tree")
             self.assertEqual(
                 (
@@ -648,16 +650,9 @@ class RepoContextForgeTests(unittest.TestCase):
                     repo, cache_dir, runtime_home
                 )
 
-            self.assertNotEqual(
-                result.returncode,
-                0,
-                "PACKET_CONTENTION_REGRESSED",
-            )
-            self.assertIn(
-                "candidate analysis transaction is already running",
-                result.stderr,
-                "PACKET_CONTENTION_REGRESSED",
-            )
+            self.assertNotEqual(result.returncode, 0, "PACKET_CONTENTION_REGRESSED")
+            self.assertIn("candidate analysis transaction is already running", result.stderr,
+                          "PACKET_CONTENTION_REGRESSED")
 
     def test_standalone_refresh_contends_with_packet_transaction(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -721,11 +716,10 @@ class RepoContextForgeTests(unittest.TestCase):
     def test_public_bootstrap_blocks_graph_time_candidate_mutation(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             names = [f"MutationAnchor{index}" for index in range(12)]
-            (repo / "src" / "a.py").write_text(
-                "".join(f"class {name}:\n    pass\n" for name in names), encoding="utf-8")
+            (repo / "src" / "a.py").write_text("".join(
+                f"class {name}:\n    pass\n" for name in names), encoding="utf-8")
             head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
-            analysis_repo, _key = repo_context_forge.analysis_checkout_path(
-                repo, head, Path(cache_dir), "intent")
+            analysis_repo, _key = repo_context_forge.analysis_checkout_path(repo, head, Path(cache_dir), "intent")
             packet_path = Path(runtime_home) / "packet.json"
             command = [
                 sys.executable, str(ROOT / "scripts" / "codex_context_bootstrap.py"),
@@ -733,8 +727,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 "--cache-dir", cache_dir, "--map-build", "never", "--gitnexus-mode", "auto",
                 "--enforce-intake", "--packet-json-out", str(packet_path)]
             process = repo_context_forge.subprocess.Popen(
-                command, env={**os.environ, "HOME": runtime_home},
-                stdout=repo_context_forge.subprocess.PIPE,
+                command, env={**os.environ, "HOME": runtime_home}, stdout=repo_context_forge.subprocess.PIPE,
                 stderr=repo_context_forge.subprocess.PIPE, text=True)
             deadline = time.monotonic() + 30
             while not (analysis_repo / ".gitnexus" / "meta.json").exists():
@@ -744,10 +737,9 @@ class RepoContextForgeTests(unittest.TestCase):
             (analysis_repo / "src" / "a.py").write_text("MUTATED = True\n", encoding="utf-8")
             process.communicate(timeout=60)
             packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
-            self.assertTrue(
-                process.returncode != 0 and not packet["gitnexus"]["required_checks_resolved"]
-                and not (analysis_repo / ".gitnexus" / "repo-context-forge-receipt.json").exists(),
-                "GRAPH_TIME_CANDIDATE_MUTATION_VALIDATED")
+            self.assertTrue(process.returncode != 0 and not packet["gitnexus"]["required_checks_resolved"]
+                            and not (analysis_repo / ".gitnexus" / "repo-context-forge-receipt.json").exists(),
+                            "GRAPH_TIME_CANDIDATE_MUTATION_VALIDATED")
 
     def test_public_bootstrap_candidate_tree_tracks_supported_git_shapes(self) -> None:
         def untracked(repo):
@@ -760,9 +752,7 @@ class RepoContextForgeTests(unittest.TestCase):
             "symlink": lambda repo: (repo / "src" / "link.py").symlink_to("a.py"),
         }
         for name, mutate in cases.items():
-            with self.subTest(name=name), self.public_intent_repo() as (
-                repo, cache_dir, runtime_home
-            ):
+            with self.subTest(name=name), self.public_intent_repo() as (repo, cache_dir, runtime_home):
                 mutate(repo)
                 status = repo_context_forge.porcelain_status(repo)
                 index_tree = repo_context_forge.run_git(repo, ["write-tree"])
@@ -821,9 +811,10 @@ class RepoContextForgeTests(unittest.TestCase):
                 result, supplied = self.run_public_bootstrap(
                     repo, cache_dir, runtime_home, mode=mode, base=base,
                     intent="Update MissingAnchor")
-                signature = lambda packet: (
-                    [item["path"] for item in packet["targets"]],
-                    packet["gitnexus_plan"], packet["coverage_gaps"])
+                def signature(packet):
+                    return (
+                        [item["path"] for item in packet["targets"]],
+                        packet["gitnexus_plan"], packet["coverage_gaps"])
                 self.assertTrue(
                     result.returncode == baseline_result.returncode
                     and signature(supplied) == signature(baseline)
@@ -874,6 +865,7 @@ class RepoContextForgeTests(unittest.TestCase):
     def test_public_bootstrap_preserves_file_intent_evidence(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             (repo / "src" / "a.py").write_text("def handle():\n    pass\n", encoding="utf-8")
+            (repo / "root.py").write_text("VALUE = 1\n", encoding="utf-8")
             repo_context_forge.run_git(repo, ["add", "-A"])
             repo_context_forge.run_git(repo, ["commit", "-m", "intent evidence"])
             result, packet = self.run_public_intent_bootstrap(
@@ -890,6 +882,9 @@ class RepoContextForgeTests(unittest.TestCase):
                 and packet["advisorProjection"]["targets"] == packet["targets"],
                 "FILE_INTENT_EVIDENCE_DISCARDED",
             )
+            for intent, marker in (("Update src/a.py.", "PUNCTUATED_EXISTING_FILE_REPORTED_ABSENT"), ("Update `src/a.py` behavior", "EXPLICIT_EXISTING_FILE_REPORTED_ABSENT"), ("Add src/a.py", "EXISTING_CREATION_PATH_REGRESSED"), ("Create root.py", "EXISTING_ROOT_CREATION_PATH_REGRESSED")):
+                result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent=intent, top=1)
+                self.assertTrue(result.returncode == 0 and not packet["coverage_gaps"], marker)
 
     def test_public_bootstrap_blocks_ambiguous_unqualified_symbol(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):

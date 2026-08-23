@@ -430,12 +430,11 @@ class WorkflowIndex:
                     score=len(matched),
                     matched_terms=matched,
                 ))
-        exact_files = {
-            match.rstrip("/")
-            for match in re.findall(
-                r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]*", intent)
-            if match.rstrip("/")
-        }
+        path_tokens = {path for path in re.findall(
+            r"(?<![/A-Za-z0-9_.-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]*", intent) if not path.endswith("/")}
+        explicit_paths = set(re.findall(r"`((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)`", intent)) | set(re.findall(r"(?i)\b(?:update|modify|change|fix|edit|remove|delete|add|create)\s+`((?:[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+|\.[A-Za-z0-9_-][A-Za-z0-9_.-]*))`(?=\s+behavior\b|\.?$)", intent))
+        creation_paths = set(re.findall(r"(?i)\b(?:add|create)\s+`?((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+)`?", intent))
+        path_tokens |= explicit_paths | creation_paths | (set(re.findall(r"(?i)\b(?:update|modify|change|fix|edit|remove|delete|add|create)\s+([A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+)\b(?=\s+behavior\b|\.?$)", intent)) - set(qualified_references))
         required_by_path: dict[str, list[str]] = {}
         for match in required:
             required_by_path.setdefault(match.path, []).append(match.symbol.name)
@@ -446,6 +445,14 @@ class WorkflowIndex:
         forms = self._intent_forms(terms)
         file_rows = self._fetchall("SELECT path, role, base_score, search_terms FROM files")
         file_roles = {str(path): str(role) for path, role, _score, _terms in file_rows}
+        known_dirs = {str(parent) for path in file_roles for parent in Path(path).parents if str(parent) != "."}
+        path_tokens = {path if path in file_roles else path.rstrip(".") for path in path_tokens}
+        exact_files = {path for path in path_tokens if path in file_roles or (
+            path not in creation_paths and (path in explicit_paths or "." in Path(path).name or str(Path(path).parent) in known_dirs))}
+        gaps.extend(
+            IntentCoverageGap(kind="absent_file", reference=path, candidates=())
+            for path in sorted(exact_files - file_roles.keys())
+        )
         for path, role, base_score, search_terms in file_rows:
             path = str(path)
             matched_terms = []
@@ -475,6 +482,9 @@ class WorkflowIndex:
                     matched_terms=tuple(dict.fromkeys(matched_terms)),
                     matched_symbols=tuple(matched_symbols),
                 ))
+        if not file_evidence and not required and not gaps:
+            gaps.append(IntentCoverageGap(
+                kind="no_relevant_seam", reference=intent.strip(), candidates=()))
         return IntentResolution(
             file_evidence=tuple(sorted(
                 file_evidence,
