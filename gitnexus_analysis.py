@@ -21,6 +21,10 @@ RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 ACTIVE_TRANSACTION: ContextVar[tuple[str, TextIO] | None] = ContextVar("active_analysis_transaction", default=None)
 
 
+class AnalysisTransactionBusy(RuntimeError):
+    """The analysis checkout lock is held by another transaction."""
+
+
 def analysis_transaction_path(analysis_repo: Path) -> Path:
     return analysis_repo.parent / f".{analysis_repo.name}.gitnexus.lock"
 
@@ -36,7 +40,8 @@ def analysis_transaction(lock_path: Path) -> Iterator[None]:
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise RuntimeError("candidate analysis transaction is already running") from exc
+            raise AnalysisTransactionBusy(
+                "candidate analysis transaction is already running") from exc
         token = ACTIVE_TRANSACTION.set((key, lock_file))
         try:
             yield
@@ -245,14 +250,20 @@ def ensure_index(
 
     try:
         with analysis_transaction(analysis_transaction_path(analysis_repo)):
-            return reindex()
+            try:
+                return reindex()
+            except RuntimeError as exc:
+                status.update(
+                    status="blocked", reindex_attempted=True,
+                    warning=f"{exc}; blast-radius claims are blocked")
+                return status
     except OSError as exc:
         status.update(
             status="blocked",
             reindex_attempted=False,
             warning=f"GitNexus reindex lock failed; blast-radius claims are blocked ({exc})",
         )
-    except RuntimeError:
+    except AnalysisTransactionBusy:
         status.update(
             status="blocked",
             reindex_attempted=False,
@@ -284,19 +295,25 @@ def publish_receipt(
         index_path = Path(str(current["index_path"]))
         receipt_path = index_path / "repo-context-forge-receipt.json"
         temporary_path = receipt_path.with_suffix(".tmp")
-        temporary_path.write_text(
-            json.dumps(
-                {
-                    "schemaVersion": 1,
-                    "analysisRepo": str(analysis_repo.resolve()),
-                    "committedHeadOid": expected_head,
-                    "candidateTree": expected_candidate_tree,
-                    "indexedAt": current["indexed_at"],
-                },
-                sort_keys=True,
-            ) + "\n",
-            encoding="utf-8",
-        )
+        try:
+            temporary_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "analysisRepo": str(analysis_repo.resolve()),
+                        "committedHeadOid": expected_head,
+                        "candidateTree": expected_candidate_tree,
+                        "indexedAt": current["indexed_at"],
+                    },
+                    sort_keys=True,
+                ) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            gitnexus_status.update(
+                status="blocked", required_checks_resolved=False,
+                warning=f"GitNexus receipt publication failed; blast-radius claims are blocked ({exc})")
+            return gitnexus_status
         temporary_path.replace(receipt_path)
         current = _current_status(*status_args)
         warning = "GitNexus receipt validation failed after publication"

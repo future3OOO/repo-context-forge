@@ -1434,7 +1434,7 @@ def target_files_for_mode(
         and not is_reference_only_path(item.path, reference_prefixes)
     ]
     path_references = intent_path_references(intent or "")
-    exact_files = [item.path for item in resolution.file_evidence if item.exact_file]
+    exact_files = [item.path for item in resolution.file_evidence if item.exact_file and not is_reference_only_path(item.path, reference_prefixes)]
     directory_matches = [
         path
         for path in candidates
@@ -2417,6 +2417,14 @@ def make_packet(
         native_index.resolve_intent(intent or "")
         if mode == "intent" else workflow_index.IntentResolution((), (), (), ())
     )
+    excluded_required = tuple(match for match in intent_resolution.required_symbols if is_reference_only_path(match.path, reference_only))
+    if excluded_required:
+        intent_resolution = workflow_index.IntentResolution(
+            intent_resolution.file_evidence,
+            tuple(match for match in intent_resolution.required_symbols if match not in excluded_required),
+            intent_resolution.symbol_relevance,
+            (*intent_resolution.coverage_gaps, *(workflow_index.IntentCoverageGap("excluded_reference", match.symbol.name, (match.path,)) for match in excluded_required)),
+        )
     targets = target_files_for_mode(
         mode,
         source_git_state,

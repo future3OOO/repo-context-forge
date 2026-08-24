@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections import namedtuple
@@ -133,6 +134,29 @@ class RepoContextForgeTests(unittest.TestCase):
         return self.run_public_bootstrap(
             repo, cache_dir, runtime_home, mode="intent", intent=intent, top=top,
             gitnexus_mode=gitnexus_mode)
+
+    def run_public_intent_bootstrap_after(
+        self, repo, cache_dir, runtime_home, ready, mutate, cleanup=None):
+        stop = threading.Event()
+        changed = threading.Event()
+        def watch() -> None:
+            deadline = time.monotonic() + 30
+            while not stop.is_set() and time.monotonic() < deadline:
+                if ready():
+                    mutate()
+                    changed.set()
+                    return
+                time.sleep(0.0005)
+        watcher = threading.Thread(target=watch)
+        watcher.start()
+        try:
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+        finally:
+            stop.set()
+            watcher.join()
+            if cleanup is not None:
+                cleanup()
+        return changed.is_set(), result, packet
 
     def assert_public_intent_gap(self, intent: str, gap: dict[str, object], marker: str) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -720,6 +744,45 @@ class RepoContextForgeTests(unittest.TestCase):
                 "INDEX_GENERATION_BINDING_REGRESSED",
             )
 
+    def test_public_bootstrap_preserves_registry_failure_diagnostic_during_reindex(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            registry_path = Path(runtime_home) / ".gitnexus" / "registry.json"
+            def registry_ready() -> bool:
+                try:
+                    return bool(repo_context_forge.json.loads(
+                        registry_path.read_text(encoding="utf-8")))
+                except (OSError, repo_context_forge.json.JSONDecodeError):
+                    return False
+            changed, result, packet = self.run_public_intent_bootstrap_after(
+                repo, cache_dir, runtime_home, registry_ready,
+                lambda: registry_path.write_text("{invalid-json", encoding="utf-8"))
+            warning = str(packet.get("gitnexus", {}).get("warning") or "")
+            self.assertEqual(
+                (changed, result.returncode != 0, packet.get("gitnexus", {}).get("status"),
+                 "registry is not valid JSON" in warning, "already running" in warning),
+                (True, True, "blocked", True, False),
+                "REGISTRY_ERROR_MISLABELED_AS_LOCK_CONTENTION")
+
+    def test_public_bootstrap_blocks_receipt_write_failure(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            analysis_repo, _key = repo_context_forge.analysis_checkout_path(
+                repo, repo_context_forge.run_git(repo, ["rev-parse", "HEAD"]),
+                Path(cache_dir), "intent")
+            index_dir = analysis_repo / ".gitnexus"
+            receipt_path = index_dir / "repo-context-forge-receipt.json"
+            changed, result, packet = self.run_public_intent_bootstrap_after(
+                repo, cache_dir, runtime_home,
+                lambda: (index_dir / "meta.json").is_file() and not receipt_path.exists(),
+                lambda: index_dir.chmod(0o555),
+                lambda: index_dir.chmod(0o755) if index_dir.exists() else None)
+            warning = str(packet.get("gitnexus", {}).get("warning") or "")
+            self.assertEqual(
+                (changed, result.returncode != 0, packet.get("gitnexus", {}).get("status"),
+                 packet.get("gitnexus", {}).get("required_checks_resolved"),
+                 "receipt publication failed" in warning, receipt_path.exists()),
+                (True, True, "blocked", False, True, False),
+                "RECEIPT_WRITE_FAILURE_ESCAPED_WITHOUT_BLOCKER_PACKET")
+
     def test_public_bootstrap_blocks_candidate_transaction_contention(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
@@ -876,6 +939,27 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertTrue(
                 result.returncode == 0 and "DeepAnchor" in target["intent_required_symbols"],
                 "SENTENCE_FINAL_EXACT_SYMBOL_NOT_REQUIRED")
+
+    def test_public_bootstrap_blocks_reference_only_required_symbol(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "AGENTS.md").write_text(
+                "- `reference/` is reference-only unless approved.\n", encoding="utf-8")
+            (repo / "reference").mkdir()
+            (repo / "reference" / "hidden.py").write_text(
+                "class HiddenAnchor:\n    pass\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "reference-only symbol"])
+            for intent in ("Update HiddenAnchor behavior", "Update reference/hidden.py and HiddenAnchor behavior"):
+                result, packet = self.run_public_intent_bootstrap(
+                    repo, cache_dir, runtime_home, intent=intent, top=5)
+                self.assertEqual(
+                    (result.returncode != 0,
+                     [item["path"] for item in packet["targets"]],
+                     packet["coverage_gaps"],
+                     packet["gitnexus"]["required_checks_resolved"]),
+                    (True, [], [{"kind": "excluded_reference", "reference": "HiddenAnchor",
+                                 "candidates": ["reference/hidden.py"]}], False),
+                    "REFERENCE_ONLY_EXPLICIT_PATH_TARGETED" if "/" in intent else "REFERENCE_ONLY_REQUIRED_SYMBOL_CERTIFIED")
 
     def test_public_non_intent_modes_ignore_intent(self) -> None:
         for mode in ("pr", "local", "repo"):
