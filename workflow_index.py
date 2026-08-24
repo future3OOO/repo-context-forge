@@ -352,7 +352,7 @@ class WorkflowIndex:
             reference.rsplit(".", 1)[-1] for reference in qualified_references
         )
         created_references = set(re.findall(
-            r"\b(?:add|create)\s+`?([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)",
+            r"\b(?:add|create|introduce)\s+(?:(?:a|an|new|class|function|method)\s+)*`?([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)",
             intent,
             re.IGNORECASE,
         ))
@@ -403,7 +403,16 @@ class WorkflowIndex:
             matches = unqualified_matches.get(reference, [])
             if len(matches) == 1:
                 required.append(IntentSymbolMatch(path=matches[0][0], symbol=matches[0][1]))
-            elif matches or (reference in bare_identifiers and reference not in created_identifiers and not reference.isupper()):
+            elif matches or (
+                reference in bare_identifiers
+                and reference not in created_identifiers
+                and not reference.isupper()
+                and re.search(
+                    rf"(?:\b(?:update|modify|change|fix|edit|remove|delete)\s+{re.escape(reference)}\b[.!?]?\s*$|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
+                    intent,
+                    re.IGNORECASE,
+                )
+            ):
                 gaps.append(IntentCoverageGap(
                     kind="ambiguous_symbol" if matches else "absent_symbol",
                     reference=reference,

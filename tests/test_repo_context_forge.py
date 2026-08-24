@@ -111,6 +111,7 @@ class RepoContextForgeTests(unittest.TestCase):
         top: int = 1, gitnexus_mode: str = "auto",
     ):
         packet_path = Path(runtime_home) / "packet.json"
+        packet_path.unlink(missing_ok=True)
         command = [
             sys.executable, str(ROOT / "scripts" / "codex_context_bootstrap.py"),
             "--repo", str(repo), "--mode", mode, "--top", str(top),
@@ -611,11 +612,19 @@ class RepoContextForgeTests(unittest.TestCase):
             (repo / "local-only.txt").write_text("dirty\n", encoding="utf-8")
             result, packet = self.run_public_bootstrap(
                 repo, cache_dir, runtime_home, mode="repo")
+            shutil.rmtree(repo)
+            failed_result, failed_packet = self.run_public_bootstrap(
+                repo, cache_dir, runtime_home, mode="repo")
         self.assertTrue(
             result.returncode == 0
             and packet["advisorProjection"]["expectedCandidateTree"]
             == packet["advisorProjection"]["indexedCandidateTree"] == head_tree,
             "REPO_DIRTY_SOURCE_CANDIDATE_REJECTED",
+        )
+        self.assertEqual(
+            (failed_result.returncode != 0, failed_packet),
+            (True, {}),
+            "FAILED_BOOTSTRAP_RETURNED_STALE_PACKET",
         )
 
     def test_public_bootstrap_preserves_offsets_after_backtick_spans(self) -> None:
@@ -1002,6 +1011,24 @@ class RepoContextForgeTests(unittest.TestCase):
             result, _packet = self.run_public_bootstrap(
                 repo, cache_dir, runtime_home, mode="local")
             self.assertEqual(result.returncode, 0, "GENERATED_CANDIDATE_EXCLUSIONS_DIVERGED")
+        for directory in (".codex", ".gitnexus", ".repo-context-forge"):
+            with self.subTest(directory=directory), self.public_intent_repo() as (
+                repo, cache_dir, runtime_home
+            ):
+                (repo / ".gitignore").write_text(
+                    f"*.log\n{directory}/\n", encoding="utf-8")
+                expected_tree = repo_context_forge.candidate_tree(repo)
+                source_status = repo_context_forge.porcelain_status(repo)
+                result, packet = self.run_public_bootstrap(
+                    repo, cache_dir, runtime_home, mode="local")
+                projection = packet.get("advisorProjection", {})
+                self.assertEqual(
+                    (result.returncode, projection.get("expectedCandidateTree"),
+                     projection.get("indexedCandidateTree"),
+                     repo_context_forge.porcelain_status(repo)),
+                    (0, expected_tree, expected_tree, source_status),
+                    "LEGITIMATE_TOOL_CACHE_GITIGNORE_EDIT_DROPPED",
+                )
 
     def test_public_bootstrap_requires_symbol_before_sentence_period(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -1065,12 +1092,30 @@ class RepoContextForgeTests(unittest.TestCase):
                     and all("intent_evidence" not in item and not item["intent_required_symbols"]
                             for item in supplied["targets"]),
                     "NON_INTENT_PACKET_CONSUMED_INTENT")
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            for name in ("GitHub", "PostgreSQL", "OpenCodeReview"):
+                for intent in (
+                    f"Update {name} integration",
+                    f"Update integration docs for {name}",
+                ):
+                    result, packet = self.run_public_intent_bootstrap(
+                        repo, cache_dir, runtime_home, intent=intent, top=1)
+                    gaps = {(gap.get("kind"), gap.get("reference"))
+                            for gap in packet.get("coverage_gaps", [])}
+                    self.assertTrue(
+                        result.returncode != 0
+                        and ("absent_symbol", name) not in gaps
+                        and ("no_relevant_seam", intent) in gaps,
+                        "PROSE_NAME_BLOCKED_AS_SYMBOL",
+                    )
 
     def test_public_bootstrap_blocks_absent_qualified_symbol(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
-            for intent, reference in (
-                ("Update src.a.MissingAnchor behavior", "src.a.MissingAnchor"),
-                ("Update MissingAnchor behavior", "MissingAnchor"),
+            for intent, reference, marker in (
+                ("Update src.a.MissingAnchor behavior", "src.a.MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
+                ("Update MissingAnchor behavior", "MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
+                ("Update MissingAnchor", "MissingAnchor", "DIRECT_ABSENT_IDENTIFIER_CONTRACT_REGRESSED"),
+                ("Fix MissingAnchor", "MissingAnchor", "DIRECT_ABSENT_IDENTIFIER_CONTRACT_REGRESSED"),
             ):
                 result, packet = self.run_public_intent_bootstrap(
                     repo, cache_dir, runtime_home, intent=intent, top=1)
@@ -1079,7 +1124,7 @@ class RepoContextForgeTests(unittest.TestCase):
                     and any(gap.get("kind") == "absent_symbol"
                             and gap.get("reference") == reference
                             for gap in packet.get("coverage_gaps", [])),
-                    "EXACT_REFERENCE_REQUIREMENT_LOST",
+                    marker,
                 )
 
     def test_public_bootstrap_requires_qualified_symbol_outside_top_file(self) -> None:
@@ -1295,11 +1340,40 @@ class RepoContextForgeTests(unittest.TestCase):
                 item["target"] != "SafeImporter"
                 for item in [*packet["gitnexus_plan"], *analysis["entries"]]
             ))
-            result, packet = self.run_public_intent_bootstrap(
-                repo, cache_dir, runtime_home,
-                intent="Add FutureAnchor to src/db.py", top=1,
-            )
-            self.assertEqual(result.returncode, 0, "UNQUALIFIED_FUTURE_CREATION_REGRESSED")
+            for intent in (
+                "Add FutureAnchor to src/db.py",
+                "Add a new FutureAnchor to src/db.py",
+                "Create class FutureAnchor in src/db.py",
+                "Introduce FutureAnchor in src/db.py",
+            ):
+                result, packet = self.run_public_intent_bootstrap(
+                    repo, cache_dir, runtime_home, intent=intent, top=1)
+                self.assertTrue(
+                    result.returncode == 0
+                    and not any(gap.get("kind") == "absent_symbol"
+                                and gap.get("reference") == "FutureAnchor"
+                                for gap in packet.get("coverage_gaps", [])),
+                    "CREATION_PHRASE_BLOCKED_FUTURE_SYMBOL",
+                )
+            for intent in (
+                "Add a new FutureAnchor",
+                "Create class FutureAnchor",
+                "Introduce FutureAnchor",
+            ):
+                with self.subTest(intent=intent), self.public_intent_repo() as (
+                    pathless_repo, pathless_cache, pathless_home
+                ):
+                    result, packet = self.run_public_intent_bootstrap(
+                        pathless_repo, pathless_cache, pathless_home,
+                        intent=intent, top=1)
+                    gaps = {(gap.get("kind"), gap.get("reference"))
+                            for gap in packet.get("coverage_gaps", [])}
+                    self.assertTrue(
+                        result.returncode != 0
+                        and ("absent_symbol", "FutureAnchor") not in gaps
+                        and ("no_relevant_seam", intent) in gaps,
+                        "CREATION_PHRASE_BLOCKED_FUTURE_SYMBOL",
+                    )
 
     def test_public_bootstrap_scopes_future_symbol_creation(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -2306,6 +2380,13 @@ class RepoContextForgeTests(unittest.TestCase):
             )
             self.assertFalse(packet["target_state"]["source_dirty"])
             self.assertTrue(packet["target_state"]["source_status_unchanged"])
+            (repo / ".gitignore").write_text("*.log\n.soulforge/\n", encoding="utf-8")
+            repo_context_forge.cleanup_soulforge_gitignore_change(repo)
+            self.assertEqual(
+                (repo / ".gitignore").read_text(encoding="utf-8"),
+                "*.log\n",
+                "CANDIDATE_OR_SOULFORGE_CLEANUP_REGRESSED",
+            )
 
     def test_make_packet_builds_workflow_index_without_soulforge(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:

@@ -788,7 +788,6 @@ def ensure_local_analysis_worktree(source_repo: Path, head_ref: str, cache_dir: 
 
     ensure_cached_checkout(source_repo, head_sha, worktree, cache_dir)
     overlay_source_worktree(source_repo, worktree)
-    cleanup_soulforge_gitignore_change(worktree)
 
     source_dirty = is_dirty(source_repo, ignore_tool_cache=True)
     return TargetState(
@@ -2523,7 +2522,14 @@ def make_packet(
         }
         analysis["producer_revision"] = producer_revision()
         if gitnexus_mode != "off" and gitnexus_analysis.result_is_resolved(analysis):
-            cleanup_soulforge_gitignore_change(target_state.analysis_repo)
+            if mode in {"local", "intent"}:
+                source_gitignore = target_state.source_repo / ".gitignore"
+                analysis_gitignore = target_state.analysis_repo / ".gitignore"
+                remove_path(analysis_gitignore)
+                if os.path.lexists(source_gitignore):
+                    shutil.copy2(source_gitignore, analysis_gitignore, follow_symlinks=False)
+            else:
+                cleanup_soulforge_gitignore_change(target_state.analysis_repo)
             if candidate_tree(target_state.analysis_repo) == expected_candidate_tree:
                 gitnexus_status = gitnexus_analysis.publish_receipt(
                     gitnexus_status,
