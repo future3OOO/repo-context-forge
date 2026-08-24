@@ -832,6 +832,35 @@ class RepoContextForgeTests(unittest.TestCase):
                 (True, "blocked", False, True, False),
                 "RECEIPT_REPLACE_FAILURE_ESCAPED_WITHOUT_BLOCKER_PACKET")
 
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            victim = Path(runtime_home) / "victim.txt"
+            victim.write_text("PRESERVE_ME\n", encoding="utf-8")
+            (repo / ".gitnexus").mkdir()
+            (repo / ".gitnexus" / "repo-context-forge-receipt.tmp").symlink_to(victim)
+            repo_context_forge.run_git(
+                repo, ["add", "-f", ".gitnexus/repo-context-forge-receipt.tmp"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "tracked receipt symlink"])
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            self.assertEqual(
+                (result.returncode, packet["gitnexus"]["required_checks_resolved"],
+                 victim.read_text(encoding="utf-8")),
+                (0, True, "PRESERVE_ME\n"),
+                "RECEIPT_TEMP_SYMLINK_OVERWROTE_EXTERNAL_TARGET")
+
+        with self.subTest("tracked index dir symlink"), self.public_intent_repo() as (
+                repo, cache_dir, runtime_home):
+            victim_dir = Path(runtime_home) / "victim-dir"
+            victim_dir.mkdir()
+            (repo / ".gitnexus").symlink_to(victim_dir)
+            repo_context_forge.run_git(repo, ["add", "-f", ".gitnexus"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "tracked index dir symlink"])
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            self.assertEqual(
+                (result.returncode, packet["gitnexus"]["required_checks_resolved"],
+                 sorted(path.name for path in victim_dir.iterdir())),
+                (0, True, []),
+                "INDEX_DIR_SYMLINK_ESCAPED_CACHE_CONFINEMENT")
+
     def test_public_bootstrap_blocks_candidate_transaction_contention(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
@@ -1059,6 +1088,20 @@ class RepoContextForgeTests(unittest.TestCase):
                     (0, expected_tree, expected_tree, source_status),
                     "LEGITIMATE_TOOL_CACHE_GITIGNORE_EDIT_DROPPED",
                 )
+        with self.subTest("tracked nested index symlink"), self.public_intent_repo() as (
+                repo, cache_dir, runtime_home):
+            victim = Path(runtime_home) / "victim.txt"
+            victim.write_text("PRESERVE_ME\n", encoding="utf-8")
+            (repo / ".gitnexus").mkdir()
+            (repo / ".gitnexus" / "meta.json").symlink_to(victim)
+            repo_context_forge.run_git(repo, ["add", "-f", ".gitnexus/meta.json"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "tracked nested index symlink"])
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            self.assertEqual(
+                (result.returncode, packet["gitnexus"]["required_checks_resolved"],
+                 victim.read_text(encoding="utf-8")),
+                (0, True, "PRESERVE_ME\n"),
+                "INDEX_TRACKED_CONTENT_ESCAPED_CACHE_CONFINEMENT")
 
     def test_public_bootstrap_requires_symbol_before_sentence_period(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):

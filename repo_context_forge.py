@@ -739,6 +739,8 @@ def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cac
 
     run_git(checkout, ["checkout", "-B", "repo-context-forge-target", head_sha])
     reset_cached_worktree(checkout, cache_dir)
+    if run_git(checkout, ["ls-files", "--", ".gitnexus"]):
+        remove_path(checkout / ".gitnexus")
 
 
 def ensure_pr_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
