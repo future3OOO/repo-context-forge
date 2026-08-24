@@ -1004,13 +1004,43 @@ class RepoContextForgeTests(unittest.TestCase):
 
     def test_public_local_bootstrap_aligns_generated_candidate_exclusions(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            magic_cache = repo / ":(exclude)owned" / ".gitnexus"
+            magic_cache.mkdir(parents=True)
+            payload = magic_cache / "payload"
+            payload.write_text("cache\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "pathspec cache"])
             (repo / "src" / "a.py").write_text("print('dirty')\n", encoding="utf-8")
             cache = repo / "src" / "__pycache__"
             cache.mkdir()
             (cache / "a.cpython-311.pyc").write_bytes(b"bytes")
-            result, _packet = self.run_public_bootstrap(
+            payload.unlink()
+            expected_tree = repo_context_forge.candidate_tree(repo)
+            payload.write_text("cache\n", encoding="utf-8")
+            source_status = repo_context_forge.porcelain_status(repo)
+            result, packet = self.run_public_bootstrap(
                 repo, cache_dir, runtime_home, mode="local")
             self.assertEqual(result.returncode, 0, "GENERATED_CANDIDATE_EXCLUSIONS_DIVERGED")
+            projection = packet.get("advisorProjection", {})
+            self.assertEqual(
+                (projection.get("expectedCandidateTree"),
+                 projection.get("indexedCandidateTree"),
+                 repo_context_forge.porcelain_status(repo)),
+                (expected_tree, expected_tree, source_status),
+                "PATHSPEC_MAGIC_CACHE_CERTIFIED",
+            )
+            for variable in ("GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"):
+                with self.subTest(variable=variable), patch.dict(os.environ, {variable: "1"}):
+                    result, packet = self.run_public_bootstrap(
+                        repo, cache_dir, runtime_home, mode="local")
+                projection = packet.get("advisorProjection", {})
+                self.assertTrue(
+                    result.returncode == 0
+                    and projection.get("expectedCandidateTree") == expected_tree
+                    and projection.get("indexedCandidateTree") == expected_tree
+                    and repo_context_forge.porcelain_status(repo) == source_status,
+                    "GLOBAL_PATHSPEC_ENV_REJECTED",
+                )
         for directory in (".codex", ".gitnexus", ".repo-context-forge"):
             with self.subTest(directory=directory), self.public_intent_repo() as (
                 repo, cache_dir, runtime_home

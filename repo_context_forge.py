@@ -635,7 +635,13 @@ def source_worktree_files(repo: Path) -> list[str]:
 def candidate_tree(repo: Path) -> str:
     with tempfile.TemporaryDirectory(prefix="repo-context-forge-index-") as temp_dir:
         index_path = Path(temp_dir) / "index"
-        env = {**os.environ, "GIT_INDEX_FILE": str(index_path)}
+        env = dict(os.environ)
+        for variable in ("GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"):
+            env.pop(variable, None)
+        env.update({
+            "GIT_INDEX_FILE": str(index_path),
+            "GIT_LITERAL_PATHSPECS": "1",
+        })
         run_cmd(["git", "read-tree", "HEAD"], cwd=repo, env=env)
         run_cmd(["git", "add", "-A", "--", "."], cwd=repo, env=env)
         generated_paths = run_cmd(
@@ -646,7 +652,6 @@ def candidate_tree(repo: Path) -> str:
                                   if path and is_generated_or_cache_path(path))],
             cwd=repo,
             env=env,
-            allow_fail=True,
         )
         return run_cmd(["git", "write-tree"], cwd=repo, env=env).stdout.strip()
 
