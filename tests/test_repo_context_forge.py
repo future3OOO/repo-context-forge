@@ -891,8 +891,12 @@ class RepoContextForgeTests(unittest.TestCase):
     def test_public_bootstrap_candidate_tree_tracks_supported_git_shapes(self) -> None:
         def untracked(repo):
             (repo / "src" / "new.py").write_text("NEW = 1\n", encoding="utf-8")
+        def hidden(repo):
+            (repo / ".runtime").mkdir()
+            (repo / ".runtime" / "config.json").write_text("{}\n", encoding="utf-8")
         cases = {
             "untracked": untracked,
+            "hidden": hidden,
             "deletion": lambda repo: (repo / "src" / "a.py").unlink(),
             "rename": lambda repo: (repo / "src" / "a.py").rename(repo / "src" / "b.py"),
             "executable": lambda repo: (repo / "src" / "a.py").chmod(0o755),
@@ -914,8 +918,8 @@ class RepoContextForgeTests(unittest.TestCase):
                      repo_context_forge.porcelain_status(repo),
                      repo_context_forge.run_git(repo, ["write-tree"])),
                     (0, expected_tree, expected_tree,
-                     int(name in {"deletion", "rename"}), status, index_tree),
-                    "DELETED_GRAPH_OMISSION_ERASED")
+                     int(name in {"hidden", "deletion", "rename"}), status, index_tree),
+                    "CANDIDATE_GRAPH_OMISSION_ERASED")
 
     def test_public_local_bootstrap_aligns_generated_candidate_exclusions(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):

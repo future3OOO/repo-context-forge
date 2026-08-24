@@ -2465,8 +2465,11 @@ def make_packet(
     gitnexus_repo_name = str(gitnexus_status.get("repo") or gitnexus_repo or target_state.analysis_repo.name)
     graph_targets = [
         entry for entry in target_entries
-        if (target_state.analysis_repo / str(entry["path"])).exists()
-        or (target_state.analysis_repo / str(entry["path"])).is_symlink()
+        if not any(part.startswith(".") for part in Path(str(entry["path"])).parts)
+        and (
+            (target_state.analysis_repo / str(entry["path"])).exists()
+            or (target_state.analysis_repo / str(entry["path"])).is_symlink()
+        )
     ]
     unavailable_targets = [entry for entry in target_entries if entry not in graph_targets]
     plan, omitted_check_count, omitted_required_checks = build_gitnexus_plan(

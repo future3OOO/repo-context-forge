@@ -411,7 +411,7 @@ def execute(
                 "target": target,
                 "direction": direction,
                 "status": "omitted",
-                "diagnostic": "required intent check exceeded the GitNexus call cap",
+                "diagnostic": "required intent check was omitted from the GitNexus plan",
             }
         )
     analysis: dict[str, object] = {
