@@ -404,13 +404,18 @@ class WorkflowIndex:
             if len(matches) == 1:
                 required.append(IntentSymbolMatch(path=matches[0][0], symbol=matches[0][1]))
             elif matches or (
-                reference in bare_identifiers
-                and reference not in created_identifiers
-                and not reference.isupper()
-                and re.search(
-                    rf"(?:\b(?:update|modify|change|fix|edit|remove|delete)\s+{re.escape(reference)}\b[.!?]?\s*$|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
-                    intent,
-                    re.IGNORECASE,
+                reference not in created_identifiers
+                and (
+                    reference in code_identifiers
+                    or (
+                        reference in bare_identifiers
+                        and not reference.isupper()
+                        and re.search(
+                            rf"(?:\b(?:update|modify|change|fix|edit|remove|delete)\s+{re.escape(reference)}\b[.!?]?\s*$|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
+                            intent,
+                            re.IGNORECASE,
+                        )
+                    )
                 )
             ):
                 gaps.append(IntentCoverageGap(

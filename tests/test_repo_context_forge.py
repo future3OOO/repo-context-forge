@@ -636,7 +636,7 @@ class RepoContextForgeTests(unittest.TestCase):
             repo_context_forge.run_git(repo, ["commit", "-m", "duplicate symbols"])
             result, packet = self.run_public_intent_bootstrap(
                 repo, cache_dir, runtime_home,
-                intent="Review `X` then update one.DeepAnchor behavior", top=2)
+                intent="Review `not code` then update one.DeepAnchor behavior", top=2)
         required_checks = {
             (entry["kind"], entry["file"], entry["target"])
             for entry in packet["gitnexus"]["analysis"]["entries"]
@@ -1146,6 +1146,8 @@ class RepoContextForgeTests(unittest.TestCase):
                 ("Update MissingAnchor behavior", "MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
                 ("Update MissingAnchor", "MissingAnchor", "DIRECT_ABSENT_IDENTIFIER_CONTRACT_REGRESSED"),
                 ("Fix MissingAnchor", "MissingAnchor", "DIRECT_ABSENT_IDENTIFIER_CONTRACT_REGRESSED"),
+                ("Update `MissingAnchor` database behavior", "MissingAnchor", "BACKTICKED_ABSENT_IDENTIFIER_NOT_REQUIRED"),
+                ("Update `MISSING_ANCHOR` database behavior", "MISSING_ANCHOR", "BACKTICKED_ABSENT_IDENTIFIER_NOT_REQUIRED"),
             ):
                 result, packet = self.run_public_intent_bootstrap(
                     repo, cache_dir, runtime_home, intent=intent, top=1)
@@ -1386,6 +1388,7 @@ class RepoContextForgeTests(unittest.TestCase):
                     "CREATION_PHRASE_BLOCKED_FUTURE_SYMBOL",
                 )
             for intent in (
+                "Add `FutureAnchor`",
                 "Add a new FutureAnchor",
                 "Create class FutureAnchor",
                 "Introduce FutureAnchor",
