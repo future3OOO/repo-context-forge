@@ -564,6 +564,63 @@ class RepoContextForgeTests(unittest.TestCase):
             "ADVISOR_PROJECTION_V1_CONTRACT_BROKEN",
         )
 
+    def test_public_bootstrap_pr_mode_ignores_unrelated_source_dirt(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "a.py").write_text("VALUE = 2\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "src/a.py"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "pr change"])
+            head_tree = repo_context_forge.run_git(repo, ["rev-parse", "HEAD^{tree}"])
+            (repo / "local-only.txt").write_text("dirty\n", encoding="utf-8")
+            result, packet = self.run_public_bootstrap(
+                repo, cache_dir, runtime_home, mode="pr", base="HEAD~1")
+        self.assertTrue(
+            result.returncode == 0
+            and packet["advisorProjection"]["expectedCandidateTree"]
+            == packet["advisorProjection"]["indexedCandidateTree"] == head_tree,
+            "PR_DIRTY_SOURCE_CANDIDATE_REJECTED",
+        )
+
+    def test_public_bootstrap_repo_mode_ignores_unrelated_source_dirt(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            head_tree = repo_context_forge.run_git(repo, ["rev-parse", "HEAD^{tree}"])
+            (repo / "local-only.txt").write_text("dirty\n", encoding="utf-8")
+            result, packet = self.run_public_bootstrap(
+                repo, cache_dir, runtime_home, mode="repo")
+        self.assertTrue(
+            result.returncode == 0
+            and packet["advisorProjection"]["expectedCandidateTree"]
+            == packet["advisorProjection"]["indexedCandidateTree"] == head_tree,
+            "REPO_DIRTY_SOURCE_CANDIDATE_REJECTED",
+        )
+
+    def test_public_bootstrap_preserves_offsets_after_backtick_spans(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            for name in ("one", "two"):
+                (repo / "src" / f"{name}.py").write_text(
+                    "class DeepAnchor:\n    pass\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "duplicate symbols"])
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home,
+                intent="Review `X` then update one.DeepAnchor behavior", top=2)
+        required_checks = {
+            (entry["kind"], entry["file"], entry["target"])
+            for entry in packet["gitnexus"]["analysis"]["entries"]
+        }
+        self.assertTrue(
+            result.returncode == 0
+            and packet["gitnexus"]["required_checks_resolved"]
+            and {
+                ("symbol_context", "src/one.py", "DeepAnchor"),
+                ("symbol_impact", "src/one.py", "DeepAnchor"),
+            } <= required_checks
+            and not any(
+                gap.get("reference") == "DeepAnchor"
+                for gap in packet["coverage_gaps"]
+            ),
+            "BACKTICK_OFFSET_AMBIGUITY_REPORTED",
+        )
+
     def test_public_bootstrap_refreshes_second_dirty_candidate_without_manual_cleanup(
         self,
     ) -> None:
@@ -634,6 +691,33 @@ class RepoContextForgeTests(unittest.TestCase):
                 "PACKET_NESTED_REFRESH_REGRESSED\n"
                 f"gitnexus={packet.get('gitnexus')}\n"
                 f"stdout={result.stdout}\nstderr={result.stderr}",
+            )
+
+    def test_public_bootstrap_blocks_mismatched_index_generation(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home)
+            registry_path = Path(runtime_home) / ".gitnexus" / "registry.json"
+            registry = repo_context_forge.json.loads(
+                registry_path.read_text(encoding="utf-8"))
+            analysis_repo = packet["target_state"]["analysis_repo"]
+            entry = next(item for item in registry if item["path"] == analysis_repo)
+            entry["indexedAt"] = "mismatched-generation"
+            registry_path.write_text(
+                repo_context_forge.json.dumps(registry), encoding="utf-8")
+
+            blocked_result, blocked_packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, gitnexus_mode="check")
+
+            self.assertTrue(
+                result.returncode == 0
+                and packet["gitnexus"].get("index_generation")
+                and blocked_result.returncode != 0
+                and blocked_packet["gitnexus"].get("status") == "blocked"
+                and not blocked_packet["gitnexus"].get("index_generation")
+                and not blocked_packet["gitnexus"].get("indexed_candidate_tree")
+                and not blocked_packet["gitnexus"]["required_checks_resolved"],
+                "INDEX_GENERATION_BINDING_REGRESSED",
             )
 
     def test_public_bootstrap_blocks_candidate_transaction_contention(self) -> None:

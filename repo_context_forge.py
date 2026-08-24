@@ -2367,7 +2367,12 @@ def make_packet(
     source_repo = repo_root(repo)
     source_status_before = porcelain_status(source_repo)
     target_state = resolve_target_state(repo, mode, base_ref, head_ref, cache_dir)
-    expected_candidate_tree = candidate_tree(target_state.source_repo)
+    candidate_repo = (
+        target_state.source_repo
+        if mode in {"local", "intent"}
+        else target_state.analysis_repo
+    )
+    expected_candidate_tree = candidate_tree(candidate_repo)
     analysis_candidate_tree = candidate_tree(target_state.analysis_repo)
     if analysis_candidate_tree != expected_candidate_tree:
         raise RuntimeError("analysis checkout does not match the source candidate tree")

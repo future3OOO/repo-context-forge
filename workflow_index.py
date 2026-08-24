@@ -332,7 +332,9 @@ class WorkflowIndex:
         bare_identifiers = list(dict.fromkeys(
             match.group(0)
             for match in re.finditer(
-                r"\b[A-Za-z_][A-Za-z0-9_]*\b", re.sub(r"`[^`]*`", " ", intent))
+                r"\b[A-Za-z_][A-Za-z0-9_]*\b",
+                re.sub(r"`[^`]*`", lambda match: " " * len(match.group(0)), intent),
+            )
             if ("_" in match.group(0) or any(character.isupper()
                                                for character in match.group(0)[1:])) and not (
                 (match.start() > 0 and intent[match.start() - 1] in "./`")
