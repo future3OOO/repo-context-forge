@@ -5,6 +5,7 @@ import fcntl
 import importlib.util
 import os
 import shutil
+import signal
 import sqlite3
 import sys
 import tempfile
@@ -744,6 +745,30 @@ class RepoContextForgeTests(unittest.TestCase):
                 "INDEX_GENERATION_BINDING_REGRESSED",
             )
 
+        for file_name in ("meta.json", "repo-context-forge-receipt.json"):
+            with self.subTest(file_name=file_name), self.public_intent_repo() as (repo, cache_dir, runtime_home):
+                result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+                index_file = Path(packet["target_state"]["analysis_repo"]) / ".gitnexus" / file_name
+                index_file.write_bytes(b"\xff")
+                packet_path = Path(runtime_home) / "packet.json"
+                packet_path.unlink()
+                check_result, check_packet = self.run_public_intent_bootstrap(
+                    repo, cache_dir, runtime_home, gitnexus_mode="check")
+                packet_path.unlink(missing_ok=True)
+                auto_result, auto_packet = self.run_public_intent_bootstrap(
+                    repo, cache_dir, runtime_home)
+                self.assertEqual(
+                    (result.returncode, check_result.returncode,
+                     check_packet.get("gitnexus", {}).get("status"),
+                     check_packet.get("gitnexus", {}).get("reindex_attempted"),
+                     check_packet.get("gitnexus", {}).get("required_checks_resolved"),
+                     auto_result.returncode, auto_packet.get("gitnexus", {}).get("status"),
+                     auto_packet.get("gitnexus", {}).get("reindex_attempted"),
+                     auto_packet.get("gitnexus", {}).get("required_checks_resolved"),
+                     "UnicodeDecodeError" in check_result.stderr + auto_result.stderr),
+                    (0, 1, "blocked", False, False, 0, "reindexed", True, True, False),
+                    "INVALID_UTF8_GRAPH_STATE_CRASHED_BOOTSTRAP")
+
     def test_public_bootstrap_preserves_registry_failure_diagnostic_during_reindex(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             registry_path = Path(runtime_home) / ".gitnexus" / "registry.json"
@@ -782,6 +807,21 @@ class RepoContextForgeTests(unittest.TestCase):
                  "receipt publication failed" in warning, receipt_path.exists()),
                 (True, True, "blocked", False, True, False),
                 "RECEIPT_WRITE_FAILURE_ESCAPED_WITHOUT_BLOCKER_PACKET")
+
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            _result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            receipt_path = Path(packet["target_state"]["analysis_repo"]) / ".gitnexus" / "repo-context-forge-receipt.json"
+            receipt_path.unlink()
+            receipt_path.mkdir()
+            (Path(runtime_home) / "packet.json").unlink()
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            self.assertEqual(
+                (result.returncode != 0, packet.get("gitnexus", {}).get("status"),
+                 packet.get("gitnexus", {}).get("required_checks_resolved"),
+                 "receipt publication failed" in str(packet.get("gitnexus", {}).get("warning") or ""),
+                 "Traceback" in result.stderr),
+                (True, "blocked", False, True, False),
+                "RECEIPT_REPLACE_FAILURE_ESCAPED_WITHOUT_BLOCKER_PACKET")
 
     def test_public_bootstrap_blocks_candidate_transaction_contention(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -861,8 +901,9 @@ class RepoContextForgeTests(unittest.TestCase):
             "CONTEXTVAR_TRANSACTION_OWNERSHIP_ESCAPED")
 
     def test_public_bootstrap_blocks_graph_time_candidate_mutation(self) -> None:
+        marker = "GRAPH_TIME_CANDIDATE_MUTATION_VALIDATED_FOR_WRONG_REASON"
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
-            names = [f"MutationAnchor{index}" for index in range(12)]
+            names = [f"MutationAnchor{index}" for index in range(8)]
             (repo / "src" / "a.py").write_text("".join(
                 f"class {name}:\n    pass\n" for name in names), encoding="utf-8")
             head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
@@ -877,16 +918,47 @@ class RepoContextForgeTests(unittest.TestCase):
                 command, env={**os.environ, "HOME": runtime_home}, stdout=repo_context_forge.subprocess.PIPE,
                 stderr=repo_context_forge.subprocess.PIPE, text=True)
             deadline = time.monotonic() + 30
-            while not (analysis_repo / ".gitnexus" / "meta.json").exists():
-                self.assertIsNone(process.poll(), "GRAPH_TIME_CANDIDATE_MUTATION_VALIDATED")
-                self.assertLess(time.monotonic(), deadline, "GRAPH_TIME_CANDIDATE_MUTATION_VALIDATED")
-                time.sleep(0.01)
-            (analysis_repo / "src" / "a.py").write_text("MUTATED = True\n", encoding="utf-8")
+
+            def stop_graph_child() -> int | None:
+                try:
+                    children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text().split()
+                except OSError:
+                    return None
+                for child in children:
+                    try:
+                        command = Path(f"/proc/{child}/cmdline").read_bytes().replace(b"\0", b" ")
+                        if b"gitnexus" not in command or not (
+                            b" context " in command or b" impact " in command):
+                            continue
+                        os.kill(int(child), signal.SIGSTOP)
+                        if "State:\tT" in Path(f"/proc/{child}/status").read_text():
+                            return int(child)
+                        os.kill(int(child), signal.SIGCONT)
+                    except OSError:
+                        continue
+                return None
+
+            graph_child = None
+            while graph_child is None:
+                self.assertIsNone(process.poll(), marker)
+                self.assertLess(time.monotonic(), deadline, marker)
+                graph_child = stop_graph_child()
+                if graph_child is None:
+                    time.sleep(0.001)
+            try:
+                with (analysis_repo / "src" / "a.py").open("a", encoding="utf-8") as source:
+                    source.write("MUTATED = True\n")
+            finally:
+                os.kill(graph_child, signal.SIGCONT)
             process.communicate(timeout=60)
             packet = repo_context_forge.json.loads(packet_path.read_text(encoding="utf-8"))
-            self.assertTrue(process.returncode != 0 and not packet["gitnexus"]["required_checks_resolved"]
-                            and not (analysis_repo / ".gitnexus" / "repo-context-forge-receipt.json").exists(),
-                            "GRAPH_TIME_CANDIDATE_MUTATION_VALIDATED")
+            analysis = packet["gitnexus"]["analysis"]
+            self.assertEqual(
+                (process.returncode != 0, packet["gitnexus"]["required_checks_resolved"],
+                 analysis["graph_call_count"], [item["kind"] for item in analysis["unresolved_checks"]],
+                 (analysis_repo / ".gitnexus" / "repo-context-forge-receipt.json").exists()),
+                (True, False, 16, ["candidate_receipt"], False),
+                marker)
 
     def test_public_bootstrap_candidate_tree_tracks_supported_git_shapes(self) -> None:
         def untracked(repo):

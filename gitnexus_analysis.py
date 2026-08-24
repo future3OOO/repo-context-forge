@@ -83,7 +83,7 @@ def _read_json_object(path: Path) -> dict[str, object] | None:
         return None
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -309,12 +309,12 @@ def publish_receipt(
                 ) + "\n",
                 encoding="utf-8",
             )
+            temporary_path.replace(receipt_path)
         except OSError as exc:
             gitnexus_status.update(
                 status="blocked", required_checks_resolved=False,
                 warning=f"GitNexus receipt publication failed; blast-radius claims are blocked ({exc})")
             return gitnexus_status
-        temporary_path.replace(receipt_path)
         current = _current_status(*status_args)
         warning = "GitNexus receipt validation failed after publication"
 
