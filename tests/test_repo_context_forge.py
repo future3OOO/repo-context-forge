@@ -1163,6 +1163,11 @@ class RepoContextForgeTests(unittest.TestCase):
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             (repo / "src" / "deep.py").write_text(
                 "class DeepAnchor:\n    pass\n", encoding="utf-8")
+            (repo / "src" / "pkg.py").write_text(
+                "class mod:\n    pass\n", encoding="utf-8")
+            (repo / "pkg.DeepAnchor").write_text("VALUE = 1\n", encoding="utf-8")
+            (repo / "pkg.mod").mkdir()
+            (repo / "pkg.mod" / "file.py").write_text("VALUE = 1\n", encoding="utf-8")
             repo_context_forge.run_git(repo, ["add", "-A"])
             repo_context_forge.run_git(repo, ["commit", "-m", "qualified owner"])
             result, packet = self.run_public_intent_bootstrap(
@@ -1182,11 +1187,55 @@ class RepoContextForgeTests(unittest.TestCase):
                 } <= required_checks,
                 "QUALIFIED_SYMBOL_OUTSIDE_TOP_OMITTED",
             )
+            collision_result, collision_packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home,
+                intent="Update pkg.DeepAnchor behavior", top=1,
+            )
+            collision_checks = {
+                (item["kind"], item["file"], item["target"])
+                for item in collision_packet["gitnexus_plan"]
+                if item.get("required") is True
+            }
+            self.assertTrue(
+                collision_result.returncode == 0
+                and {
+                    ("file_context", "pkg.DeepAnchor", "pkg.DeepAnchor"),
+                    ("symbol_context", "src/deep.py", "DeepAnchor"),
+                    ("symbol_impact", "src/deep.py", "DeepAnchor"),
+                } <= collision_checks,
+                "QUALIFIED_SYMBOL_COLLISION_DROPPED",
+            )
+            for path_reference in ("pkg.mod/file.py", "`pkg.mod/file.py`"):
+                repeated_result, repeated_packet = self.run_public_intent_bootstrap(
+                    repo, cache_dir, runtime_home,
+                    intent=f"Update {path_reference} and pkg.mod behavior", top=1,
+                )
+                repeated_checks = {
+                    (item["kind"], item["file"], item["target"])
+                    for item in repeated_packet["gitnexus_plan"]
+                    if item.get("required") is True
+                }
+                self.assertTrue(
+                    repeated_result.returncode == 0
+                    and {
+                        ("file_context", "pkg.mod/file.py", "pkg.mod/file.py"),
+                        ("symbol_context", "src/pkg.py", "mod"),
+                        ("symbol_impact", "src/pkg.py", "mod"),
+                    } <= repeated_checks,
+                    "REPEATED_PATH_PREFIX_HID_QUALIFIED_SYMBOL",
+                )
 
     def test_public_bootstrap_preserves_file_intent_evidence(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             (repo / "src" / "a.py").write_text("def handle():\n    pass\n", encoding="utf-8")
-            (repo / "root.py").write_text("VALUE = 1\n", encoding="utf-8")
+            for relative_path in (
+                "root.py", "pyproject.toml", "setup.cfg", "package.lock",
+                "config.d/settings.py",
+            ):
+                path = repo / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("VALUE = 1\n", encoding="utf-8")
+            (repo / "src" / "d.py").write_text("class d:\n    pass\n", encoding="utf-8")
             repo_context_forge.run_git(repo, ["add", "-A"])
             repo_context_forge.run_git(repo, ["commit", "-m", "intent evidence"])
             result, packet = self.run_public_intent_bootstrap(
@@ -1206,6 +1255,40 @@ class RepoContextForgeTests(unittest.TestCase):
             for intent, marker in (("Update src/a.py.", "PUNCTUATED_EXISTING_FILE_REPORTED_ABSENT"), ("Update `src/a.py` behavior", "EXPLICIT_EXISTING_FILE_REPORTED_ABSENT"), ("Add src/a.py", "EXISTING_CREATION_PATH_REGRESSED"), ("Create root.py", "EXISTING_ROOT_CREATION_PATH_REGRESSED")):
                 result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent=intent, top=1)
                 self.assertTrue(result.returncode == 0 and not packet["coverage_gaps"], marker)
+            for relative_path in (
+                "pyproject.toml",
+                "setup.cfg",
+                "package.lock",
+                "config.d/settings.py",
+            ):
+                for reference in (relative_path, f"`{relative_path}`"):
+                    result, packet = self.run_public_intent_bootstrap(
+                        repo, cache_dir, runtime_home,
+                        intent=f"Update {reference} behavior", top=1,
+                    )
+                    target = next(
+                        item for item in packet["targets"]
+                        if item["path"] == relative_path
+                    )
+                    evidence = target.get("intent_evidence", {})
+                    self.assertTrue(
+                        evidence.get("exact_file") is True
+                        and relative_path in evidence.get("matched_terms", [])
+                        and not any(
+                            gap.get("kind") == "absent_symbol"
+                            for gap in packet["coverage_gaps"]
+                        ),
+                        "DOTTED_EXISTING_FILE_REPORTED_SYMBOL_GAP",
+                    )
+                    if relative_path == "config.d/settings.py":
+                        self.assertFalse(
+                            any(
+                                item.get("target") == "d"
+                                and item.get("required") is True
+                                for item in packet["gitnexus_plan"]
+                            ),
+                            "DOTTED_DIRECTORY_PREFIX_RESOLVED_SYMBOL",
+                        )
 
     def test_public_bootstrap_blocks_ambiguous_unqualified_symbol(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):

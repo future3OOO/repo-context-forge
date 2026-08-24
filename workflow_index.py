@@ -316,15 +316,46 @@ class WorkflowIndex:
         return matches
 
     def resolve_intent(self, intent: str) -> IntentResolution:
-        qualified_references = [
-            reference
-            for reference in dict.fromkeys(re.findall(
+        file_rows = self._fetchall("SELECT path, role, base_score, search_terms FROM files")
+        file_roles = {str(path): str(role) for path, role, _score, _terms in file_rows}
+        qualified_reference_matches = [
+            match
+            for match in re.finditer(
                 r"(?<![/A-Za-z0-9_])(?:[A-Za-z_][A-Za-z0-9_]*\.)+[A-Za-z_][A-Za-z0-9_]*\b",
                 intent,
-            ))
-            if reference.rsplit(".", 1)[-1].lower()
+            )
+            if match.group(0).rsplit(".", 1)[-1].lower()
             not in {"js", "json", "md", "py", "sh", "ts", "tsx", "yaml", "yml"}
         ]
+        qualified_references = list(dict.fromkeys(
+            match.group(0) for match in qualified_reference_matches
+        ))
+        path_tokens = {path for path in re.findall(
+            r"(?<![/A-Za-z0-9_.-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]*", intent) if not path.endswith("/")}
+        explicit_paths = set(re.findall(r"`((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)`", intent)) | set(re.findall(r"(?i)\b(?:update|modify|change|fix|edit|remove|delete|add|create)\s+`((?:[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+|\.[A-Za-z0-9_-][A-Za-z0-9_.-]*))`(?=\s+behavior\b|\.?$)", intent))
+        creation_paths = set(re.findall(r"(?i)\b(?:add|create)\s+`?((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+)`?", intent))
+        root_paths = set(re.findall(r"(?i)\b(?:update|modify|change|fix|edit|remove|delete|add|create)\s+([A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+)\b(?=\s+behavior\b|\.?$)", intent))
+        intent_paths = path_tokens | explicit_paths | creation_paths | root_paths
+        exact_intent_paths = {
+            path if path in file_roles else path.rstrip(".")
+            for path in intent_paths
+        } & file_roles.keys()
+        path_prefix_references = {
+            reference
+            for reference in qualified_references
+            if any(path.startswith(f"{reference}/") for path in exact_intent_paths)
+            and all(
+                match.end() < len(intent) and intent[match.end()] == "/"
+                for match in qualified_reference_matches
+                if match.group(0) == reference
+            )
+        }
+        path_bound_references = path_prefix_references | (
+            set(qualified_references) & exact_intent_paths
+        )
+        path_tokens |= explicit_paths | creation_paths | (
+            root_paths - (set(qualified_references) - path_bound_references)
+        )
         code_identifiers = re.findall(
             r"`([A-Za-z_][A-Za-z0-9_]*)`",
             intent,
@@ -359,6 +390,8 @@ class WorkflowIndex:
         created_identifiers = {
             reference.rsplit(".", 1)[-1] for reference in created_references}
         for reference in qualified_references:
+            if reference in path_prefix_references:
+                continue
             qualifier, name = reference.rsplit(".", 1)
             qualifier = qualifier.rsplit(".", 1)[-1]
             candidates = qualified_matches.get(name, [])
@@ -392,7 +425,11 @@ class WorkflowIndex:
                 IntentSymbolMatch(path=path, symbol=symbol)
                 for path, symbol in selected
             )
-            if not selected and reference not in created_references:
+            if (
+                not selected
+                and reference not in created_references
+                and (candidates or reference not in path_bound_references)
+            ):
                 gaps.append(IntentCoverageGap(
                     kind="ambiguous_symbol" if candidates else "absent_symbol",
                     reference=reference,
@@ -446,11 +483,6 @@ class WorkflowIndex:
                     score=len(matched),
                     matched_terms=matched,
                 ))
-        path_tokens = {path for path in re.findall(
-            r"(?<![/A-Za-z0-9_.-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]*", intent) if not path.endswith("/")}
-        explicit_paths = set(re.findall(r"`((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)`", intent)) | set(re.findall(r"(?i)\b(?:update|modify|change|fix|edit|remove|delete|add|create)\s+`((?:[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+|\.[A-Za-z0-9_-][A-Za-z0-9_.-]*))`(?=\s+behavior\b|\.?$)", intent))
-        creation_paths = set(re.findall(r"(?i)\b(?:add|create)\s+`?((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+)`?", intent))
-        path_tokens |= explicit_paths | creation_paths | (set(re.findall(r"(?i)\b(?:update|modify|change|fix|edit|remove|delete|add|create)\s+([A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+)\b(?=\s+behavior\b|\.?$)", intent)) - set(qualified_references))
         required_by_path: dict[str, list[str]] = {}
         for match in required:
             required_by_path.setdefault(match.path, []).append(match.symbol.name)
@@ -459,8 +491,6 @@ class WorkflowIndex:
             relevant_by_path.setdefault(item.path, []).append(item)
         file_evidence: list[IntentFileEvidence] = []
         forms = self._intent_forms(terms)
-        file_rows = self._fetchall("SELECT path, role, base_score, search_terms FROM files")
-        file_roles = {str(path): str(role) for path, role, _score, _terms in file_rows}
         known_dirs = {str(parent) for path in file_roles for parent in Path(path).parents if str(parent) != "."}
         path_tokens = {path if path in file_roles else path.rstrip(".") for path in path_tokens}
         exact_files = {path for path in path_tokens if path in file_roles or (
