@@ -30,8 +30,8 @@ The plugin startup path is:
 3. The bootstrap script auto-selects `pr`, `local`, `intent`, or `repo` mode.
 4. Forge builds an atomic workflow index in the cache-owned analysis checkout.
 5. The generated XML packet becomes the initial repo context for the task.
-6. GitNexus freshness is checked for the exact target head before blast-radius
-   claims are trusted.
+6. GitNexus freshness is checked for the exact candidate tree, with committed
+   HEAD retained as provenance, before blast-radius claims are trusted.
 
 In production plugin mode, the current git folder is the target. Clean folders
 with no diff use `repo` mode for whole-repo context. Repo Context Forge does not
@@ -161,24 +161,32 @@ For active implementation before a PR exists, use `mode=local` or `mode=intent`.
 These modes intentionally use ambient current-worktree context, but SoulForge
 runs against a cached analysis checkout. The target repository is an input only:
 Repo Context Forge must not add `.soulforge`, edit `.gitignore`, or run cleanup
-checkouts in the source checkout. Intent-mode graph checks apply only to existing
-selected files. A qualified existing symbol becomes required when its immediate
-qualifier identifies one exact-name direct enclosing class candidate or one selected
-file path, or when its terminal name is unique across selected targets. Matching uses
-each selected file's complete extracted inventory. A planned symbol that does not
-exist never synthesizes a symbol check; when the intent independently names an existing
-file path, that file is required instead as context.
-Required checks omitted by the bounded plan block through `unresolved_checks`, while
-optional omissions remain non-blocking. Directory-derived `go.sum` and `Cargo.lock`
-are excluded; explicitly named lockfiles remain required anchors.
+checkouts in the source checkout. Exact files, qualified existing symbols, and
+globally unambiguous explicit symbols remain required through final graph planning.
+Matching uses the complete workflow-index inventory, independently of bounded symbol
+display. Whole intent target records carry relevance score, exact-file status, matched
+terms, and matched symbols through final ordering and `advisorProjection`. Ambiguous or absent
+references become explicit coverage gaps; only the qualified reference immediately governed
+by Add/Create is treated as a future symbol. Required context/impact pairs allocate before
+optional breadth. Required omissions are whole blocking records; optional omissions are
+counted separately and remain non-blocking. Directory-derived `go.sum` and `Cargo.lock` are
+excluded; explicitly named lockfiles remain required anchors.
 
 For clean exploration, use `mode=repo` or let the plugin bootstrap select it.
 
-GitNexus is not replaced by this tool. In `auto` mode, Repo Context Forge checks
-whether the GitNexus index matches the packet target head and reindexes the
-cache-owned analysis checkout when it is missing or stale. It then executes the
-packet plan once. Stale, unavailable, malformed, ambiguous, or identity-mismatched
-results produce one blocker instead of a successful packet. The bootstrap's
-optional `--packet-json-out PATH` atomically writes the same machine packet while
-normal prompt stdout remains unchanged. A blocker is still rendered and written,
-then the production bootstrap exits nonzero.
+GitNexus is not replaced by this tool. In `auto` mode, Repo Context Forge captures
+the exact candidate as a Git tree without mutating the source index, reindexes the
+cache-owned analysis checkout when its receipt does not certify that tree, and holds
+one producer transaction through graph execution and receipt publication. The receipt
+binds the indexed candidate to checkout identity, committed-head provenance, matching
+registry/local index generation, and present index storage.
+
+Every normal and blocker machine packet contains one `advisorProjection` with
+`schemaVersion: 1`. It carries canonical source/base provenance, expected and indexed
+candidate trees (or named gaps), whole target records, same-packet references to full
+GitNexus entries, required omissions, optional omission count, and coverage gaps; it
+does not duplicate graph bodies or replace legacy evidence. Stale, unavailable,
+malformed, ambiguous, or identity-mismatched results produce one blocker instead of a
+successful packet. The bootstrap's optional `--packet-json-out PATH` atomically writes
+the same machine packet while normal prompt stdout remains unchanged. A blocker is
+still rendered and written, then the production bootstrap exits nonzero.

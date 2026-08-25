@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import html
+import inspect
 import json
 import os
 import re
@@ -15,6 +17,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Literal
+from urllib.parse import urlsplit
 
 import gitnexus_analysis
 import workflow_index
@@ -28,7 +31,8 @@ GitNexusMode = Literal["off", "check", "auto"]
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "repo-context-forge"
 TOOL_CACHE_DIRS = (".soulforge", ".codex", ".gitnexus", workflow_index.INDEX_DIR)
-TOOL_CACHE_PREFIXES = tuple(f"{name}/" for name in TOOL_CACHE_DIRS)
+TOOL_CACHE_PATHS = (*TOOL_CACHE_DIRS, ".claude/skills/gitnexus")
+TOOL_CACHE_PREFIXES = tuple(f"{name}/" for name in TOOL_CACHE_PATHS)
 MIN_TOKEN_BUDGET = 16_000
 MAX_TOKEN_BUDGET = 32_000
 DEFAULT_TOKEN_BUDGET = MIN_TOKEN_BUDGET
@@ -254,7 +258,7 @@ def tool_cache_dirty_paths(paths: Iterable[str]) -> list[str]:
     return [
         path
         for path in paths
-        if path in TOOL_CACHE_DIRS
+        if path in TOOL_CACHE_PATHS
         or path.startswith(TOOL_CACHE_PREFIXES)
     ]
 
@@ -285,7 +289,10 @@ def is_generated_or_cache_path(path: str) -> bool:
     parts = path.split("/")
     if any(part in TOOL_CACHE_DIRS for part in parts) or "__pycache__" in parts:
         return True
-    return path.endswith((".pyc", ".pyo")) or path.startswith(".git/")
+    return (
+        path.endswith((".pyc", ".pyo"))
+        or path.startswith((".git/", *TOOL_CACHE_PREFIXES))
+    )
 
 
 def reference_only_prefixes(repo: Path) -> list[str]:
@@ -344,7 +351,12 @@ def cleanup_soulforge_gitignore_change(repo: Path) -> None:
         for line in changed_lines
         if not line.startswith("+++") and not line.startswith("---")
     ]
-    if content_changes and all(line in {"+.soulforge", "+.soulforge/"} for line in content_changes):
+    tool_cache_lines = {
+        f"+{name}"
+        for directory in TOOL_CACHE_DIRS
+        for name in (directory, f"{directory}/")
+    }
+    if content_changes and all(line in tool_cache_lines for line in content_changes):
         run_git(repo, ["checkout", "--", ".gitignore"])
 
 
@@ -487,24 +499,7 @@ def intent_path_references(intent: str) -> list[str]:
     )
 
 
-def identifier_words(value: str) -> list[str]:
-    words: list[str] = []
-    for chunk in re.split(r"[^A-Za-z0-9]+", value):
-        if not chunk:
-            continue
-        words.extend(
-            word.lower()
-            for word in re.findall(r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+", chunk)
-        )
-    return words
-
-
-def synthetic_symbol_summary(path: str, name: str, kind: str) -> str:
-    words = " ".join(identifier_words(name)) or name
-    parent = Path(path).parent.name.replace("_", " ").replace("-", " ")
-    if parent and parent != ".":
-        return f"{kind} in {parent}: {words}"
-    return f"{kind}: {words}"
+synthetic_symbol_summary = workflow_index.synthetic_symbol_summary
 
 
 def compute_token_budget(conversation_tokens: int | None, explicit_budget: int | None) -> int:
@@ -523,6 +518,13 @@ def estimate_tokens(text: str) -> int:
 def cache_key_for(repo: Path, head_sha: str, extra: str = "") -> str:
     material = f"{repo.resolve()}\0{head_sha}\0{extra}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def analysis_checkout_path(repo: Path, head_sha: str, cache_dir: Path, mode: Mode) -> tuple[Path, str]:
+    extra = "repo-analysis" if mode == "repo" else "local-analysis" if mode != "pr" else ""
+    key = cache_key_for(repo, head_sha, extra)
+    directory = "worktrees" if mode == "pr" else "analysis-checkouts" if mode == "repo" else "analysis-worktrees"
+    return (cache_dir / directory / f"{repo.name}-{head_sha[:12]}-{key}").resolve(), key
 
 
 def default_task_id(repo: Path, head_sha: str, intent: str | None = None) -> str:
@@ -625,6 +627,30 @@ def source_worktree_files(repo: Path) -> list[str]:
     ]
 
 
+def candidate_tree(repo: Path) -> str:
+    with tempfile.TemporaryDirectory(prefix="repo-context-forge-index-") as temp_dir:
+        index_path = Path(temp_dir) / "index"
+        env = dict(os.environ)
+        for variable in ("GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"):
+            env.pop(variable, None)
+        env.update({
+            "GIT_INDEX_FILE": str(index_path),
+            "GIT_LITERAL_PATHSPECS": "1",
+        })
+        run_cmd(["git", "read-tree", "HEAD"], cwd=repo, env=env)
+        run_cmd(["git", "add", "-A", "--", "."], cwd=repo, env=env)
+        generated_paths = run_cmd(
+            ["git", "ls-files", "-z"], cwd=repo, env=env).stdout.split("\0")
+        run_cmd(
+            ["git", "rm", "-r", "--cached", "--ignore-unmatch", "--",
+             *TOOL_CACHE_PATHS, *(path for path in generated_paths
+                                  if path and is_generated_or_cache_path(path))],
+            cwd=repo,
+            env=env,
+        )
+        return run_cmd(["git", "write-tree"], cwd=repo, env=env).stdout.strip()
+
+
 def locally_deleted_files(repo: Path) -> list[str]:
     unstaged = split_lines(
         run_git(repo, ["diff", "--name-only", "--diff-filter=D"], allow_fail=True)
@@ -649,7 +675,8 @@ def remove_path(path: Path) -> None:
 def reset_cached_worktree(worktree: Path, cache_dir: Path, *, allow_fail: bool = False) -> None:
     require_cache_path(worktree, cache_dir)
     run_git(worktree, ["reset", "--hard", "HEAD"], allow_fail=allow_fail)
-    run_git(worktree, ["clean", "-fd", "-e", f"{workflow_index.INDEX_DIR}/"], allow_fail=allow_fail)
+    exclusions = [item for path in TOOL_CACHE_DIRS for item in ("-e", f"{path}/")]
+    run_git(worktree, ["clean", "-fd", *exclusions], allow_fail=allow_fail)
     soulforge_cache = worktree / ".soulforge"
     if os.path.lexists(soulforge_cache):
         require_cache_path(soulforge_cache, cache_dir)
@@ -707,12 +734,13 @@ def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cac
 
     run_git(checkout, ["checkout", "-B", "repo-context-forge-target", head_sha])
     reset_cached_worktree(checkout, cache_dir)
+    if run_git(checkout, ["ls-files", "--", ".gitnexus"]):
+        remove_path(checkout / ".gitnexus")
 
 
 def ensure_pr_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
     head_sha = run_git(source_repo, ["rev-parse", head_ref])
-    key = cache_key_for(source_repo, head_sha)
-    worktree = (cache_dir / "worktrees" / f"{source_repo.name}-{head_sha[:12]}-{key}").resolve()
+    worktree, key = analysis_checkout_path(source_repo, head_sha, cache_dir, "pr")
 
     ensure_cached_checkout(source_repo, head_sha, worktree, cache_dir)
     cleanup_soulforge_gitignore_change(worktree)
@@ -735,10 +763,7 @@ def ensure_pr_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> Tar
 
 def ensure_repo_analysis_checkout(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
     head_sha = run_git(source_repo, ["rev-parse", head_ref])
-    key = cache_key_for(source_repo, head_sha, "repo-analysis")
-    checkout = (
-        cache_dir / "analysis-checkouts" / f"{source_repo.name}-{head_sha[:12]}-{key}"
-    ).resolve()
+    checkout, key = analysis_checkout_path(source_repo, head_sha, cache_dir, "repo")
 
     ensure_cached_checkout(source_repo, head_sha, checkout, cache_dir)
     cleanup_soulforge_gitignore_change(checkout)
@@ -761,14 +786,10 @@ def ensure_repo_analysis_checkout(source_repo: Path, head_ref: str, cache_dir: P
 
 def ensure_local_analysis_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
     head_sha = run_git(source_repo, ["rev-parse", head_ref])
-    key = cache_key_for(source_repo, head_sha, "local-analysis")
-    worktree = (
-        cache_dir / "analysis-worktrees" / f"{source_repo.name}-{head_sha[:12]}-{key}"
-    ).resolve()
+    worktree, key = analysis_checkout_path(source_repo, head_sha, cache_dir, "local")
 
     ensure_cached_checkout(source_repo, head_sha, worktree, cache_dir)
     overlay_source_worktree(source_repo, worktree)
-    cleanup_soulforge_gitignore_change(worktree)
 
     source_dirty = is_dirty(source_repo, ignore_tool_cache=True)
     return TargetState(
@@ -1377,6 +1398,7 @@ def target_files_for_mode(
     intent: str | None,
     top: int,
     reference_only: Iterable[str] = (),
+    intent_resolution: workflow_index.IntentResolution | None = None,
 ) -> list[str]:
     reference_prefixes = tuple(reference_only)
     if mode == "pr":
@@ -1405,22 +1427,15 @@ def target_files_for_mode(
             if not is_generated_or_cache_path(entry.path)
             and not is_reference_only_path(entry.path, reference_prefixes)
         ][:top]
-    tokens = tokenize_intent(intent or "")
+    resolution = intent_resolution or soul_map.native_index.resolve_intent(intent or "")
     candidates = [
-        path
-        for path in soul_map.intent_files(tokens, max(top * 3, top + 20))
-        if not is_generated_or_cache_path(path)
-        and not is_reference_only_path(path, reference_prefixes)
+        item.path
+        for item in resolution.file_evidence
+        if not is_generated_or_cache_path(item.path)
+        and not is_reference_only_path(item.path, reference_prefixes)
     ]
     path_references = intent_path_references(intent or "")
-    mapped_references = soul_map.files_by_path(path_references)
-    exact_files = [
-        reference
-        for reference in path_references
-        if reference in mapped_references
-        and not is_generated_or_cache_path(reference)
-        and not is_reference_only_path(reference, reference_prefixes)
-    ]
+    exact_files = [item.path for item in resolution.file_evidence if item.exact_file and not is_reference_only_path(item.path, reference_prefixes)]
     directory_matches = [
         path
         for path in candidates
@@ -1507,6 +1522,17 @@ def rank_target_entry(
     return entry
 
 
+def target_entry_sort_key(entry: dict[str, object]) -> tuple[object, ...]:
+    relevance = entry["intent_evidence"].get("relevance_score", 0) if isinstance(entry.get("intent_evidence"), dict) else 0
+    return (
+        -float(relevance),
+        -float(entry.get("priority_score") or 0),
+        0 if entry.get("surface_role") == "production" else 1,
+        int(entry["rank"]) if isinstance(entry.get("rank"), int) else 999999,
+        str(entry["path"]),
+    )
+
+
 def apply_task_state_to_entries(
     target_entries: list[dict[str, object]],
     task_state: dict[str, object] | None,
@@ -1541,15 +1567,7 @@ def apply_task_state_to_entries(
         entry["rank_signals"] = signals
         entry["why_selected"] = reasons
         entry["priority_score"] = round(score, 4)
-    return sorted(
-        target_entries,
-        key=lambda entry: (
-            -float(entry.get("priority_score") or 0),
-            0 if entry.get("surface_role") == "production" else 1,
-            int(entry["rank"]) if isinstance(entry.get("rank"), int) else 999999,
-            str(entry["path"]),
-        ),
-    )
+    return sorted(target_entries, key=target_entry_sort_key)
 
 
 def is_changed_target(entry: dict[str, object]) -> bool:
@@ -1691,8 +1709,20 @@ def make_target_entries(
     soul_map: SoulForgeMap,
     targets: list[str],
     intent: str | None = None,
+    intent_resolution: workflow_index.IntentResolution | None = None,
 ) -> list[dict[str, object]]:
-    intent = intent if mode == "intent" else None
+    if mode == "intent":
+        intent_resolution = intent_resolution or soul_map.native_index.resolve_intent(intent or "")
+    else:
+        intent = None
+        intent_resolution = workflow_index.IntentResolution((), (), (), ())
+    relevance_by_symbol = {
+        (item.path, item.line, item.name): item.score
+        for item in intent_resolution.symbol_relevance
+    }
+    file_evidence_by_path = {
+        item.path: item for item in intent_resolution.file_evidence
+    }
     map_files = soul_map.files_by_path(targets)
     symbols_by_path = {
         path: soul_map.symbols_for_file(
@@ -1703,55 +1733,10 @@ def make_target_entries(
         )
         for path in targets
     }
-    qualified_references = [
-        (parts[-2], parts[-1])
-        for match in re.findall(
-            r"(?<![/A-Za-z0-9_])(?:[A-Za-z_][A-Za-z0-9_]*\.)+[A-Za-z_][A-Za-z0-9_]*\b",
-            intent or "",
-        )
-        if len(parts := match.split(".")) >= 2
-    ]
-    required_symbol_keys: set[tuple[str, int, str]] = set()
-    for qualifier, name in qualified_references:
-        candidates = [
-            (path, symbol)
-            for path, symbols in symbols_by_path.items()
-            for symbol in symbols
-            if symbol.name == name
-        ]
-        class_matches = []
-        for path, symbol in candidates:
-            owner = min(
-                (
-                    container
-                    for container in symbols_by_path[path]
-                    if container.line < symbol.line
-                    and symbol.end_line <= container.end_line
-                ),
-                key=lambda container: container.end_line - container.line,
-                default=None,
-            )
-            if owner is not None and owner.kind == "class" and owner.name == qualifier:
-                class_matches.append((path, symbol))
-        qualifier_words = set(identifier_words(qualifier))
-        file_matches = [
-            candidate
-            for candidate in candidates
-            if qualifier_words <= set(identifier_words(candidate[0]))
-        ]
-        if len(class_matches) == 1:
-            selected = class_matches
-        elif class_matches:
-            selected = []
-        elif len(file_matches) == 1:
-            selected = file_matches
-        elif len(candidates) == 1:
-            selected = candidates
-        else:
-            selected = []
-        required_symbol_keys.update(
-            (path, symbol.line, symbol.name) for path, symbol in selected
-        )
+    required_symbol_keys: set[tuple[str, int, str]] = set(
+        (match.path, match.symbol.line, match.symbol.name)
+        for match in intent_resolution.required_symbols
+    )
     directory_owner_paths: set[str] = set()
     for reference in intent_path_references(intent or ""):
         owner = next(
@@ -1782,6 +1767,15 @@ def make_target_entries(
             *intent_required_symbols,
             *(symbol for symbol in symbols if symbol not in intent_required_symbols),
         ]
+        planner_symbols = sorted(
+            symbols,
+            key=lambda symbol: (
+                -relevance_by_symbol.get((path, symbol.line, symbol.name), 0),
+                not symbol.is_exported,
+                symbol.line,
+                symbol.name,
+            ),
+        )
         intent_names_file = bool(intent) and any(
             re.search(
                 rf"(?<![A-Za-z0-9_./-]){re.escape(candidate)}(?![A-Za-z0-9_./-])",
@@ -1792,6 +1786,7 @@ def make_target_entries(
         intent_required_file = not intent_required_symbols and (
             intent_names_file or path in directory_owner_paths
         )
+        file_evidence = file_evidence_by_path.get(path)
         display_symbols = changed_symbols[:12] if changed_symbols else intent_symbols[:12]
         dirty_kinds = []
         if path in source_git_state.staged_files:
@@ -1813,6 +1808,7 @@ def make_target_entries(
             "line_count": map_file.line_count if map_file else None,
             "changed_symbols": [symbol.__dict__ for symbol in changed_symbols],
             "symbols": [symbol.__dict__ for symbol in display_symbols],
+            "_planner_symbols": [symbol.__dict__ for symbol in planner_symbols],
             "intent_required_symbols": [symbol.name for symbol in intent_required_symbols],
             "intent_required_file": intent_required_file,
             "dependent_count": soul_map.dependent_count_for_file(path),
@@ -1821,18 +1817,12 @@ def make_target_entries(
             "soulforge_impact": soul_map.impact_summary_for_file(path),
             "analysis_repo": str(analysis_repo),
         }
+        if file_evidence is not None:
+            entry["intent_evidence"] = file_evidence.__dict__
         target_entries.append(
             rank_target_entry(entry, source_git_state, mode=mode)
         )
-    return sorted(
-        target_entries,
-        key=lambda entry: (
-            -float(entry.get("priority_score") or 0),
-            0 if entry.get("surface_role") == "production" else 1,
-            int(entry["rank"]) if isinstance(entry.get("rank"), int) else 999999,
-            str(entry["path"]),
-        ),
-    )
+    return sorted(target_entries, key=target_entry_sort_key)
 
 
 def build_gitnexus_plan(
@@ -1847,7 +1837,11 @@ def build_gitnexus_plan(
     for entry in target_entries:
         entry_optional_groups: list[list[dict[str, object]]] = []
         path = str(entry["path"])
-        symbols = entry.get("changed_symbols") or entry.get("symbols")
+        symbols = (
+            entry.get("changed_symbols")
+            or entry.get("_planner_symbols")
+            or entry.get("symbols")
+        )
         required_file = entry.get("intent_required_file") is True
         file_key = ("file_context", path, path, "")
         if required_file and file_key not in seen:
@@ -1931,16 +1925,23 @@ def build_gitnexus_plan(
         if index < len(queue)
     ]
     plan: list[dict[str, object]] = []
-    omitted_checks = 0
     omitted_required_checks: list[dict[str, object]] = []
-    for group in [*required_groups, *optional_groups]:
+    for group in required_groups:
         if len(plan) + len(group) > MAX_GITNEXUS_CHECKS:
-            omitted_checks += len(group)
-            if any(item.get("required") is True for item in group):
-                omitted_required_checks.extend(dict(item) for item in group)
+            omitted_required_checks.extend(dict(item) for item in group)
             continue
         plan.extend(group)
-    return plan, omitted_checks, omitted_required_checks
+
+    omitted_optional_checks = 0
+    if omitted_required_checks:
+        omitted_optional_checks = sum(len(group) for group in optional_groups)
+    else:
+        for group in optional_groups:
+            if len(plan) + len(group) > MAX_GITNEXUS_CHECKS:
+                omitted_optional_checks += len(group)
+                continue
+            plan.extend(group)
+    return plan, omitted_optional_checks, omitted_required_checks
 
 
 semantic_summary_section = workflow_index.semantic_summary
@@ -2175,7 +2176,7 @@ def make_blocker_packet(
     source_repo = repo_root(repo)
     head_sha = run_git(source_repo, ["rev-parse", head_ref], allow_fail=True)
     git_state = read_git_state(source_repo, base_ref or head_ref, head_ref)
-    return {
+    packet = {
         "schema_version": 1,
         "blocked": True,
         "blocker": {
@@ -2233,8 +2234,119 @@ def make_blocker_packet(
         ), source_repo.name),
         "gitnexus_plan": [],
     }
+    packet["advisorProjection"] = build_advisor_projection(packet)
+    return packet
 
 
+def canonical_repo_identity(repo: Path) -> str | None:
+    remotes = sorted(split_lines(run_git(repo, ["remote"], allow_fail=True)))
+    if not remotes:
+        return None
+    remote = "origin" if "origin" in remotes else remotes[0]
+    url = run_git(repo, ["remote", "get-url", remote], allow_fail=True)
+    scp_match = re.fullmatch(r"[^@]+@([^:]+):(.+)", url)
+    if scp_match:
+        host, path = scp_match.groups()
+    else:
+        parsed = urlsplit(url)
+        if not parsed.hostname:
+            return None
+        host, path = parsed.hostname, parsed.path
+    normalized_path = path.strip("/")
+    if normalized_path.endswith(".git"):
+        normalized_path = normalized_path[:-4]
+    return f"{host}/{normalized_path}" if normalized_path else None
+
+
+def build_advisor_projection(packet: dict[str, object]) -> dict[str, object]:
+    gitnexus = packet.get("gitnexus")
+    gitnexus = gitnexus if isinstance(gitnexus, dict) else {}
+    analysis = gitnexus.get("analysis")
+    analysis = analysis if isinstance(analysis, dict) else {}
+    entries = analysis.get("entries")
+    entries = entries if isinstance(entries, list) else []
+    references = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        reference = f"gitnexus.analysis.entries[{index}]"
+        entry["reference"] = reference
+        references.append(reference)
+    unresolved = analysis.get("unresolved_checks")
+    unresolved = unresolved if isinstance(unresolved, list) else []
+    required_omissions = [
+        dict(item)
+        for item in unresolved
+        if isinstance(item, dict) and item.get("status") == "omitted"
+    ]
+    target_state = packet.get("target_state")
+    target_state = target_state if isinstance(target_state, dict) else {}
+    git = packet.get("git")
+    git = git if isinstance(git, dict) else {}
+    targets = packet.get("targets")
+    targets = targets if isinstance(targets, list) else []
+    source_identity = canonical_repo_identity(Path(str(packet.get("repo") or ".")))
+    source_base = git.get("merge_base")
+    coverage_gaps = [
+        dict(gap)
+        for gap in packet.get("coverage_gaps", [])
+        if isinstance(gap, dict)
+    ]
+    if not source_identity:
+        coverage_gaps.append({"kind": "source_repo_unavailable"})
+    if not source_base:
+        coverage_gaps.append({"kind": "source_base_unavailable"})
+    expected_candidate = target_state.get("candidate_tree")
+    if not expected_candidate:
+        expected_candidate = {"gap": "expected_candidate_tree_unavailable"}
+        coverage_gaps.append({"kind": "expected_candidate_tree_unavailable"})
+    indexed_candidate = gitnexus.get("indexed_candidate_tree")
+    if not indexed_candidate:
+        indexed_candidate = {"gap": "indexed_candidate_tree_unavailable"}
+        coverage_gaps.append({"kind": "indexed_candidate_tree_unavailable"})
+    graph_status = (
+        "disabled"
+        if gitnexus.get("status") == "disabled"
+        else analysis.get("status") or gitnexus.get("status") or "unknown"
+    )
+    return {
+        "schemaVersion": 1,
+        "producerRevision": analysis.get("producer_revision") or producer_revision(),
+        "sourceRepo": source_identity or {"gap": "source_repo_unavailable"},
+        "sourceBaseOid": source_base or {"gap": "source_base_unavailable"},
+        "committedHeadOid": target_state.get("head_sha") or "",
+        "expectedCandidateTree": expected_candidate,
+        "indexedCandidateTree": indexed_candidate,
+        "targets": [dict(target) for target in targets if isinstance(target, dict)],
+        "graph": {
+            "status": graph_status,
+            "references": references,
+            "requiredOmissions": required_omissions,
+            "optionalOmissionCount": int(analysis.get("omitted_check_count") or 0),
+        },
+        "coverageGaps": coverage_gaps,
+    }
+
+
+def candidate_analysis_transaction(function):
+    signature = inspect.signature(function)
+
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        arguments = signature.bind(*args, **kwargs).arguments
+        source_repo = repo_root(Path(arguments["repo"]))
+        head_sha = run_git(source_repo, ["rev-parse", str(arguments["head_ref"])])
+        analysis_repo, _key = analysis_checkout_path(
+            source_repo, head_sha, Path(arguments["cache_dir"]), arguments["mode"])
+        with gitnexus_analysis.analysis_transaction(
+            gitnexus_analysis.analysis_transaction_path(analysis_repo)
+        ):
+            return function(*args, **kwargs)
+
+    return wrapped
+
+
+@candidate_analysis_transaction
 def make_packet(
     repo: Path,
     *,
@@ -2256,6 +2368,15 @@ def make_packet(
     source_repo = repo_root(repo)
     source_status_before = porcelain_status(source_repo)
     target_state = resolve_target_state(repo, mode, base_ref, head_ref, cache_dir)
+    candidate_repo = (
+        target_state.source_repo
+        if mode in {"local", "intent"}
+        else target_state.analysis_repo
+    )
+    expected_candidate_tree = candidate_tree(candidate_repo)
+    analysis_candidate_tree = candidate_tree(target_state.analysis_repo)
+    if analysis_candidate_tree != expected_candidate_tree:
+        raise RuntimeError("analysis checkout does not match the source candidate tree")
     if target_state.cache_key is None:
         raise RuntimeError("packet analysis checkout must be cache-owned")
     require_cache_path(target_state.analysis_repo, cache_dir)
@@ -2293,6 +2414,18 @@ def make_packet(
 
     source_git_state = read_git_state(target_state.source_repo, base_ref, head_ref)
     reference_only = reference_only_prefixes(target_state.source_repo)
+    intent_resolution = (
+        native_index.resolve_intent(intent or "")
+        if mode == "intent" else workflow_index.IntentResolution((), (), (), ())
+    )
+    excluded_required = tuple(match for match in intent_resolution.required_symbols if is_reference_only_path(match.path, reference_only))
+    if excluded_required:
+        intent_resolution = workflow_index.IntentResolution(
+            intent_resolution.file_evidence,
+            tuple(match for match in intent_resolution.required_symbols if match not in excluded_required),
+            intent_resolution.symbol_relevance,
+            (*intent_resolution.coverage_gaps, *(workflow_index.IntentCoverageGap("excluded_reference", match.symbol.name, (match.path,)) for match in excluded_required)),
+        )
     targets = target_files_for_mode(
         mode,
         source_git_state,
@@ -2300,7 +2433,13 @@ def make_packet(
         intent,
         top,
         reference_only,
+        intent_resolution,
     )
+    if mode == "intent":
+        targets = unique_ordered([
+            *(match.path for match in intent_resolution.required_symbols),
+            *targets,
+        ])
     target_entries = make_target_entries(
         mode=mode,
         source_repo=target_state.source_repo,
@@ -2311,20 +2450,40 @@ def make_packet(
         soul_map=soul_map,
         targets=targets,
         intent=intent,
+        intent_resolution=intent_resolution,
     )
     target_entries = apply_task_state_to_entries(target_entries, task_state)
     coverage_plan = build_coverage_plan(target_entries)
     gitnexus_status = gitnexus_analysis.ensure_index(
-        target_state.analysis_repo, target_state.head_sha, gitnexus_repo, gitnexus_mode,
+        target_state.analysis_repo,
+        target_state.head_sha,
+        gitnexus_repo,
+        gitnexus_mode,
         run_command=run_cmd,
+        expected_candidate_tree=expected_candidate_tree,
     )
     index_freshness_status = str(gitnexus_status.get("status") or "unknown")
     gitnexus_repo_name = str(gitnexus_status.get("repo") or gitnexus_repo or target_state.analysis_repo.name)
+    graph_targets = [
+        entry for entry in target_entries
+        if not any(part.startswith(".") for part in Path(str(entry["path"])).parts)
+        and (
+            (target_state.analysis_repo / str(entry["path"])).exists()
+            or (target_state.analysis_repo / str(entry["path"])).is_symlink()
+        )
+    ]
+    unavailable_targets = [entry for entry in target_entries if entry not in graph_targets]
     plan, omitted_check_count, omitted_required_checks = build_gitnexus_plan(
-        target_entries,
-        gitnexus_repo_name,
-        intent_mode=mode == "intent",
-    )
+        graph_targets, gitnexus_repo_name, intent_mode=mode == "intent")
+    unavailable_plan, unavailable_omitted, unavailable_required = build_gitnexus_plan(
+        unavailable_targets, gitnexus_repo_name, intent_mode=mode == "intent")
+    omitted_check_count += unavailable_omitted
+    for item in unavailable_plan:
+        if item.get("required") is True:
+            omitted_required_checks.append(item)
+        else:
+            omitted_check_count += 1
+    omitted_required_checks.extend(unavailable_required)
     gitnexus_status = gitnexus_analysis.execute(
         plan,
         gitnexus_status,
@@ -2332,8 +2491,29 @@ def make_packet(
         omitted_check_count=omitted_check_count,
         omitted_required_checks=omitted_required_checks,
     )
+    coverage_gaps = [
+        {
+            "kind": gap.kind,
+            "reference": gap.reference,
+            "candidates": list(gap.candidates),
+        }
+        for gap in intent_resolution.coverage_gaps
+    ]
     analysis = gitnexus_status.get("analysis")
     if isinstance(analysis, dict):
+        if coverage_gaps:
+            unresolved = analysis.get("unresolved_checks")
+            if isinstance(unresolved, list):
+                unresolved.extend(
+                    {**gap, "status": "coverage_gap"}
+                    for gap in coverage_gaps
+                )
+            analysis["status"] = "blocked"
+            gitnexus_status.update(
+                status="blocked",
+                required_checks_resolved=False,
+                warning="intent coverage gaps block semantic analysis",
+            )
         analysis["authority"] = {
             "source_repository": str(target_state.source_repo),
             "analysis_repository": str(target_state.analysis_repo),
@@ -2343,6 +2523,38 @@ def make_packet(
             "freshness_status": index_freshness_status,
         }
         analysis["producer_revision"] = producer_revision()
+        if gitnexus_mode != "off" and gitnexus_analysis.result_is_resolved(analysis):
+            if mode in {"local", "intent"}:
+                source_gitignore = target_state.source_repo / ".gitignore"
+                analysis_gitignore = target_state.analysis_repo / ".gitignore"
+                remove_path(analysis_gitignore)
+                if os.path.lexists(source_gitignore):
+                    shutil.copy2(source_gitignore, analysis_gitignore, follow_symlinks=False)
+            else:
+                cleanup_soulforge_gitignore_change(target_state.analysis_repo)
+            if candidate_tree(target_state.analysis_repo) == expected_candidate_tree:
+                gitnexus_status = gitnexus_analysis.publish_receipt(
+                    gitnexus_status,
+                    target_state.analysis_repo,
+                    target_state.head_sha,
+                    expected_candidate_tree,
+                    run_command=run_cmd,
+                )
+            if not gitnexus_status.get("index_fresh"):
+                analysis["status"] = "blocked"
+                unresolved = analysis.get("unresolved_checks")
+                if isinstance(unresolved, list):
+                    unresolved.append({
+                        "kind": "candidate_receipt",
+                        "file": str(target_state.analysis_repo),
+                        "target": expected_candidate_tree,
+                        "status": "unresolved",
+                        "diagnostic": str(
+                            gitnexus_status.get("warning")
+                            or "candidate changed before receipt publication"
+                        ),
+                    })
+                gitnexus_status["required_checks_resolved"] = False
     source_status = source_status_proof(
         source_status_before,
         porcelain_status(target_state.source_repo),
@@ -2367,6 +2579,10 @@ def make_packet(
     if not source_status["unchanged"]:
         warnings.append("source checkout status changed during context generation")
 
+    packet_target_entries = [
+        {key: value for key, value in entry.items() if key != "_planner_symbols"}
+        for entry in target_entries
+    ]
     packet = {
         "schema_version": 1,
         "repo": str(target_state.source_repo),
@@ -2382,6 +2598,7 @@ def make_packet(
             "base_ref": base_ref,
             "head_ref": head_ref,
             "head_sha": target_state.head_sha,
+            "candidate_tree": expected_candidate_tree,
             "source_dirty": target_state.source_dirty,
             "target_dirty": target_state.target_dirty,
             "cache_key": target_state.cache_key,
@@ -2419,10 +2636,12 @@ def make_packet(
         "semantic_summaries": semantic_summary_section(target_entries),
         "architecture_summary": workflow_index.summarize_architecture(target_entries),
         "coverage_plan": coverage_plan,
-        "targets": target_entries,
+        "coverage_gaps": coverage_gaps,
+        "targets": packet_target_entries,
         "gitnexus": build_gitnexus_section(plan, target_state, gitnexus_repo_name, gitnexus_status),
         "gitnexus_plan": plan,
     }
+    packet["advisorProjection"] = build_advisor_projection(packet)
     if gitnexus_mode != "off" and not gitnexus_analysis.result_is_resolved(analysis):
         packet["blocked"] = True
         packet["blocker"] = {

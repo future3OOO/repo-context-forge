@@ -18,10 +18,30 @@ SCHEMA_VERSION = 8
 SOURCE_EXTENSIONS = {".js", ".jsx", ".mjs", ".py", ".ts", ".tsx"}
 STRUCTURED_EXTENSIONS = {".json", ".toml", ".yaml", ".yml"}
 FILE_COLUMNS = "path, base_score, symbol_count, line_count, base_rank"
+INTENT_OPERATOR_VERBS = frozenset(
+    {"add", "create", "introduce", "update", "modify", "change", "fix", "edit", "remove", "delete"}
+)
 SYMBOL_COLUMNS = "name, kind, line, end_line, signature, is_exported, summary, summary_source"
 
 RoleForPath = Callable[[str], str]
 SummaryForSymbol = Callable[[str, str, str], str]
+
+
+def identifier_words(value: str) -> tuple[str, ...]:
+    return tuple(
+        word.lower()
+        for chunk in re.split(r"[^A-Za-z0-9]+", value)
+        for word in re.findall(
+            r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+", chunk)
+    )
+
+
+def synthetic_symbol_summary(path: str, name: str, kind: str) -> str:
+    words = " ".join(identifier_words(name)) or name
+    parent = Path(path).parent.name.replace("_", " ").replace("-", " ")
+    if parent and parent != ".":
+        return f"{kind} in {parent}: {words}"
+    return f"{kind}: {words}"
 
 
 @dataclass(frozen=True)
@@ -45,6 +65,45 @@ class IndexedSymbol:
     is_exported: bool
     summary: str
     summary_source: str = "workflow_index"
+
+
+@dataclass(frozen=True)
+class IntentSymbolMatch:
+    path: str
+    symbol: IndexedSymbol
+
+
+@dataclass(frozen=True)
+class IntentCoverageGap:
+    kind: str
+    reference: str
+    candidates: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class IntentSymbolRelevance:
+    path: str
+    line: int
+    name: str
+    score: int
+    matched_terms: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class IntentFileEvidence:
+    path: str
+    relevance_score: float
+    exact_file: bool
+    matched_terms: tuple[str, ...]
+    matched_symbols: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class IntentResolution:
+    file_evidence: tuple[IntentFileEvidence, ...]
+    required_symbols: tuple[IntentSymbolMatch, ...]
+    symbol_relevance: tuple[IntentSymbolRelevance, ...]
+    coverage_gaps: tuple[IntentCoverageGap, ...]
 
 
 class WorkflowIndex:
@@ -239,43 +298,274 @@ class WorkflowIndex:
             for name, kind, line, end_line, signature, is_exported, summary, summary_source in rows
         ]
 
+    def exact_symbols(
+        self, names: Iterable[str]
+    ) -> dict[str, list[tuple[str, IndexedSymbol]]]:
+        wanted = list(dict.fromkeys(name for name in names if name))
+        if not self.is_available or not wanted:
+            return {}
+        marks = ",".join("?" for _ in wanted)
+        rows = self._fetchall(
+            f"""SELECT file_path, {SYMBOL_COLUMNS} FROM symbols
+            WHERE name IN ({marks})
+            ORDER BY name ASC, file_path ASC, line ASC""",
+            wanted,
+        )
+        matches: dict[str, list[tuple[str, IndexedSymbol]]] = {}
+        for file_path, name, kind, line, end_line, signature, is_exported, summary, summary_source in rows:
+            symbol = IndexedSymbol(
+                name=str(name),
+                kind=str(kind),
+                line=int(line),
+                end_line=int(end_line),
+                signature=str(signature),
+                is_exported=bool(is_exported),
+                summary=str(summary),
+                summary_source=str(summary_source),
+            )
+            matches.setdefault(symbol.name, []).append((str(file_path), symbol))
+        return matches
+
+    def resolve_intent(self, intent: str) -> IntentResolution:
+        file_rows = self._fetchall("SELECT path, role, base_score, search_terms FROM files")
+        file_roles = {str(path): str(role) for path, role, _score, _terms in file_rows}
+        qualified_reference_matches = [
+            match
+            for match in re.finditer(
+                r"(?<![/A-Za-z0-9_])(?:[A-Za-z_][A-Za-z0-9_]*\.)+[A-Za-z_][A-Za-z0-9_]*\b",
+                intent,
+            )
+            if match.group(0).rsplit(".", 1)[-1].lower()
+            not in {"js", "json", "md", "py", "sh", "ts", "tsx", "yaml", "yml"}
+        ]
+        qualified_references = list(dict.fromkeys(
+            match.group(0) for match in qualified_reference_matches
+        ))
+        path_tokens = {path for path in re.findall(
+            r"(?<![/A-Za-z0-9_.-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]*", intent) if not path.endswith("/")}
+        explicit_paths = set(re.findall(r"`((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)`", intent)) | set(re.findall(r"(?i)\b(?:update|modify|change|fix|edit|remove|delete|add|create)\s+`((?:[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+|\.[A-Za-z0-9_-][A-Za-z0-9_.-]*))`(?=\s+behavior\b|\.?$)", intent))
+        creation_paths = set(re.findall(r"(?i)\b(?:add|create)\s+`?((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+)`?", intent))
+        root_paths = set(re.findall(r"(?i)\b(?:update|modify|change|fix|edit|remove|delete|add|create)\s+([A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+)\b(?=\s+behavior\b|\.?$)", intent))
+        intent_paths = path_tokens | explicit_paths | creation_paths | root_paths
+        exact_intent_paths = {
+            path if path in file_roles else path.rstrip(".")
+            for path in intent_paths
+        } & file_roles.keys()
+        path_prefix_references = {
+            reference
+            for reference in qualified_references
+            if any(path.startswith(f"{reference}/") for path in exact_intent_paths)
+            and all(
+                match.end() < len(intent) and intent[match.end()] == "/"
+                for match in qualified_reference_matches
+                if match.group(0) == reference
+            )
+        }
+        path_bound_references = path_prefix_references | (
+            set(qualified_references) & exact_intent_paths
+        )
+        path_tokens |= explicit_paths | creation_paths | (
+            root_paths - (set(qualified_references) - path_bound_references)
+        )
+        code_identifiers = re.findall(
+            r"`([A-Za-z_][A-Za-z0-9_]*)`",
+            intent,
+        )
+        bare_identifiers = list(dict.fromkeys(
+            match.group(0)
+            for match in re.finditer(
+                r"\b[A-Za-z_][A-Za-z0-9_]*\b",
+                re.sub(r"`[^`]*`", lambda match: " " * len(match.group(0)), intent),
+            )
+            if ("_" in match.group(0) or any(character.isupper()
+                                               for character in match.group(0)[1:])) and not (
+                (match.start() > 0 and intent[match.start() - 1] in "./`")
+                or (match.end() < len(intent) and (
+                    intent[match.end()] in "/`" or (
+                        intent[match.end()] == "." and match.end() + 1 < len(intent)
+                        and re.match(r"[A-Za-z_]", intent[match.end() + 1]))
+                ))
+            )
+        ))
+        identifiers = list(dict.fromkeys([*code_identifiers, *bare_identifiers]))
+        required: list[IntentSymbolMatch] = []
+        gaps: list[IntentCoverageGap] = []
+        qualified_matches = self.exact_symbols(
+            reference.rsplit(".", 1)[-1] for reference in qualified_references
+        )
+        created_references = set(re.findall(
+            r"\b(?:add|create|introduce)\s+(?:(?:a|an|new|class|function|method)\s+)*`?([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)",
+            intent,
+            re.IGNORECASE,
+        ))
+        created_identifiers = {
+            reference.rsplit(".", 1)[-1] for reference in created_references}
+        for reference in qualified_references:
+            if reference in path_prefix_references:
+                continue
+            qualifier, name = reference.rsplit(".", 1)
+            qualifier = qualifier.rsplit(".", 1)[-1]
+            candidates = qualified_matches.get(name, [])
+            class_matches = []
+            for path, symbol in candidates:
+                owner = min(
+                    (
+                        container
+                        for container in self.file_symbols(path, 1_000_000)
+                        if container.line < symbol.line
+                        and symbol.end_line <= container.end_line
+                    ),
+                    key=lambda container: container.end_line - container.line,
+                    default=None,
+                )
+                if owner is not None and owner.kind == "class" and owner.name == qualifier:
+                    class_matches.append((path, symbol))
+            qualifier_words = set(identifier_words(qualifier))
+            file_matches = [
+                (path, symbol)
+                for path, symbol in candidates
+                if qualifier_words <= set(identifier_words(path))
+            ]
+            selected = (
+                class_matches if len(class_matches) == 1
+                else file_matches if not class_matches and len(file_matches) == 1
+                else candidates if not class_matches and len(candidates) == 1
+                else []
+            )
+            required.extend(
+                IntentSymbolMatch(path=path, symbol=symbol)
+                for path, symbol in selected
+            )
+            if (
+                not selected
+                and reference not in created_references
+                and (candidates or reference not in path_bound_references)
+            ):
+                gaps.append(IntentCoverageGap(
+                    kind="ambiguous_symbol" if candidates else "absent_symbol",
+                    reference=reference,
+                    candidates=tuple(path for path, _symbol in candidates),
+                ))
+        unqualified_matches = self.exact_symbols(identifiers)
+        for reference in identifiers:
+            matches = unqualified_matches.get(reference, [])
+            if len(matches) == 1:
+                required.append(IntentSymbolMatch(path=matches[0][0], symbol=matches[0][1]))
+            elif matches or (
+                reference not in created_identifiers
+                and (
+                    reference in code_identifiers
+                    or (
+                        reference in bare_identifiers
+                        and not reference.isupper()
+                        and re.search(
+                            rf"(?:\b(?:update|modify|change|fix|edit|remove|delete)\s+{re.escape(reference)}\b[.!?]?\s*$|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
+                            intent,
+                            re.IGNORECASE,
+                        )
+                    )
+                )
+            ):
+                gaps.append(IntentCoverageGap(
+                    kind="ambiguous_symbol" if matches else "absent_symbol",
+                    reference=reference,
+                    candidates=tuple(path for path, _symbol in matches),
+                ))
+
+        tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]+", intent)
+        if tokens and tokens[0].lower() in INTENT_OPERATOR_VERBS:
+            tokens = tokens[1:]
+        terms = list(dict.fromkeys(
+            token.lower() for token in tokens if len(token) > 2
+        ))
+        relevance: list[IntentSymbolRelevance] = []
+        for path, name, line, summary, kind in self._fetchall(
+            "SELECT file_path, name, line, summary, kind FROM symbols"
+        ):
+            summary_text = f"{summary}"
+            if summary_text == synthetic_symbol_summary(str(path), str(name), str(kind)):
+                summary_text = " ".join(identifier_words(str(name))) or str(name)
+            haystack = f"{name}".lower() + " " + summary_text.lower()
+            matched = tuple(
+                term for term in terms
+                if re.search(rf"\b{re.escape(term)}\b", haystack)
+            )
+            if matched:
+                relevance.append(IntentSymbolRelevance(
+                    path=str(path),
+                    line=int(line),
+                    name=str(name),
+                    score=len(matched),
+                    matched_terms=matched,
+                ))
+        required_by_path: dict[str, list[str]] = {}
+        for match in required:
+            required_by_path.setdefault(match.path, []).append(match.symbol.name)
+        relevant_by_path: dict[str, list[IntentSymbolRelevance]] = {}
+        for item in relevance:
+            relevant_by_path.setdefault(item.path, []).append(item)
+        file_evidence: list[IntentFileEvidence] = []
+        forms = self._intent_forms(terms)
+        known_dirs = {str(parent) for path in file_roles for parent in Path(path).parents if str(parent) != "."}
+        path_tokens = {path if path in file_roles else path.rstrip(".") for path in path_tokens}
+        exact_files = {path for path in path_tokens if path in file_roles or (
+            path not in creation_paths and (path in explicit_paths or "." in Path(path).name or str(Path(path).parent) in known_dirs))}
+        gaps.extend(
+            IntentCoverageGap(kind="absent_file", reference=path, candidates=())
+            for path in sorted(exact_files - file_roles.keys())
+        )
+        for path, role, base_score, search_terms in file_rows:
+            path = str(path)
+            matched_terms = []
+            score = float(base_score)
+            for token, singular in forms:
+                if re.search(rf"\b{re.escape(token)}\b", str(search_terms)):
+                    matched_terms.append(token)
+                    score += 45
+                elif singular and re.search(rf"\b{re.escape(singular)}\b", str(search_terms)):
+                    matched_terms.append(token)
+                    score += 35
+            exact_file = path in exact_files
+            matched_symbols = list(dict.fromkeys([
+                *(item.name for item in relevant_by_path.get(path, [])),
+                *required_by_path.get(path, []),
+            ]))
+            if exact_file:
+                matched_terms.insert(0, path)
+                score += 10_000
+            if required_by_path.get(path):
+                score += 5_000
+            if matched_terms or matched_symbols:
+                file_evidence.append(IntentFileEvidence(
+                    path=path,
+                    relevance_score=score,
+                    exact_file=exact_file,
+                    matched_terms=tuple(dict.fromkeys(matched_terms)),
+                    matched_symbols=tuple(matched_symbols),
+                ))
+        if not file_evidence and not required and not gaps:
+            gaps.append(IntentCoverageGap(
+                kind="no_relevant_seam", reference=intent.strip(), candidates=()))
+        return IntentResolution(
+            file_evidence=tuple(sorted(
+                file_evidence,
+                key=lambda item: (
+                    file_roles[item.path] != "production", -item.relevance_score, item.path),
+            )),
+            required_symbols=tuple(required),
+            symbol_relevance=tuple(sorted(
+                relevance,
+                key=lambda item: (item.path, -item.score, item.line, item.name),
+            )),
+            coverage_gaps=tuple(gaps),
+        )
+
     def rank_intent(self, tokens: list[str], limit: int) -> list[str]:
         if not self.is_available or not tokens or limit <= 0:
             return []
-        forms = self._intent_forms([token.lower() for token in tokens])
-        candidates: list[str] = []
-        for token, singular in forms:
-            candidates.extend((token, singular) if singular else (token,))
-        candidates = list(dict.fromkeys(candidates))
-        predicates = " OR ".join("instr(search_terms, ?) > 0" for _ in candidates)
-        rows = self._fetchall(
-            f"""
-            SELECT path, role, base_score, search_terms
-            FROM files
-            WHERE {predicates}
-            """,
-            candidates,
-        )
-        scored: list[tuple[float, str, str]] = []
-        for path, role, base_score, search_terms in rows:
-            score = float(base_score)
-            matched = False
-            haystack = str(search_terms)
-            for token, singular in forms:
-                if re.search(rf"\b{re.escape(token)}\b", haystack):
-                    score += 45
-                    matched = True
-                elif singular and re.search(rf"\b{re.escape(singular)}\b", haystack):
-                    score += 35
-                    matched = True
-            if matched:
-                scored.append((score, str(role), str(path)))
         return [
-            path
-            for _score, _role, path in sorted(
-                scored,
-                key=lambda item: (item[1] != "production", -item[0], item[2]),
-            )[:limit]
+            item.path
+            for item in self.resolve_intent(" ".join(tokens)).file_evidence[:limit]
         ]
 
     def related_paths(self, paths: Iterable[str], limit: int) -> list[str]:
