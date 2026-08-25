@@ -584,6 +584,42 @@ class RepoContextForgeTests(unittest.TestCase):
             "PROJECTION_PROVENANCE_WAS_NONCANONICAL",
         )
 
+    def test_public_bootstrap_provenance_preserves_remote_port(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            repo_context_forge.run_git(
+                repo, ["remote", "add", "origin", "ssh://git@example.com:8443/org/repo.git"])
+            first_result, first_packet = self.run_off_mode_bootstrap(
+                repo, cache_dir, runtime_home)
+            repo_context_forge.run_git(
+                repo, ["remote", "set-url", "origin", "ssh://git@example.com:9443/org/repo.git"])
+            second_result, second_packet = self.run_off_mode_bootstrap(
+                repo, cache_dir, runtime_home)
+            repo_context_forge.run_git(
+                repo, ["remote", "set-url", "origin",
+                       "https://user@example.com:8443/org/repo.git"])
+            third_result, third_packet = self.run_off_mode_bootstrap(
+                repo, cache_dir, runtime_home)
+        first_tree = first_packet["target_state"].get("candidate_tree")
+        self.assertEqual(
+            (
+                first_result.returncode, second_result.returncode, third_result.returncode,
+                first_packet["advisorProjection"].get("sourceRepo"),
+                second_packet["advisorProjection"].get("sourceRepo"),
+                third_packet["advisorProjection"].get("sourceRepo"),
+                bool(first_tree),
+                second_packet["target_state"].get("candidate_tree") == first_tree,
+            ),
+            (
+                0, 0, 0,
+                "example.com:8443/org/repo",
+                "example.com:9443/org/repo",
+                "example.com:8443/org/repo",
+                True,
+                True,
+            ),
+            "PORT_DISTINGUISHED_REMOTES_COLLAPSED_TO_ONE_PROVENANCE",
+        )
+
     def test_public_bootstrap_emits_bounded_advisor_projection_v1(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             (repo / "src" / "projection.py").write_text(

@@ -2244,14 +2244,17 @@ def canonical_repo_identity(repo: Path) -> str | None:
         return None
     remote = "origin" if "origin" in remotes else remotes[0]
     url = run_git(repo, ["remote", "get-url", remote], allow_fail=True)
-    scp_match = re.fullmatch(r"[^@]+@([^:]+):(.+)", url)
-    if scp_match:
-        host, path = scp_match.groups()
+    parsed = urlsplit(url)
+    if parsed.hostname:
+        host = parsed.hostname
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        path = parsed.path
     else:
-        parsed = urlsplit(url)
-        if not parsed.hostname:
+        scp_match = re.fullmatch(r"[^@]+@([^:]+):(.+)", url)
+        if not scp_match:
             return None
-        host, path = parsed.hostname, parsed.path
+        host, path = scp_match.groups()
     normalized_path = path.strip("/")
     if normalized_path.endswith(".git"):
         normalized_path = normalized_path[:-4]
