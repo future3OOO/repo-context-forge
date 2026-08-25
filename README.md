@@ -11,16 +11,26 @@ becoming a startup dependency.
 
 ## Codex Plugin
 
-Install the plugin once:
+Install the plugin once, or rerun it to activate a different commit:
 
 ```bash
-python3 scripts/install_local_plugin.py
+python3 scripts/install_local_plugin.py [--commit <ref>]
 ```
 
-That registers this repo as the `repo-context-forge` Codex plugin in the local
-plugin marketplace and marks it installed by default. After that, Codex can use
-the plugin skill at the start of code work in any git repository. Users should
-not need to run context commands per task.
+That clones a commit-addressed runtime snapshot into
+`~/.local/share/repo-context-forge/<sha>/`, verifies the snapshot is clean and
+at the requested commit, atomically repoints the single
+`~/.local/share/repo-context-forge/current` symlink at it, links
+`~/plugins/repo-context-forge` through `current`, and registers the
+`repo-context-forge` Codex plugin in the local plugin marketplace as installed
+by default. Consumers resolve through `current` only, so activating a new
+commit — including a PR head for live validation — swaps one symlink and never
+edits consumer configuration; after the PR merges, rerun against merged `main`.
+Snapshots are commit-pinned and treated as immutable: a snapshot with local
+modifications refuses to activate. Installer runs are serialized by an
+exclusive lock, and pointer/marketplace updates are atomic. After installation, Codex can use the plugin skill at the start of
+code work in any git repository. Users should not need to run context commands
+per task.
 
 The plugin startup path is:
 
