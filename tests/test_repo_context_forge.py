@@ -446,10 +446,32 @@ class RepoContextForgeTests(unittest.TestCase):
             result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent="Update workflow_documents.py so each item retains evidence under CLAUDE.md for RED PR JSON output, premise/occurrence checks, and https://example.com/missing.py", top=1)
         references = {gap.get("reference") for gap in packet.get("coverage_gaps", [])}
         self.assertTrue(result.returncode == 0 and references.isdisjoint({"workflow_documents.py", "CLAUDE.md", "item", "evidence", "RED", "PR", "JSON", "example.com/missing.py"}), "ROOT_PROSE_REPORTED_ABSENT_FILE")
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "delete.py").write_text("def delete():\n    return 1\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "delete subject"])
+            for subject_intent in ("Harden the delete flow", "Add support for delete behavior"):
+                result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent=subject_intent, top=1)
+                self.assertEqual(
+                    (result.returncode, {gap.get("kind") for gap in packet.get("coverage_gaps", [])} & {"no_relevant_seam"}, "src/delete.py" in {item["path"] for item in packet["targets"]}),
+                    (0, set(), True),
+                    "OPERATOR_SUBJECT_INTENT_FALSELY_BLOCKED",
+                )
 
     def test_public_bootstrap_blocks_intent_without_relevant_seam(self) -> None:
         intent = "Update Frobnicator behavior"
         self.assert_public_intent_gap(intent, {"kind": "no_relevant_seam", "reference": intent, "candidates": []}, "BM_R2_NO_RELEVANT_SEAM_CONTRACT_FAILED")
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "widget.py").write_text("def add_widget():\n    return 1\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "widget.py"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "widget"])
+            for creation_intent in ("Add a new FutureAnchor", "Create a new validation function"):
+                result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent=creation_intent, top=1)
+                self.assertEqual(
+                    (result.returncode == 0, packet["coverage_gaps"], "widget.py" in {item["path"] for item in packet["targets"]}),
+                    (False, [{"kind": "no_relevant_seam", "reference": creation_intent, "candidates": []}], False),
+                    "PROSE_TERM_RELEVANCE_RESOLVED_FALSE_SEAM",
+                )
 
     def test_public_bootstrap_blocks_absent_root_file(self) -> None:
         for path in ("workflow_documents.py", "CLAUDE.md"):
@@ -2688,6 +2710,44 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertEqual(
                 native_index.rank_intent(["tenant", "ledger"], 5)[0],
                 "src/processor.py",
+            )
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "archive.py").write_text(
+                "def cleanup_rows():\n    return None\n",
+                encoding="utf-8",
+            )
+            native_index = repo_context_forge.workflow_index.WorkflowIndex(
+                repo, repo_context_forge.file_role
+            )
+            native_index.build(
+                repo_context_forge.source_worktree_files(repo),
+                head_sha=repo_context_forge.run_git(repo, ["rev-parse", "HEAD"]),
+                summary_for_symbol=lambda path, name, kind: "validation: account cleanup",
+            )
+            resolution = native_index.resolve_intent("Harden validation behavior")
+            self.assertEqual(
+                (
+                    {gap.kind for gap in resolution.coverage_gaps} & {"no_relevant_seam"},
+                    "src/archive.py" in {item.path for item in resolution.file_evidence},
+                ),
+                (set(), True),
+                "NONSYNTHETIC_SUMMARY_RELEVANCE_DROPPED",
+            )
+            native_index.build(
+                repo_context_forge.source_worktree_files(repo),
+                head_sha="own-kind-summaries",
+                summary_for_symbol=lambda path, name, kind: "function: account cleanup",
+            )
+            resolution = native_index.resolve_intent("Harden function behavior")
+            self.assertEqual(
+                (
+                    {gap.kind for gap in resolution.coverage_gaps} & {"no_relevant_seam"},
+                    "src/archive.py" in {item.path for item in resolution.file_evidence},
+                ),
+                (set(), True),
+                "OWN_KIND_SUMMARY_RELEVANCE_DROPPED",
             )
 
     def test_workflow_index_intent_uses_whole_terms_and_safe_plurals(self) -> None:

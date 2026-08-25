@@ -499,12 +499,7 @@ def intent_path_references(intent: str) -> list[str]:
     )
 
 
-def synthetic_symbol_summary(path: str, name: str, kind: str) -> str:
-    words = " ".join(workflow_index.identifier_words(name)) or name
-    parent = Path(path).parent.name.replace("_", " ").replace("-", " ")
-    if parent and parent != ".":
-        return f"{kind} in {parent}: {words}"
-    return f"{kind}: {words}"
+synthetic_symbol_summary = workflow_index.synthetic_symbol_summary
 
 
 def compute_token_budget(conversation_tokens: int | None, explicit_budget: int | None) -> int:

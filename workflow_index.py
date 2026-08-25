@@ -18,6 +18,9 @@ SCHEMA_VERSION = 8
 SOURCE_EXTENSIONS = {".js", ".jsx", ".mjs", ".py", ".ts", ".tsx"}
 STRUCTURED_EXTENSIONS = {".json", ".toml", ".yaml", ".yml"}
 FILE_COLUMNS = "path, base_score, symbol_count, line_count, base_rank"
+INTENT_OPERATOR_VERBS = frozenset(
+    {"add", "create", "introduce", "update", "modify", "change", "fix", "edit", "remove", "delete"}
+)
 SYMBOL_COLUMNS = "name, kind, line, end_line, signature, is_exported, summary, summary_source"
 
 RoleForPath = Callable[[str], str]
@@ -31,6 +34,14 @@ def identifier_words(value: str) -> tuple[str, ...]:
         for word in re.findall(
             r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+", chunk)
     )
+
+
+def synthetic_symbol_summary(path: str, name: str, kind: str) -> str:
+    words = " ".join(identifier_words(name)) or name
+    parent = Path(path).parent.name.replace("_", " ").replace("-", " ")
+    if parent and parent != ".":
+        return f"{kind} in {parent}: {words}"
+    return f"{kind}: {words}"
 
 
 @dataclass(frozen=True)
@@ -461,16 +472,20 @@ class WorkflowIndex:
                     candidates=tuple(path for path, _symbol in matches),
                 ))
 
+        tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]+", intent)
+        if tokens and tokens[0].lower() in INTENT_OPERATOR_VERBS:
+            tokens = tokens[1:]
         terms = list(dict.fromkeys(
-            token.lower()
-            for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]+", intent)
-            if len(token) > 2
+            token.lower() for token in tokens if len(token) > 2
         ))
         relevance: list[IntentSymbolRelevance] = []
-        for path, name, line, summary in self._fetchall(
-            "SELECT file_path, name, line, summary FROM symbols"
+        for path, name, line, summary, kind in self._fetchall(
+            "SELECT file_path, name, line, summary, kind FROM symbols"
         ):
-            haystack = f"{name} {summary}".lower()
+            summary_text = f"{summary}"
+            if summary_text == synthetic_symbol_summary(str(path), str(name), str(kind)):
+                summary_text = " ".join(identifier_words(str(name))) or str(name)
+            haystack = f"{name}".lower() + " " + summary_text.lower()
             matched = tuple(
                 term for term in terms
                 if re.search(rf"\b{re.escape(term)}\b", haystack)
