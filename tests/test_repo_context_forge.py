@@ -599,21 +599,37 @@ class RepoContextForgeTests(unittest.TestCase):
                        "https://user@example.com:8443/org/repo.git"])
             third_result, third_packet = self.run_off_mode_bootstrap(
                 repo, cache_dir, runtime_home)
+            repo_context_forge.run_git(
+                repo, ["remote", "set-url", "origin",
+                       "ssh://git@[2001:db8::1]:8443/org/repo.git"])
+            ipv6_result, ipv6_packet = self.run_off_mode_bootstrap(
+                repo, cache_dir, runtime_home)
+            repo_context_forge.run_git(
+                repo, ["remote", "set-url", "origin",
+                       "https://example.com:notaport/org/repo.git"])
+            bad_port_result, bad_port_packet = self.run_off_mode_bootstrap(
+                repo, cache_dir, runtime_home)
         first_tree = first_packet["target_state"].get("candidate_tree")
         self.assertEqual(
             (
                 first_result.returncode, second_result.returncode, third_result.returncode,
+                ipv6_result.returncode, bad_port_result.returncode,
                 first_packet["advisorProjection"].get("sourceRepo"),
                 second_packet["advisorProjection"].get("sourceRepo"),
                 third_packet["advisorProjection"].get("sourceRepo"),
+                ipv6_packet["advisorProjection"].get("sourceRepo"),
+                bad_port_packet["advisorProjection"].get("sourceRepo"),
                 bool(first_tree),
                 second_packet["target_state"].get("candidate_tree") == first_tree,
             ),
             (
                 0, 0, 0,
+                0, 0,
                 "example.com:8443/org/repo",
                 "example.com:9443/org/repo",
                 "example.com:8443/org/repo",
+                "[2001:db8::1]:8443/org/repo",
+                {"gap": "source_repo_unavailable"},
                 True,
                 True,
             ),

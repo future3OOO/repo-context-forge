@@ -2247,8 +2247,14 @@ def canonical_repo_identity(repo: Path) -> str | None:
     parsed = urlsplit(url)
     if parsed.hostname:
         host = parsed.hostname
-        if parsed.port is not None:
-            host = f"{host}:{parsed.port}"
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        if port is not None:
+            if ":" in host:
+                host = f"[{host}]"
+            host = f"{host}:{port}"
         path = parsed.path
     else:
         scp_match = re.fullmatch(r"[^@]+@([^:]+):(.+)", url)
