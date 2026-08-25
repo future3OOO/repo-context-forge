@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
@@ -87,11 +88,25 @@ def ensure_snapshot(source_repo: Path, sha: str) -> Path:
     return snapshot
 
 
+def require_replaceable(link: Path) -> None:
+    if link.exists() and not link.is_symlink():
+        raise RuntimeError(f"refusing to replace non-symlink path: {link}")
+
+
+def write_marketplace(path: Path, marketplace: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staging = path.parent / f".{path.name}.tmp"
+    staging.write_text(
+        json.dumps(marketplace, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(staging, path)
+
+
 def point_symlink(link: Path, target: Path) -> None:
     if link.is_symlink() and os.readlink(link) == str(target):
         return
-    if link.exists() and not link.is_symlink():
-        raise RuntimeError(f"refusing to replace non-symlink path: {link}")
+    require_replaceable(link)
     link.parent.mkdir(parents=True, exist_ok=True)
     staging = link.parent / f".{link.name}.tmp"
     staging.unlink(missing_ok=True)
@@ -111,19 +126,19 @@ def main() -> int:
     args = parser.parse_args()
 
     source_repo = Path(__file__).resolve().parents[1]
-    sha = run_git(source_repo, ["rev-parse", f"{args.commit}^{{commit}}"])
-    snapshot = ensure_snapshot(source_repo, sha)
-    point_symlink(CURRENT_LINK, snapshot)
-    link_path = Path.home() / "plugins" / PLUGIN_NAME
-    point_symlink(link_path, CURRENT_LINK)
-
-    marketplace_path = Path.home() / ".agents" / "plugins" / "marketplace.json"
-    marketplace = update_marketplace(load_marketplace(marketplace_path))
-    marketplace_path.parent.mkdir(parents=True, exist_ok=True)
-    marketplace_path.write_text(
-        json.dumps(marketplace, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    SNAPSHOT_BASE.mkdir(parents=True, exist_ok=True)
+    with open(SNAPSHOT_BASE / ".install.lock", "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        sha = run_git(source_repo, ["rev-parse", f"{args.commit}^{{commit}}"])
+        snapshot = ensure_snapshot(source_repo, sha)
+        link_path = Path.home() / "plugins" / PLUGIN_NAME
+        require_replaceable(CURRENT_LINK)
+        require_replaceable(link_path)
+        marketplace_path = Path.home() / ".agents" / "plugins" / "marketplace.json"
+        marketplace = update_marketplace(load_marketplace(marketplace_path))
+        point_symlink(link_path, CURRENT_LINK)
+        write_marketplace(marketplace_path, marketplace)
+        point_symlink(CURRENT_LINK, snapshot)
     print(f"installed snapshot {sha}")
     print(f"current: {CURRENT_LINK} -> {snapshot}")
     print(f"plugin link: {link_path} -> {CURRENT_LINK}")

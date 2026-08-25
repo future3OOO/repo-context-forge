@@ -26,8 +26,9 @@ at the requested commit, atomically repoints the single
 by default. Consumers resolve through `current` only, so activating a new
 commit — including a PR head for live validation — swaps one symlink and never
 edits consumer configuration; after the PR merges, rerun against merged `main`.
-Snapshots are immutable: a snapshot with local modifications refuses to
-activate. After installation, Codex can use the plugin skill at the start of
+Snapshots are commit-pinned and treated as immutable: a snapshot with local
+modifications refuses to activate. Installer runs are serialized by an
+exclusive lock, and pointer/marketplace updates are atomic. After installation, Codex can use the plugin skill at the start of
 code work in any git repository. Users should not need to run context commands
 per task.
 

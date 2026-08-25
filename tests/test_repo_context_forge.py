@@ -4580,6 +4580,56 @@ class RepoContextForgeTests(unittest.TestCase):
                 "INSTALL_CURRENT_POINTER_CONTRACT_VIOLATED",
             )
 
+    def test_install_prevalidates_links_and_serializes_writers(self) -> None:
+        script = ROOT / "scripts" / "install_local_plugin.py"
+        sha = repo_context_forge.run_git(ROOT, ["rev-parse", "HEAD^{commit}"])
+        with tempfile.TemporaryDirectory() as home:
+            env = {**os.environ, "HOME": home}
+            base = Path(home) / ".local" / "share" / "repo-context-forge"
+            current = base / "current"
+            link = Path(home) / "plugins" / "repo-context-forge"
+            marketplace_path = Path(home) / ".agents" / "plugins" / "marketplace.json"
+            link.mkdir(parents=True)
+            rogue = repo_context_forge.subprocess.run(
+                [sys.executable, str(script)], capture_output=True, text=True, env=env)
+            rogue_left_no_activation = not current.is_symlink() and not marketplace_path.exists()
+            link.rmdir()
+            first = repo_context_forge.subprocess.Popen(
+                [sys.executable, str(script)],
+                stdout=repo_context_forge.subprocess.PIPE,
+                stderr=repo_context_forge.subprocess.PIPE, env=env)
+            second = repo_context_forge.subprocess.Popen(
+                [sys.executable, str(script)],
+                stdout=repo_context_forge.subprocess.PIPE,
+                stderr=repo_context_forge.subprocess.PIPE, env=env)
+            first.communicate(timeout=60)
+            second.communicate(timeout=60)
+            marketplace = repo_context_forge.json.loads(
+                marketplace_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                (
+                    rogue.returncode,
+                    "refusing to replace non-symlink path" in rogue.stderr,
+                    rogue_left_no_activation,
+                    first.returncode,
+                    second.returncode,
+                    os.readlink(current),
+                    os.readlink(link),
+                    [plugin["name"] for plugin in marketplace["plugins"]],
+                ),
+                (
+                    1,
+                    True,
+                    True,
+                    0,
+                    0,
+                    str(base / sha),
+                    str(current),
+                    ["repo-context-forge"],
+                ),
+                "INSTALL_PREVALIDATION_OR_SERIALIZATION_VIOLATED",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
