@@ -4538,6 +4538,48 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertEqual(entry["source"]["path"], "./plugins/repo-context-forge")
         self.assertEqual(entry["policy"]["installation"], "INSTALLED_BY_DEFAULT")
 
+    def test_install_activates_verified_snapshot_through_current_pointer(self) -> None:
+        script = ROOT / "scripts" / "install_local_plugin.py"
+        sha = repo_context_forge.run_git(ROOT, ["rev-parse", "HEAD^{commit}"])
+        with tempfile.TemporaryDirectory() as home:
+            env = {**os.environ, "HOME": home}
+            first = repo_context_forge.subprocess.run(
+                [sys.executable, str(script)], capture_output=True, text=True, env=env)
+            base = Path(home) / ".local" / "share" / "repo-context-forge"
+            snapshot = base / sha
+            current = base / "current"
+            link = Path(home) / "plugins" / "repo-context-forge"
+            marketplace_path = Path(home) / ".agents" / "plugins" / "marketplace.json"
+            marketplace = repo_context_forge.json.loads(
+                marketplace_path.read_text(encoding="utf-8"))
+            current_after_install = os.readlink(current)
+            (snapshot / "DIRTY_MARKER").write_text("dirty", encoding="utf-8")
+            second = repo_context_forge.subprocess.run(
+                [sys.executable, str(script)], capture_output=True, text=True, env=env)
+            self.assertEqual(
+                (
+                    first.returncode,
+                    repo_context_forge.run_git(snapshot, ["rev-parse", "HEAD"]),
+                    current_after_install,
+                    os.readlink(link),
+                    [plugin["name"] for plugin in marketplace["plugins"]],
+                    second.returncode,
+                    "refusing to activate" in second.stderr,
+                    os.readlink(current),
+                ),
+                (
+                    0,
+                    sha,
+                    str(snapshot),
+                    str(current),
+                    ["repo-context-forge"],
+                    1,
+                    True,
+                    str(snapshot),
+                ),
+                "INSTALL_CURRENT_POINTER_CONTRACT_VIOLATED",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
