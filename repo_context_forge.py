@@ -1988,6 +1988,33 @@ def _omissions_are_blocking(analysis: dict[str, object]) -> bool:
     )
 
 
+def coverage_gap_text(gaps: list[dict[str, object]]) -> str:
+    def single_line(value: object) -> str:
+        return " ".join(str(value or "").splitlines())
+    terms = []
+    for gap in gaps:
+        candidates = gap.get("candidates")
+        suffix = (
+            f" (candidates: {', '.join(single_line(path) for path in candidates)})"
+            if isinstance(candidates, list) and candidates else ""
+        )
+        terms.append(
+            f"{single_line(gap.get('kind')) or 'unknown_gap'} "
+            f"{single_line(gap.get('reference'))}{suffix}".strip())
+    return "; ".join(terms)
+
+
+def resolved_required_anchor(analysis: dict[str, object], plan: list[dict[str, object]]) -> bool:
+    def check_key(item: dict[str, object]) -> tuple[str, ...]:
+        return tuple(str(item.get(name) or "") for name in ("kind", "file", "target", "direction"))
+    required = {check_key(item) for item in plan if item.get("required") is True}
+    entries = analysis.get("entries")
+    return isinstance(entries, list) and any(
+        isinstance(entry, dict) and entry.get("status") == "resolved" and check_key(entry) in required
+        for entry in entries
+    )
+
+
 def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> list[str]:
     analysis = gitnexus.get("analysis")
     if not isinstance(analysis, dict):
@@ -2509,20 +2536,25 @@ def make_packet(
         for gap in intent_resolution.coverage_gaps
     ]
     analysis = gitnexus_status.get("analysis")
+    coverage_gap_warning = ""
     if isinstance(analysis, dict):
         if coverage_gaps:
-            unresolved = analysis.get("unresolved_checks")
-            if isinstance(unresolved, list):
-                unresolved.extend(
-                    {**gap, "status": "coverage_gap"}
-                    for gap in coverage_gaps
+            gap_text = coverage_gap_text(coverage_gaps)
+            if resolved_required_anchor(analysis, plan):
+                coverage_gap_warning = f"intent coverage gaps recorded: {gap_text}"
+            else:
+                unresolved = analysis.get("unresolved_checks")
+                if isinstance(unresolved, list):
+                    unresolved.extend(
+                        {**gap, "status": "coverage_gap"}
+                        for gap in coverage_gaps
+                    )
+                analysis["status"] = "blocked"
+                gitnexus_status.update(
+                    status="blocked",
+                    required_checks_resolved=False,
+                    warning=f"intent coverage gaps block semantic analysis: {gap_text}",
                 )
-            analysis["status"] = "blocked"
-            gitnexus_status.update(
-                status="blocked",
-                required_checks_resolved=False,
-                warning="intent coverage gaps block semantic analysis",
-            )
         analysis["authority"] = {
             "source_repository": str(target_state.source_repo),
             "analysis_repository": str(target_state.analysis_repo),
@@ -2577,6 +2609,8 @@ def make_packet(
     gitnexus_warning = gitnexus_status.get("warning")
     if gitnexus_warning:
         warnings.append(str(gitnexus_warning))
+    if coverage_gap_warning:
+        warnings.append(coverage_gap_warning)
     if mode == "pr" and target_state.source_dirty:
         warnings.append("source worktree is dirty; PR target map was built from clean cached checkout")
     if mode != "pr" and target_state.target_dirty:
@@ -2952,6 +2986,10 @@ def render_required_intake(packet: dict[str, object]) -> str:
             f"unresolved={len(unresolved_items)}; "
             f"elapsed_ms={analysis.get('elapsed_ms') or 0}"
         )
+    packet_gaps = packet.get("coverage_gaps")
+    if isinstance(packet_gaps, list) and packet_gaps:
+        lines.append("coverage_gaps: " + coverage_gap_text(
+            [gap for gap in packet_gaps if isinstance(gap, dict)]))
     lines.append(
         "gitnexus_tool_discovery: run tool_search for missing follow-up GitNexus capabilities before declaring context, impact, or detect_changes unavailable."
     )
