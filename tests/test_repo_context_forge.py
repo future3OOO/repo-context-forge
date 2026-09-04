@@ -76,6 +76,133 @@ class RepoContextForgeTests(unittest.TestCase):
         repo_context_forge.run_cmd(["git", "add", ".gitignore", "src/a.py"], cwd=root)
         repo_context_forge.run_cmd(["git", "commit", "-m", "initial"], cwd=root)
 
+    def head_tree(self, root: Path) -> str:
+        return repo_context_forge.run_cmd(["git", "rev-parse", "HEAD^{tree}"], cwd=root).stdout.strip()
+
+    def plain_worktree_tree(self, root: Path) -> str:
+        """HEAD plus every tracked and untracked change, with nothing stripped."""
+        with tempfile.TemporaryDirectory() as index_dir:
+            env = {**os.environ, "GIT_INDEX_FILE": str(Path(index_dir) / "index")}
+            repo_context_forge.run_cmd(["git", "read-tree", "HEAD"], cwd=root, env=env)
+            repo_context_forge.run_cmd(["git", "add", "-A", "--", "."], cwd=root, env=env)
+            return repo_context_forge.run_cmd(["git", "write-tree"], cwd=root, env=env).stdout.strip()
+
+    def commit_gitnexus_skill(self, root: Path, name: str) -> Path:
+        skill = root / ".claude" / "skills" / "gitnexus" / name / "SKILL.md"
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text(f"# {name}\n", encoding="utf-8")
+        repo_context_forge.run_cmd(["git", "add", str(skill.relative_to(root))], cwd=root)
+        repo_context_forge.run_cmd(["git", "commit", "-m", f"track {name}"], cwd=root)
+        return skill
+
+    def test_candidate_tree_keeps_paths_tracked_at_head(self) -> None:
+        # repo-context-forge#17: GitNexus commits .claude/skills/gitnexus/*/SKILL.md;
+        # the digest must not strip committed content.
+        marker = "TRACKED_TOOL_PATH_STRIPPED"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.make_git_repo(root)
+            self.commit_gitnexus_skill(root, "gitnexus-guide")
+            self.assertEqual(repo_context_forge.candidate_tree(root), self.head_tree(root), marker)
+
+    def test_candidate_tree_keeps_a_tracked_file_beside_an_untracked_sibling_artifact(self) -> None:
+        marker = "SIBLING_ARTIFACT_DIGESTED"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.make_git_repo(root)
+            self.commit_gitnexus_skill(root, "gitnexus-guide")
+            sibling = root / ".claude" / "skills" / "gitnexus" / "gitnexus-cli" / "SKILL.md"
+            sibling.parent.mkdir(parents=True)
+            sibling.write_text("# written by gitnexus analyze\n", encoding="utf-8")
+            self.assertEqual(repo_context_forge.candidate_tree(root), self.head_tree(root), marker)
+
+    def test_candidate_tree_reflects_tracked_changes_under_an_excluded_prefix(self) -> None:
+        marker = "TRACKED_CHANGE_LOST"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.make_git_repo(root)
+            guide = self.commit_gitnexus_skill(root, "gitnexus-guide")
+            cli = self.commit_gitnexus_skill(root, "gitnexus-cli")
+            head = self.head_tree(root)
+            guide.write_text("# guide, edited\n", encoding="utf-8")
+            cli.unlink()
+            expected = self.plain_worktree_tree(root)
+            self.assertNotEqual(expected, head, marker + " (fixture)")
+            self.assertEqual(repo_context_forge.candidate_tree(root), expected, marker)
+
+    def test_candidate_tree_keeps_ordinary_untracked_files(self) -> None:
+        marker = "UNTRACKED_CONTENT_DROPPED"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.make_git_repo(root)
+            (root / "src" / "new.py").write_text("print('new')\n", encoding="utf-8")
+            expected = self.plain_worktree_tree(root)
+            self.assertNotEqual(expected, self.head_tree(root), marker + " (fixture)")
+            self.assertEqual(repo_context_forge.candidate_tree(root), expected, marker)
+
+    def test_candidate_tree_leaves_the_callers_index_unchanged(self) -> None:
+        marker = "CALLER_INDEX_MUTATED"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.make_git_repo(root)
+            (root / "src" / "a.py").write_text("print('staged')\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "src/a.py"], cwd=root)
+            (root / "src" / "a.py").write_text("print('unstaged on top')\n", encoding="utf-8")
+            def index_state() -> tuple[str, str]:
+                return (
+                    repo_context_forge.run_cmd(["git", "diff", "--cached"], cwd=root).stdout,
+                    repo_context_forge.run_cmd(["git", "ls-files", "-s"], cwd=root).stdout,
+                )
+            before = index_state()
+            self.assertEqual(repo_context_forge.candidate_tree(root), self.plain_worktree_tree(root), marker)
+            self.assertEqual(index_state(), before, marker)
+
+    def test_candidate_tree_still_excludes_tracked_content_of_isolated_dirs(self) -> None:
+        # The analysis worktree never materializes tracked .gitnexus/ or .soulforge/
+        # content (symlink-attack isolation), so the digest matches that.
+        marker = "ISOLATED_DIR_TRACKED_CONTENT_DIGESTED"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.make_git_repo(root)
+            before = self.head_tree(root)
+            for relative in (".gitnexus/payload", ".soulforge/repomap.db"):
+                target = root / relative
+                target.parent.mkdir()
+                target.write_text("tracked\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "-f", ".gitnexus/payload", ".soulforge/repomap.db"], cwd=root)
+            repo_context_forge.run_cmd(["git", "commit", "-m", "track isolated dirs"], cwd=root)
+            self.assertNotEqual(self.head_tree(root), before, marker + " (fixture)")
+            self.assertEqual(repo_context_forge.candidate_tree(root), before, marker)
+
+    def test_candidate_tree_still_excludes_tracked_content_of_reserved_dirs(self) -> None:
+        # The producer writes into every reserved cache directory of the analysis
+        # worktree, so tracked content there is stripped like before.
+        marker = "RESERVED_DIR_TRACKED_CONTENT_DIGESTED"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.make_git_repo(root)
+            before = self.head_tree(root)
+            paths = [f"{directory}/tracked.txt" for directory in (".codex", ".repo-context-forge")]
+            for relative in paths:
+                (root / relative).parent.mkdir()
+                (root / relative).write_text("tracked\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "-f", *paths], cwd=root)
+            repo_context_forge.run_cmd(["git", "commit", "-m", "track reserved dirs"], cwd=root)
+            self.assertNotEqual(self.head_tree(root), before, marker + " (fixture)")
+            self.assertEqual(repo_context_forge.candidate_tree(root), before, marker)
+
+    def test_candidate_tree_still_excludes_untracked_producer_artifacts(self) -> None:
+        marker = "PRODUCER_ARTIFACT_ENTERED_DIGEST"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.make_git_repo(root)
+            head = self.head_tree(root)
+            (root / ".soulforge").mkdir()
+            (root / ".soulforge" / "repomap.db").write_bytes(b"x")
+            (root / "src" / "__pycache__").mkdir()
+            (root / "src" / "__pycache__" / "a.cpython-312.pyc").write_bytes(b"x")
+            self.assertEqual(repo_context_forge.candidate_tree(root), head, marker)
+
     def ensure_gitnexus_index(
         self,
         state: repo_context_forge.TargetState,

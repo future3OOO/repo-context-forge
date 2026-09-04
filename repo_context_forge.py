@@ -31,7 +31,11 @@ GitNexusMode = Literal["off", "check", "auto"]
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "repo-context-forge"
 TOOL_CACHE_DIRS = (".soulforge", ".codex", ".gitnexus", workflow_index.INDEX_DIR)
-TOOL_CACHE_PATHS = (*TOOL_CACHE_DIRS, ".claude/skills/gitnexus")
+# Skills gitnexus analyze writes into a target may also be committed by that
+# target (GitNexus ships its own); tracked content there is repository content,
+# unlike the reserved cache directories the producer writes into.
+SHIPPED_SKILLS_DIR = ".claude/skills/gitnexus"
+TOOL_CACHE_PATHS = (*TOOL_CACHE_DIRS, SHIPPED_SKILLS_DIR)
 TOOL_CACHE_PREFIXES = tuple(f"{name}/" for name in TOOL_CACHE_PATHS)
 MIN_TOKEN_BUDGET = 16_000
 MAX_TOKEN_BUDGET = 32_000
@@ -639,15 +643,19 @@ def candidate_tree(repo: Path) -> str:
         })
         run_cmd(["git", "read-tree", "HEAD"], cwd=repo, env=env)
         run_cmd(["git", "add", "-A", "--", "."], cwd=repo, env=env)
-        generated_paths = run_cmd(
-            ["git", "ls-files", "-z"], cwd=repo, env=env).stdout.split("\0")
-        run_cmd(
-            ["git", "rm", "-r", "--cached", "--ignore-unmatch", "--",
-             *TOOL_CACHE_PATHS, *(path for path in generated_paths
-                                  if path and is_generated_or_cache_path(path))],
-            cwd=repo,
-            env=env,
-        )
+        # Producer artifacts leave the digest. A shipped skill tracked at HEAD is
+        # repository content and stays; an untracked one beside it is output of
+        # gitnexus analyze and goes, as does everything under the reserved
+        # cache directories the producer writes into.
+        tracked_skills = set(run_cmd(
+            ["git", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", SHIPPED_SKILLS_DIR],
+            cwd=repo, env=env).stdout.split("\0"))
+        artifacts = [
+            path for path in run_cmd(["git", "ls-files", "-z"], cwd=repo, env=env).stdout.split("\0")
+            if path and is_generated_or_cache_path(path) and path not in tracked_skills
+        ]
+        if artifacts:
+            run_cmd(["git", "rm", "--cached", "--", *artifacts], cwd=repo, env=env)
         return run_cmd(["git", "write-tree"], cwd=repo, env=env).stdout.strip()
 
 
