@@ -88,12 +88,181 @@ class RepoContextForgeTests(unittest.TestCase):
             return repo_context_forge.run_cmd(["git", "write-tree"], cwd=root, env=env).stdout.strip()
 
     def commit_gitnexus_skill(self, root: Path, name: str) -> Path:
-        skill = root / ".claude" / "skills" / "gitnexus" / name / "SKILL.md"
-        skill.parent.mkdir(parents=True, exist_ok=True)
-        skill.write_text(f"# {name}\n", encoding="utf-8")
-        repo_context_forge.run_cmd(["git", "add", str(skill.relative_to(root))], cwd=root)
-        repo_context_forge.run_cmd(["git", "commit", "-m", f"track {name}"], cwd=root)
-        return skill
+        return self.commit_shipped_skill(root, f"{repo_context_forge.SHIPPED_SKILLS_DIR}/{name}/SKILL.md", f"# {name}\n")
+
+    SKILL = ".claude/skills/gitnexus/gitnexus-guide/SKILL.md"
+
+    def commit_shipped_skill(self, repo: Path, relative: str = SKILL, content: str = "# repository-owned skill\n") -> Path:
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        repo_context_forge.run_git(repo, ["add", "-f", relative])
+        repo_context_forge.run_git(repo, ["commit", "-m", f"track {relative}"])
+        return target
+
+    def tree_paths(self, repo: Path, tree: str) -> set[str]:
+        return set(repo_context_forge.split_lines(repo_context_forge.run_git(repo, ["ls-tree", "-r", "--name-only", tree])))
+
+    def assert_bootstrap_parity(self, marker: str, repo: Path, result, packet, *, mode: str) -> tuple[str, Path]:
+        """The bootstrap recorded, the projection binds the source digest, and the
+        receipt agrees."""
+        projection = packet.get("advisorProjection", {}) if isinstance(packet, dict) else {}
+        expected = repo_context_forge.candidate_tree(repo)
+        self.assertEqual(
+            (result.returncode, packet.get("mode"), projection.get("expectedCandidateTree"), projection.get("indexedCandidateTree")),
+            (0, mode, expected, expected),
+            marker + ": " + result.stderr[-600:],
+        )
+        analysis = Path(packet["target_state"]["analysis_repo"])
+        receipt = repo_context_forge.json.loads((analysis / ".gitnexus" / "repo-context-forge-receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt.get("candidateTree"), expected, marker + " (receipt)")
+        return expected, analysis
+
+    def test_public_local_bootstrap_carries_a_modified_tracked_shipped_skill(self) -> None:
+        marker = "MODIFIED_SKILL_LOCAL_DIVERGED"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            skill = self.commit_shipped_skill(repo)
+            skill.write_text("# edited in the worktree\n", encoding="utf-8")
+            result, packet = self.run_public_bootstrap(repo, cache_dir, runtime_home, mode="local")
+            expected, analysis = self.assert_bootstrap_parity(marker, repo, result, packet, mode="local")
+            self.assertNotEqual(expected, self.head_tree(repo), marker + " (fixture)")
+            self.assertEqual((analysis / self.SKILL).read_text(encoding="utf-8"), "# edited in the worktree\n", marker)
+
+    def test_public_local_bootstrap_carries_a_deleted_tracked_shipped_skill(self) -> None:
+        marker = "DELETED_SKILL_LOCAL_DIVERGED"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            self.commit_shipped_skill(repo).unlink()
+            result, packet = self.run_public_bootstrap(repo, cache_dir, runtime_home, mode="local")
+            expected, analysis = self.assert_bootstrap_parity(marker, repo, result, packet, mode="local")
+            self.assertNotIn(self.SKILL, self.tree_paths(repo, expected), marker)
+            self.assertFalse((analysis / self.SKILL).exists(), marker + " (analysis worktree)")
+
+    def test_public_intent_bootstrap_carries_a_modified_tracked_shipped_skill(self) -> None:
+        marker = "MODIFIED_SKILL_INTENT_DIVERGED"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            skill = self.commit_shipped_skill(repo)
+            skill.write_text("# edited in the worktree\n", encoding="utf-8")
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            expected, analysis = self.assert_bootstrap_parity(marker, repo, result, packet, mode="intent")
+            self.assertEqual((analysis / self.SKILL).read_text(encoding="utf-8"), "# edited in the worktree\n", marker)
+
+    def test_public_intent_bootstrap_carries_a_deleted_tracked_shipped_skill(self) -> None:
+        marker = "DELETED_SKILL_INTENT_DIVERGED"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            self.commit_shipped_skill(repo).unlink()
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            expected, analysis = self.assert_bootstrap_parity(marker, repo, result, packet, mode="intent")
+            self.assertNotIn(self.SKILL, self.tree_paths(repo, expected), marker)
+            self.assertFalse((analysis / self.SKILL).exists(), marker + " (analysis worktree)")
+
+    def test_public_intent_bootstrap_accepts_a_tracked_skill_that_differs_from_the_installed_output(self) -> None:
+        # cubic P2 on PR #18: gitnexus analyze rewrites the shipped skills in the
+        # analysis worktree; the tracked bytes must win before the receipt binds.
+        marker = "DIVERGENT_SKILL_BYTES_REFUSED"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            self.commit_shipped_skill(repo)
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            expected, analysis = self.assert_bootstrap_parity(marker, repo, result, packet, mode="intent")
+            self.assertEqual(expected, self.head_tree(repo), marker)
+            self.assertEqual((analysis / self.SKILL).read_text(encoding="utf-8"), "# repository-owned skill\n", marker)
+
+    def test_public_intent_bootstrap_strips_nested_cache_under_the_shipped_skills(self) -> None:
+        marker = "NESTED_CACHE_UNDER_SKILLS_DIGESTED"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            self.commit_shipped_skill(repo)
+            nested = (".claude/skills/gitnexus/gitnexus-guide/__pycache__/x.cpython-312.pyc", ".claude/skills/gitnexus/.gitnexus/meta.json")
+            for relative in nested:
+                self.commit_shipped_skill(repo, relative, "x\n")
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            expected, _ = self.assert_bootstrap_parity(marker, repo, result, packet, mode="intent")
+            paths = self.tree_paths(repo, expected)
+            self.assertEqual((self.SKILL in paths, [p for p in nested if p in paths]), (True, []), marker)
+
+    def test_public_intent_bootstrap_keeps_untracked_sibling_skills_out(self) -> None:
+        marker = "UNTRACKED_SIBLING_SKILL_LEAKED"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            extra = repo / ".claude/skills/gitnexus/extra/SKILL.md"
+            extra.parent.mkdir(parents=True)
+            extra.write_text("# written by an earlier gitnexus analyze\n", encoding="utf-8")
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            expected, _ = self.assert_bootstrap_parity(marker, repo, result, packet, mode="intent")
+            self.assertEqual(expected, self.head_tree(repo), marker)
+
+    def test_public_local_bootstrap_presents_the_modified_shipped_skill_to_gitnexus(self) -> None:
+        # The tree handed to the real gitnexus binary is the overlaid worktree state,
+        # captured by a PATH shim at the moment analyze is exec'd. GitNexus indexes
+        # nothing under .claude, so the graph cannot witness it.
+        marker = "OVERLAY_NOT_PRESENTED_TO_GITNEXUS"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            edited = self.commit_shipped_skill(repo)
+            gone = self.commit_shipped_skill(repo, ".claude/skills/gitnexus/gitnexus-cli/SKILL.md", "# doomed skill\n")
+            edited.write_text("# edited in the worktree\n", encoding="utf-8")
+            gone.unlink()
+            shim_dir = Path(runtime_home) / "bin"
+            shim_dir.mkdir()
+            capture = Path(runtime_home) / "presented.txt"
+            shim = shim_dir / "gitnexus"
+            shim.write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" = analyze ]; then\n'
+                '  for arg in "$@"; do target="$arg"; done\n'
+                f'  {{ cat "$target/{self.SKILL}"; [ -e "$target/.claude/skills/gitnexus/gitnexus-cli/SKILL.md" ] && echo present || echo absent; }} > "{capture}"\n'
+                "fi\n"
+                f'exec "{shutil.which("gitnexus")}" "$@"\n',
+                encoding="utf-8",
+            )
+            shim.chmod(0o755)
+            result, packet = self.run_public_bootstrap(
+                repo, cache_dir, runtime_home, mode="local",
+                extra_env={"PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}"})
+            self.assert_bootstrap_parity(marker, repo, result, packet, mode="local")
+            self.assertEqual(capture.read_text(encoding="utf-8"), "# edited in the worktree\nabsent\n", marker)
+
+    def test_public_intent_bootstrap_strips_each_nested_cache_variant(self) -> None:
+        marker = "NESTED_CACHE_VARIANT_DIGESTED"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            self.commit_shipped_skill(repo)
+            variants = (".claude/skills/gitnexus/gitnexus-guide/__pycache__/notes.txt", ".claude/skills/gitnexus/gitnexus-guide/compiled.pyc", ".claude/skills/gitnexus/.codex/state")
+            for relative in variants:
+                self.commit_shipped_skill(repo, relative, "x\n")
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            expected, _ = self.assert_bootstrap_parity(marker, repo, result, packet, mode="intent")
+            paths = self.tree_paths(repo, expected)
+            self.assertEqual((self.SKILL in paths, [p for p in variants if p in paths]), (True, []), marker)
+
+    def test_public_local_bootstrap_keeps_dirty_nested_cache_an_artifact(self) -> None:
+        marker = "DIRTY_NESTED_CACHE_BECAME_SURFACE"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            self.commit_shipped_skill(repo)
+            modified = self.commit_shipped_skill(repo, ".claude/skills/gitnexus/gitnexus-guide/__pycache__/a.pyc", "x\n")
+            deleted = self.commit_shipped_skill(repo, ".claude/skills/gitnexus/gitnexus-guide/compiled.pyc", "x\n")
+            clean = repo_context_forge.candidate_tree(repo)
+            modified.write_text("changed\n", encoding="utf-8")
+            deleted.unlink()
+            result, packet = self.run_public_bootstrap(repo, cache_dir, runtime_home, mode="local")
+            self.assertEqual(
+                (packet.get("mode"), repo_context_forge.candidate_tree(repo), repo_context_forge.is_dirty(repo, ignore_tool_cache=True)),
+                ("blocked", clean, False),
+                marker + ": " + result.stderr[-300:],
+            )
+            (repo / self.SKILL).write_text("# edited beside artifact dirt\n", encoding="utf-8")
+            result, packet = self.run_public_bootstrap(repo, cache_dir, runtime_home, mode="local")
+            expected, analysis = self.assert_bootstrap_parity(marker, repo, result, packet, mode="local")
+            invalid = {str(modified.relative_to(repo)), str(deleted.relative_to(repo))}
+            self.assertEqual(
+                (invalid & self.tree_paths(repo, expected), invalid & {item["path"] for item in packet["targets"]},
+                 (analysis / modified.relative_to(repo)).read_text(encoding="utf-8"), (analysis / deleted.relative_to(repo)).exists()),
+                (set(), set(), "x\n", True),
+                marker + " (artifact dirt reached the candidate, targets, or analysis worktree)",
+            )
+
+    def test_public_local_bootstrap_targets_the_modified_shipped_skill(self) -> None:
+        marker = "MODIFIED_SKILL_NOT_A_TARGET"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            self.commit_shipped_skill(repo).write_text("# edited in the worktree\n", encoding="utf-8")
+            result, packet = self.run_public_bootstrap(repo, cache_dir, runtime_home, mode="local")
+            self.assert_bootstrap_parity(marker, repo, result, packet, mode="local")
+            self.assertIn(self.SKILL, {item["path"] for item in packet["targets"]}, marker)
 
     def test_candidate_tree_keeps_paths_tracked_at_head(self) -> None:
         # repo-context-forge#17: GitNexus commits .claude/skills/gitnexus/*/SKILL.md;
@@ -235,7 +404,7 @@ class RepoContextForgeTests(unittest.TestCase):
     def run_public_bootstrap(
         self, repo: Path, cache_dir: str, runtime_home: str, *,
         mode: str, intent: str | None = None, base: str | None = None,
-        top: int = 1, gitnexus_mode: str = "auto",
+        top: int = 1, gitnexus_mode: str = "auto", extra_env: dict[str, str] | None = None,
     ):
         packet_path = Path(runtime_home) / "packet.json"
         packet_path.unlink(missing_ok=True)
@@ -251,7 +420,7 @@ class RepoContextForgeTests(unittest.TestCase):
         if base is not None:
             command.extend(("--base", base, "--allow-stale-pr-head"))
         result = repo_context_forge.run_cmd(
-            command, env={**os.environ, "HOME": runtime_home}, allow_fail=True)
+            command, env={**os.environ, "HOME": runtime_home, **(extra_env or {})}, allow_fail=True)
         packet = repo_context_forge.json.loads(
             packet_path.read_text(encoding="utf-8")) if packet_path.exists() else {}
         return result, packet
@@ -2418,7 +2587,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 ]
 
         self.assertEqual(
-            repo_context_forge.target_files_for_mode("repo", state, FakeMap(), None, 3),
+            repo_context_forge.target_files_for_mode("repo", state, FakeMap(), None, 3, tracked_skills=frozenset()),
             ["src/app.py", "src/worker.py"],
         )
 
@@ -2450,6 +2619,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 None,
                 3,
                 ["plugin-baseline/"],
+                tracked_skills=frozenset(),
             ),
             ["runtime/a.py", "src/app.py"],
         )
@@ -2478,6 +2648,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 None,
                 3,
                 ["plugin-baseline/"],
+                tracked_skills=frozenset(),
             ),
             ["plugin-baseline/a.py", "runtime/a.py"],
         )
@@ -2650,7 +2821,8 @@ class RepoContextForgeTests(unittest.TestCase):
                     ".gitnexus/meta.json",
                     ".repo-context-forge/workflow-index.sqlite3",
                     "src/app.py",
-                ]
+                ],
+                frozenset(),
             ),
             ["src/app.py"],
         )
@@ -3013,6 +3185,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 soul_map,
                 "Improve agent gateway robustness and tests",
                 5,
+                tracked_skills=frozenset(),
             )
 
             self.assertEqual(targets[0], "apps/ops-dashboard/server/agentGateway.mjs")
@@ -4068,8 +4241,10 @@ class RepoContextForgeTests(unittest.TestCase):
         )
         original_read_git_state = codex_context_bootstrap.forge.read_git_state
         original_is_detached = codex_context_bootstrap.forge.is_detached
+        original_tracked_skills = codex_context_bootstrap.forge.tracked_shipped_skills
         codex_context_bootstrap.forge.read_git_state = lambda *_args, **_kwargs: state
         codex_context_bootstrap.forge.is_detached = lambda _repo: True
+        codex_context_bootstrap.forge.tracked_shipped_skills = lambda _repo: frozenset()
         try:
             reason = codex_context_bootstrap.should_block_empty_checkout(
                 Path("/repo"),
@@ -4081,6 +4256,7 @@ class RepoContextForgeTests(unittest.TestCase):
         finally:
             codex_context_bootstrap.forge.read_git_state = original_read_git_state
             codex_context_bootstrap.forge.is_detached = original_is_detached
+            codex_context_bootstrap.forge.tracked_shipped_skills = original_tracked_skills
 
         self.assertEqual(
             reason,
@@ -4128,8 +4304,10 @@ class RepoContextForgeTests(unittest.TestCase):
         )
         original_read_git_state = codex_context_bootstrap.forge.read_git_state
         original_is_detached = codex_context_bootstrap.forge.is_detached
+        original_tracked_skills = codex_context_bootstrap.forge.tracked_shipped_skills
         codex_context_bootstrap.forge.read_git_state = lambda *_args, **_kwargs: state
         codex_context_bootstrap.forge.is_detached = lambda _repo: True
+        codex_context_bootstrap.forge.tracked_shipped_skills = lambda _repo: frozenset()
         try:
             reason = codex_context_bootstrap.should_block_empty_checkout(
                 Path("/repo"),
@@ -4141,6 +4319,7 @@ class RepoContextForgeTests(unittest.TestCase):
         finally:
             codex_context_bootstrap.forge.read_git_state = original_read_git_state
             codex_context_bootstrap.forge.is_detached = original_is_detached
+            codex_context_bootstrap.forge.tracked_shipped_skills = original_tracked_skills
 
         self.assertEqual(
             reason,

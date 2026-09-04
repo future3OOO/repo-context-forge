@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from typing import Collection
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -95,7 +96,7 @@ def branch_is_behind_upstream(repo: Path, branch: str) -> tuple[str, str, str] |
     return branch, local_sha, upstream_sha
 
 
-def context_surface_paths(git_state: forge.GitState) -> list[str]:
+def context_surface_paths(git_state: forge.GitState, tracked_skills: Collection[str]) -> list[str]:
     return [
         path
         for path in forge.unique_ordered(
@@ -106,7 +107,7 @@ def context_surface_paths(git_state: forge.GitState) -> list[str]:
                 *git_state.untracked_files,
             ]
         )
-        if not forge.is_generated_or_cache_path(path)
+        if not forge.is_producer_artifact(path, tracked_skills)
     ]
 
 
@@ -146,7 +147,8 @@ def should_block_empty_checkout(
     if mode == "pr":
         return None
     git_state = forge.read_git_state(repo, base_ref or head_ref, head_ref)
-    has_any_surface = bool(context_surface_paths(git_state) or intent)
+    tracked_skills = forge.tracked_shipped_skills(repo)
+    has_any_surface = bool(context_surface_paths(git_state, tracked_skills) or intent)
     if has_any_surface:
         return None
     if forge.is_detached(repo):

@@ -16,7 +16,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Collection, Iterable, Literal
 from urllib.parse import urlsplit
 
 import gitnexus_analysis
@@ -249,12 +249,12 @@ def worktree_suggestions(repo: Path) -> list[dict[str, str]]:
     return suggestions
 
 
-def filter_tool_cache_dirty_paths(paths: Iterable[str]) -> list[str]:
+def filter_tool_cache_dirty_paths(paths: Iterable[str], tracked_skills: Collection[str]) -> list[str]:
     return [
         path
         for path in paths
-        if path not in TOOL_CACHE_DIRS
-        and not path.startswith(TOOL_CACHE_PREFIXES)
+        if path in tracked_skills
+        or (path not in TOOL_CACHE_DIRS and not path.startswith(TOOL_CACHE_PREFIXES))
     ]
 
 
@@ -297,6 +297,34 @@ def is_generated_or_cache_path(path: str) -> bool:
         path.endswith((".pyc", ".pyo"))
         or path.startswith((".git/", *TOOL_CACHE_PREFIXES))
     )
+
+
+def literal_pathspec_env(**extra: str) -> dict[str, str]:
+    """A git environment whose pathspecs are literal, whatever the caller exported."""
+    env = dict(os.environ)
+    for variable in ("GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"):
+        env.pop(variable, None)
+    env.update({"GIT_LITERAL_PATHSPECS": "1", **extra})
+    return env
+
+
+def tracked_shipped_skills(repo: Path) -> set[str]:
+    """Repository content under the shipped-skills prefix: paths tracked at HEAD
+    whose remainder below the prefix is not itself a cache or bytecode path."""
+    prefix = f"{SHIPPED_SKILLS_DIR}/"
+    listed = run_cmd(
+        ["git", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", SHIPPED_SKILLS_DIR],
+        cwd=repo,
+        env=literal_pathspec_env(),
+    ).stdout.split("\0")
+    return {
+        path for path in listed
+        if path.startswith(prefix) and not is_generated_or_cache_path(path[len(prefix):])
+    }
+
+
+def is_producer_artifact(path: str, tracked_skills: Collection[str]) -> bool:
+    return is_generated_or_cache_path(path) and path not in tracked_skills
 
 
 def reference_only_prefixes(repo: Path) -> list[str]:
@@ -367,7 +395,7 @@ def cleanup_soulforge_gitignore_change(repo: Path) -> None:
 def is_dirty(repo: Path, *, ignore_tool_cache: bool = False) -> bool:
     paths = dirty_paths(repo)
     if ignore_tool_cache:
-        paths = filter_tool_cache_dirty_paths(paths)
+        paths = filter_tool_cache_dirty_paths(paths, tracked_shipped_skills(repo))
     return bool(paths)
 
 
@@ -624,35 +652,25 @@ def source_worktree_files(repo: Path) -> list[str]:
     untracked = split_lines(
         run_git(repo, ["ls-files", "--others", "--exclude-standard"], allow_fail=True)
     )
+    tracked_skills = tracked_shipped_skills(repo)
     return [
         path
         for path in unique_ordered([*tracked, *untracked])
-        if not is_generated_or_cache_path(path)
+        if not is_producer_artifact(path, tracked_skills)
     ]
 
 
 def candidate_tree(repo: Path) -> str:
     with tempfile.TemporaryDirectory(prefix="repo-context-forge-index-") as temp_dir:
-        index_path = Path(temp_dir) / "index"
-        env = dict(os.environ)
-        for variable in ("GIT_GLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"):
-            env.pop(variable, None)
-        env.update({
-            "GIT_INDEX_FILE": str(index_path),
-            "GIT_LITERAL_PATHSPECS": "1",
-        })
+        env = literal_pathspec_env(GIT_INDEX_FILE=str(Path(temp_dir) / "index"))
         run_cmd(["git", "read-tree", "HEAD"], cwd=repo, env=env)
         run_cmd(["git", "add", "-A", "--", "."], cwd=repo, env=env)
-        # Producer artifacts leave the digest. A shipped skill tracked at HEAD is
-        # repository content and stays; an untracked one beside it is output of
-        # gitnexus analyze and goes, as does everything under the reserved
-        # cache directories the producer writes into.
-        tracked_skills = set(run_cmd(
-            ["git", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", SHIPPED_SKILLS_DIR],
-            cwd=repo, env=env).stdout.split("\0"))
+        # Producer artifacts leave the digest; tracked shipped skills are
+        # repository content and stay.
+        tracked_skills = tracked_shipped_skills(repo)
         artifacts = [
             path for path in run_cmd(["git", "ls-files", "-z"], cwd=repo, env=env).stdout.split("\0")
-            if path and is_generated_or_cache_path(path) and path not in tracked_skills
+            if path and is_producer_artifact(path, tracked_skills)
         ]
         if artifacts:
             run_cmd(["git", "rm", "--cached", "--", *artifacts], cwd=repo, env=env)
@@ -666,10 +684,11 @@ def locally_deleted_files(repo: Path) -> list[str]:
     staged = split_lines(
         run_git(repo, ["diff", "--name-only", "--cached", "--diff-filter=D"], allow_fail=True)
     )
+    tracked_skills = tracked_shipped_skills(repo)
     return [
         path
         for path in unique_ordered([*unstaged, *staged])
-        if not is_generated_or_cache_path(path)
+        if not is_producer_artifact(path, tracked_skills)
     ]
 
 
@@ -708,6 +727,25 @@ def overlay_source_worktree(source_repo: Path, analysis_repo: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         remove_path(target)
         shutil.copy2(source, target, follow_symlinks=False)
+
+
+def resync_shipped_skills(target_state: TargetState) -> None:
+    """Return the tracked shipped skills gitnexus analyze rewrote in the analysis
+    worktree to the candidate's bytes. The index was built before those writes,
+    so this restores the indexed tree; generated siblings stay candidate-excluded."""
+    analysis = target_state.analysis_repo
+    tracked = sorted(tracked_shipped_skills(analysis))
+    if tracked:
+        run_cmd(["git", "checkout", "--", *tracked], cwd=analysis, env=literal_pathspec_env())
+    if target_state.mode not in {"local", "intent"}:
+        return
+    for path in tracked:
+        source = target_state.source_repo / path
+        target = analysis / path
+        remove_path(target)
+        if os.path.lexists(source):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target, follow_symlinks=False)
 
 
 def checkout_uses_external_git_dir(checkout: Path) -> bool:
@@ -1407,6 +1445,8 @@ def target_files_for_mode(
     top: int,
     reference_only: Iterable[str] = (),
     intent_resolution: workflow_index.IntentResolution | None = None,
+    *,
+    tracked_skills: Collection[str],
 ) -> list[str]:
     reference_prefixes = tuple(reference_only)
     if mode == "pr":
@@ -1426,7 +1466,7 @@ def target_files_for_mode(
         return [
             path
             for path in selected_files(source_git_state, "all")
-            if not is_generated_or_cache_path(path)
+            if not is_producer_artifact(path, tracked_skills)
         ][:top]
     if mode == "repo":
         return [
@@ -2478,6 +2518,7 @@ def make_packet(
         top,
         reference_only,
         intent_resolution,
+        tracked_skills=tracked_shipped_skills(target_state.source_repo),
     )
     if mode == "intent":
         targets = unique_ordered([
@@ -2573,6 +2614,7 @@ def make_packet(
         }
         analysis["producer_revision"] = producer_revision()
         if gitnexus_mode != "off" and gitnexus_analysis.result_is_resolved(analysis):
+            resync_shipped_skills(target_state)
             if mode in {"local", "intent"}:
                 source_gitignore = target_state.source_repo / ".gitignore"
                 analysis_gitignore = target_state.analysis_repo / ".gitignore"
