@@ -4865,10 +4865,6 @@ class RepoContextForgeTests(unittest.TestCase):
             )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SoulforgeGitignoreCleanupTests(unittest.TestCase):
     """cleanup_soulforge_gitignore_change restores only the tool's own append."""
 
@@ -4912,3 +4908,12 @@ class SoulforgeGitignoreCleanupTests(unittest.TestCase):
         repo_context_forge.cleanup_soulforge_gitignore_change(repo)
         self.assertEqual(self.dirty(repo), " M .gitignore\n")
 
+    def test_keeps_a_reordered_rule_next_to_the_append(self) -> None:
+        repo = self.repo_with_gitignore("first/\nlast/\n")
+        (repo / ".gitignore").write_text("last/\nfirst/\n.soulforge\n", encoding="utf-8")
+        repo_context_forge.cleanup_soulforge_gitignore_change(repo)
+        self.assertEqual(self.dirty(repo), " M .gitignore\n")
+
+
+if __name__ == "__main__":
+    unittest.main()
