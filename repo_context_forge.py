@@ -352,11 +352,16 @@ def cleanup_soulforge_gitignore_change(repo: Path) -> None:
         if not line.startswith("+++") and not line.startswith("---")
     ]
     tool_cache_lines = {
-        f"+{name}"
-        for directory in TOOL_CACHE_DIRS
-        for name in (directory, f"{directory}/")
+        name for directory in TOOL_CACHE_DIRS for name in (directory, f"{directory}/")
     }
-    if content_changes and all(line in tool_cache_lines for line in content_changes):
+    removed = [line[1:] for line in content_changes if line.startswith("-")]
+    added = [line[1:] for line in content_changes if line.startswith("+")]
+    # Appending to a file with no final newline re-emits its last line: git
+    # shows that line removed and added back verbatim, which changes no rule.
+    if len(removed) == 1 and removed[0] in added:
+        added.remove(removed[0])
+        removed = []
+    if added and not removed and all(line in tool_cache_lines for line in added):
         run_git(repo, ["checkout", "--", ".gitignore"])
 
 

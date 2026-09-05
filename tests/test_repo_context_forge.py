@@ -7,6 +7,7 @@ import os
 import shutil
 import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -4866,3 +4867,48 @@ class RepoContextForgeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SoulforgeGitignoreCleanupTests(unittest.TestCase):
+    """cleanup_soulforge_gitignore_change restores only the tool's own append."""
+
+    def repo_with_gitignore(self, content: str) -> Path:
+        repo = Path(tempfile.mkdtemp(prefix="rcf-gitignore-"))
+        self.addCleanup(shutil.rmtree, repo, True)
+        for args in (["init", "-q"], ["config", "user.email", "t@example.com"], ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", str(repo), *args], check=True)
+        (repo / ".gitignore").write_text(content, encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "ignore"], check=True)
+        return repo
+
+    def dirty(self, repo: Path) -> str:
+        return subprocess.run(["git", "-C", str(repo), "status", "--short"], text=True, capture_output=True, check=True).stdout
+
+    def test_restores_the_append_after_a_final_newline(self) -> None:
+        repo = self.repo_with_gitignore("dist/\nlocal_docs/\n")
+        with (repo / ".gitignore").open("a", encoding="utf-8") as handle:
+            handle.write(".soulforge\n")
+        repo_context_forge.cleanup_soulforge_gitignore_change(repo)
+        self.assertEqual(self.dirty(repo), "")
+
+    def test_restores_the_append_when_the_file_had_no_final_newline(self) -> None:
+        repo = self.repo_with_gitignore("dist/\nlocal_docs/")
+        with (repo / ".gitignore").open("a", encoding="utf-8") as handle:
+            handle.write("\n.soulforge")
+        repo_context_forge.cleanup_soulforge_gitignore_change(repo)
+        self.assertEqual(self.dirty(repo), "")
+
+    def test_keeps_a_genuine_rule_added_next_to_the_append(self) -> None:
+        repo = self.repo_with_gitignore("dist/\nlocal_docs/")
+        with (repo / ".gitignore").open("a", encoding="utf-8") as handle:
+            handle.write("\nbuild/\n.soulforge")
+        repo_context_forge.cleanup_soulforge_gitignore_change(repo)
+        self.assertEqual(self.dirty(repo), " M .gitignore\n")
+
+    def test_keeps_a_genuine_rewrite_of_the_last_line(self) -> None:
+        repo = self.repo_with_gitignore("dist/\nlocal_docs/")
+        (repo / ".gitignore").write_text("dist/\nother_docs/\n.soulforge", encoding="utf-8")
+        repo_context_forge.cleanup_soulforge_gitignore_change(repo)
+        self.assertEqual(self.dirty(repo), " M .gitignore\n")
+
