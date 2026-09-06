@@ -2686,6 +2686,22 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertTrue(task_state.exists(), f"{marker}: {task_state}")
             self.assertTrue(link.is_symlink(), f"{marker}: {link}")
 
+    def test_gc_never_sweeps_through_a_symlinked_parent(self) -> None:
+        marker = "SYMLINKED_PARENT_SWEPT"
+        with tempfile.TemporaryDirectory() as cache_dir:
+            cache = Path(cache_dir)
+            stamp = time.time() - 3 * 86400
+            task_state = cache / "tasks" / "repo" / "task.json"
+            task_state.parent.mkdir(parents=True)
+            task_state.write_text("{}\n", encoding="utf-8")
+            os.utime(task_state.parent, (stamp, stamp))
+            (cache / "analysis-worktrees").symlink_to(cache / "tasks", target_is_directory=True)
+
+            result = self.run_gc(cache)
+
+            self.assertEqual(result.returncode, 0, f"{marker}: {result.stderr}")
+            self.assertTrue(task_state.exists(), f"{marker}: {task_state}")
+
     def test_gc_leaves_a_checkout_whose_lock_another_process_holds(self) -> None:
         marker = "LOCKED_CHECKOUT_SWEPT"
         with tempfile.TemporaryDirectory() as cache_dir:

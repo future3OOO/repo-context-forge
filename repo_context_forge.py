@@ -621,7 +621,7 @@ def sweep_cache_checkouts(cache_dir: Path) -> list[Path]:
     removed: list[Path] = []
     for name in CACHE_CHECKOUT_DIRS:
         parent = cache_dir / name
-        if not parent.is_dir():
+        if parent.is_symlink() or not parent.is_dir():
             continue
         for checkout in parent.iterdir():
             if checkout.is_symlink() or not checkout.is_dir():
