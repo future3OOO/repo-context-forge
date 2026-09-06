@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import functools
 import hashlib
 import html
@@ -612,8 +613,9 @@ def safe_rmtree(path: Path, cache_root: Path) -> None:
 def sweep_cache_checkouts(cache_dir: Path) -> list[Path]:
     """Delete cache checkouts unused for longer than the TTL, with their gitnexus lock files.
 
-    Concurrent runs sweep the same directories, so a checkout another process
-    already removed is skipped rather than reported.
+    Symlinks are never followed. A checkout whose gitnexus lock another process
+    holds (it is being indexed), or that a concurrent sweep already removed, is
+    skipped rather than reported.
     """
     cutoff = time.time() - CACHE_CHECKOUT_TTL_SECONDS
     removed: list[Path] = []
@@ -622,15 +624,18 @@ def sweep_cache_checkouts(cache_dir: Path) -> list[Path]:
         if not parent.is_dir():
             continue
         for checkout in parent.iterdir():
-            if not checkout.is_dir():
+            if checkout.is_symlink() or not checkout.is_dir():
                 continue
+            lock = parent / f".{checkout.name}.gitnexus.lock"
             try:
                 if checkout.stat().st_mtime > cutoff:
                     continue
-                safe_rmtree(checkout, cache_dir)
-            except FileNotFoundError:
+                with lock.open("a") as holder:
+                    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    safe_rmtree(checkout, cache_dir)
+            except (BlockingIOError, FileNotFoundError):
                 continue
-            (parent / f".{checkout.name}.gitnexus.lock").unlink(missing_ok=True)
+            lock.unlink(missing_ok=True)
             removed.append(checkout)
     return removed
 
@@ -752,6 +757,7 @@ def checkout_uses_external_git_dir(checkout: Path) -> bool:
 def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cache_dir: Path) -> None:
     require_cache_path(checkout.parent, cache_dir)
     if checkout.exists():
+        os.utime(checkout)
         remove_checkout = True
         if is_git_repo(checkout) and not checkout_uses_external_git_dir(checkout):
             existing_sha = run_git(checkout, ["rev-parse", "HEAD"], allow_fail=True)
@@ -771,7 +777,6 @@ def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cac
     reset_cached_worktree(checkout, cache_dir)
     if run_git(checkout, ["ls-files", "--", ".gitnexus"]):
         remove_path(checkout / ".gitnexus")
-    os.utime(checkout)
 
 
 def ensure_pr_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
