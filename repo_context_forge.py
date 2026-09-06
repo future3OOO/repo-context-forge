@@ -530,8 +530,18 @@ def cache_key_for(repo: Path, head_sha: str, extra: str = "") -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
-def analysis_checkout_path(repo: Path, head_sha: str, cache_dir: Path, mode: Mode) -> tuple[Path, str]:
+def analysis_checkout_path(
+    repo: Path, head_sha: str, cache_dir: Path, mode: Mode, candidate_slot: bool = False,
+) -> tuple[Path, str]:
+    """Map repo, head and mode to a cache-owned checkout and its GitNexus selector.
+
+    `candidate_slot` selects a second checkout for the same three, so a later
+    intake does not re-populate the one an earlier intake indexed. There are only
+    ever these two; the value is internal, and the existing sweep reclaims both.
+    """
     extra = "repo-analysis" if mode == "repo" else "local-analysis" if mode != "pr" else ""
+    if candidate_slot:
+        extra = f"{extra}-candidate" if extra else "candidate"
     key = cache_key_for(repo, head_sha, extra)
     directory = "worktrees" if mode == "pr" else "analysis-checkouts" if mode == "repo" else "analysis-worktrees"
     return (cache_dir / directory / f"{repo.name}-{head_sha[:12]}-{key}").resolve(), key
@@ -775,6 +785,21 @@ def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cac
 
     run_git(checkout, ["checkout", "-B", "repo-context-forge-target", head_sha])
     reset_cached_worktree(checkout, cache_dir)
+    # candidate_tree already excludes these, but the checkout still carries them,
+    # so whatever indexes this tree reports their absence from the candidate as an
+    # unattributable change. Excluded here, before the overlay and before any
+    # index is built. Appended, never rewritten: this file may carry exclusions
+    # the producer did not write. TOOL_CACHE_DIRS, not TOOL_CACHE_PATHS: exactly
+    # what reset_cached_worktree keeps, so cleanup behaviour is unchanged, and
+    # excluding .claude/skills/gitnexus would leave .claude undeletable.
+    exclude_file = checkout / ".git" / "info" / "exclude"
+    exclude_file.parent.mkdir(parents=True, exist_ok=True)
+    present = exclude_file.read_text(encoding="utf-8") if exclude_file.exists() else ""
+    missing = [path for path in TOOL_CACHE_DIRS if path not in present.splitlines()]
+    if missing:
+        prefix = "" if not present or present.endswith("\n") else "\n"
+        exclude_file.write_text(
+            present + prefix + "".join(f"{path}\n" for path in missing), encoding="utf-8")
     if run_git(checkout, ["ls-files", "--", ".gitnexus"]):
         remove_path(checkout / ".gitnexus")
 
@@ -825,9 +850,12 @@ def ensure_repo_analysis_checkout(source_repo: Path, head_ref: str, cache_dir: P
     )
 
 
-def ensure_local_analysis_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
+def ensure_local_analysis_worktree(
+    source_repo: Path, head_ref: str, cache_dir: Path, candidate_slot: bool = False,
+) -> TargetState:
     head_sha = run_git(source_repo, ["rev-parse", head_ref])
-    worktree, key = analysis_checkout_path(source_repo, head_sha, cache_dir, "local")
+    worktree, key = analysis_checkout_path(
+        source_repo, head_sha, cache_dir, "local", candidate_slot)
 
     ensure_cached_checkout(source_repo, head_sha, worktree, cache_dir)
     overlay_source_worktree(source_repo, worktree)
@@ -852,6 +880,7 @@ def resolve_target_state(
     base_ref: str,
     head_ref: str,
     cache_dir: Path,
+    candidate_slot: bool = False,
 ) -> TargetState:
     source_repo = repo_root(repo)
     if mode == "pr":
@@ -882,7 +911,7 @@ def resolve_target_state(
             cache_key=target.cache_key,
         )
 
-    target = ensure_local_analysis_worktree(source_repo, head_ref, cache_dir)
+    target = ensure_local_analysis_worktree(source_repo, head_ref, cache_dir, candidate_slot)
     return TargetState(
         mode=mode,
         source_repo=target.source_repo,
@@ -2441,10 +2470,12 @@ def make_packet(
     gitnexus_repo: str | None,
     task_state: dict[str, object] | None = None,
     gitnexus_mode: GitNexusMode = "off",
+    candidate_slot: bool = False,
 ) -> dict[str, object]:
     source_repo = repo_root(repo)
     source_status_before = porcelain_status(source_repo)
-    target_state = resolve_target_state(repo, mode, base_ref, head_ref, cache_dir)
+    target_state = resolve_target_state(
+        repo, mode, base_ref, head_ref, cache_dir, candidate_slot)
     sweep_cache_checkouts(cache_dir)
     candidate_repo = (
         target_state.source_repo
@@ -3607,6 +3638,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     analyze = subcommands.add_parser("analyze", help="Generate a production context packet")
     analyze.add_argument("--repo", required=True, type=Path)
     analyze.add_argument("--mode", choices=["pr", "local", "intent", "repo"], default="pr")
+    analyze.add_argument(
+        "--candidate-slot", action="store_true",
+        help="local and intent modes: index into the candidate slot, leaving the "
+             "checkout an earlier intake built resolvable under its own selector")
     analyze.add_argument("--base", default="main")
     analyze.add_argument("--head", default="HEAD")
     analyze.add_argument("--intent")
@@ -3967,6 +4002,7 @@ def main(argv: list[str]) -> int:
             map_build=args.map_build,
             map_timeout_ms=args.map_timeout_ms,
             allow_missing_map=args.allow_missing_map,
+            candidate_slot=args.candidate_slot,
             gitnexus_repo=args.gitnexus_repo,
             gitnexus_mode=args.gitnexus_mode,
         )
