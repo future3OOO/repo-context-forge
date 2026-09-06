@@ -2587,6 +2587,204 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertFalse(second.target_dirty)
             self.assertFalse(repo_context_forge.is_dirty(repo, ignore_tool_cache=True))
 
+    def aged_cache_checkout(self, cache: Path, directory: str, name: str, *, days: float) -> Path:
+        checkout = cache / directory / name
+        checkout.mkdir(parents=True)
+        (checkout / "marker.txt").write_text("cached\n", encoding="utf-8")
+        (cache / directory / f".{name}.gitnexus.lock").write_text("", encoding="utf-8")
+        stamp = time.time() - days * 86400
+        os.utime(checkout, (stamp, stamp))
+        return checkout
+
+    def run_gc(self, cache: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(MODULE_PATH), "gc", "--cache-dir", str(cache)],
+            text=True, capture_output=True,
+        )
+
+    def test_gc_removes_checkouts_unused_for_a_day(self) -> None:
+        marker = "EXPIRED_CHECKOUT_SURVIVED"
+        with tempfile.TemporaryDirectory() as cache_dir:
+            cache = Path(cache_dir)
+            expired = [
+                self.aged_cache_checkout(cache, directory, f"repo-{directory}-expired", days=3)
+                for directory in ("analysis-worktrees", "analysis-checkouts", "worktrees")
+            ]
+
+            result = self.run_gc(cache)
+
+            self.assertEqual(result.returncode, 0, f"{marker}: {result.stderr}")
+            for checkout in expired:
+                self.assertFalse(checkout.exists(), f"{marker}: {checkout}")
+                lock = checkout.parent / f".{checkout.name}.gitnexus.lock"
+                self.assertFalse(lock.exists(), f"{marker}: {lock}")
+
+    def test_gc_keeps_fresh_checkouts_and_cache_state(self) -> None:
+        marker = "FRESH_CACHE_ENTRY_REMOVED"
+        with tempfile.TemporaryDirectory() as cache_dir:
+            cache = Path(cache_dir)
+            fresh = [
+                self.aged_cache_checkout(cache, directory, f"repo-{directory}-fresh", days=0.5)
+                for directory in ("analysis-worktrees", "analysis-checkouts", "worktrees")
+            ]
+            self.aged_cache_checkout(cache, "analysis-worktrees", "repo-expired", days=3)
+            stamp = time.time() - 3 * 86400
+            task_state = cache / "tasks" / "repo" / "key" / "task.json"
+            task_state.parent.mkdir(parents=True)
+            task_state.write_text("{}\n", encoding="utf-8")
+            os.utime(task_state.parent, (stamp, stamp))
+            lock = cache / "locks" / "key.lock"
+            lock.parent.mkdir()
+            lock.write_text("", encoding="utf-8")
+            os.utime(lock.parent, (stamp, stamp))
+
+            result = self.run_gc(cache)
+
+            self.assertEqual(result.returncode, 0, f"{marker}: {result.stderr}")
+            for checkout in fresh:
+                self.assertTrue(checkout.exists(), f"{marker}: {checkout}")
+            self.assertTrue(task_state.exists(), f"{marker}: {task_state}")
+            self.assertTrue(lock.exists(), f"{marker}: {lock}")
+
+    def test_concurrent_gc_runs_both_succeed_and_remove_everything_expired(self) -> None:
+        marker = "CONCURRENT_GC_FAILED"
+        with tempfile.TemporaryDirectory() as cache_dir:
+            cache = Path(cache_dir)
+            expired = [
+                self.aged_cache_checkout(cache, directory, f"repo-{directory}-{index}", days=3)
+                for directory in ("analysis-worktrees", "analysis-checkouts", "worktrees")
+                for index in range(150)
+            ]
+            command = [sys.executable, str(MODULE_PATH), "gc", "--cache-dir", str(cache)]
+
+            first = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            second = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            outputs = [process.communicate() for process in (first, second)]
+
+            for process, (_stdout, stderr) in zip((first, second), outputs):
+                self.assertEqual(process.returncode, 0, f"{marker}: {stderr}")
+            for checkout in expired:
+                self.assertFalse(checkout.exists(), f"{marker}: {checkout}")
+
+    def test_gc_never_follows_a_symlink(self) -> None:
+        marker = "SYMLINK_TARGET_SWEPT"
+        with tempfile.TemporaryDirectory() as cache_dir:
+            cache = Path(cache_dir)
+            stamp = time.time() - 3 * 86400
+            task_state = cache / "tasks" / "repo" / "key" / "task.json"
+            task_state.parent.mkdir(parents=True)
+            task_state.write_text("{}\n", encoding="utf-8")
+            os.utime(cache / "tasks", (stamp, stamp))
+            (cache / "analysis-worktrees").mkdir()
+            link = cache / "analysis-worktrees" / "repo-000000000000-linked"
+            link.symlink_to(cache / "tasks", target_is_directory=True)
+            os.utime(link, (stamp, stamp), follow_symlinks=False)
+
+            result = self.run_gc(cache)
+
+            self.assertEqual(result.returncode, 0, f"{marker}: {result.stderr}")
+            self.assertTrue(task_state.exists(), f"{marker}: {task_state}")
+            self.assertTrue(link.is_symlink(), f"{marker}: {link}")
+
+    def test_gc_never_sweeps_through_a_symlinked_parent(self) -> None:
+        marker = "SYMLINKED_PARENT_SWEPT"
+        with tempfile.TemporaryDirectory() as cache_dir:
+            cache = Path(cache_dir)
+            stamp = time.time() - 3 * 86400
+            task_state = cache / "tasks" / "repo" / "task.json"
+            task_state.parent.mkdir(parents=True)
+            task_state.write_text("{}\n", encoding="utf-8")
+            os.utime(task_state.parent, (stamp, stamp))
+            (cache / "analysis-worktrees").symlink_to(cache / "tasks", target_is_directory=True)
+
+            result = self.run_gc(cache)
+
+            self.assertEqual(result.returncode, 0, f"{marker}: {result.stderr}")
+            self.assertTrue(task_state.exists(), f"{marker}: {task_state}")
+
+    def test_gc_leaves_a_checkout_whose_lock_another_process_holds(self) -> None:
+        marker = "LOCKED_CHECKOUT_SWEPT"
+        with tempfile.TemporaryDirectory() as cache_dir:
+            cache = Path(cache_dir)
+            checkout = self.aged_cache_checkout(cache, "analysis-worktrees", "repo-locked", days=3)
+            lock = cache / "analysis-worktrees" / ".repo-locked.gitnexus.lock"
+            holder = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import fcntl, sys, time\nhandle = open(sys.argv[1])\nfcntl.flock(handle, fcntl.LOCK_EX)\n"
+                 "print('held', flush=True)\ntime.sleep(60)", str(lock)],
+                text=True, stdout=subprocess.PIPE,
+            )
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "held")
+
+                while_held = self.run_gc(cache)
+
+                self.assertEqual(while_held.returncode, 0, f"{marker}: {while_held.stderr}")
+                self.assertTrue(checkout.exists(), f"{marker}: {checkout}")
+            finally:
+                holder.kill()
+                holder.wait()
+
+            released = self.run_gc(cache)
+
+            self.assertEqual(released.returncode, 0, f"{marker}: {released.stderr}")
+            self.assertFalse(checkout.exists(), f"{marker}: {checkout} survived after release")
+
+    def test_reuse_renews_the_ttl_before_any_git_work(self) -> None:
+        marker = "RENEWAL_AFTER_GIT"
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            cache = Path(cache_dir)
+            first = repo_context_forge.ensure_pr_worktree(repo, "HEAD", cache)
+            stamp = time.time() - 3 * 86400
+            os.utime(first.analysis_repo, (stamp, stamp))
+            git_dir = first.analysis_repo / ".git"
+            git_dir.chmod(0o555)
+            try:
+                with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                    repo_context_forge.ensure_pr_worktree(repo, "HEAD", cache)
+            finally:
+                git_dir.chmod(0o755)
+
+            self.assertGreater(first.analysis_repo.stat().st_mtime, stamp + 86400,
+                               f"{marker}: {first.analysis_repo} still expired after a reuse whose git work failed")
+
+    def test_analyze_sweeps_expired_checkouts_and_keeps_its_target(self) -> None:
+        marker = "ANALYZE_LEFT_EXPIRED_CHECKOUT"
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, \
+                tempfile.TemporaryDirectory() as runtime_home:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            cache = Path(cache_dir)
+            expired = self.aged_cache_checkout(
+                cache, "analysis-checkouts", "other-000000000000-0123456789abcdef", days=3)
+
+            result, _packet = self.run_public_bootstrap(
+                repo, cache_dir, runtime_home, mode="repo", gitnexus_mode="off")
+
+            head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+            target, _key = repo_context_forge.analysis_checkout_path(repo, head, cache, "repo")
+            self.assertTrue(target.exists(), f"{marker}: no target checkout: {result.stderr[-400:]}")
+            self.assertFalse(expired.exists(), f"{marker}: {expired}")
+
+    def test_reusing_a_checkout_renews_its_ttl(self) -> None:
+        marker = "REUSED_CHECKOUT_EXPIRED"
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            cache = Path(cache_dir)
+            first = repo_context_forge.ensure_pr_worktree(repo, "HEAD", cache)
+            stamp = time.time() - 3 * 86400
+            os.utime(first.analysis_repo, (stamp, stamp))
+
+            second = repo_context_forge.ensure_pr_worktree(repo, "HEAD", cache)
+            self.assertEqual(second.analysis_repo, first.analysis_repo)
+            result = self.run_gc(cache)
+
+            self.assertEqual(result.returncode, 0, f"{marker}: {result.stderr}")
+            self.assertTrue(first.analysis_repo.exists(), f"{marker}: {first.analysis_repo}")
+
     def test_pr_analysis_recovers_when_reused_cache_preclean_fails(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
             repo = Path(repo_dir)

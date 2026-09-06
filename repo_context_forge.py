@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import functools
 import hashlib
 import html
@@ -14,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Literal
@@ -30,6 +32,8 @@ GitNexusMode = Literal["off", "check", "auto"]
 
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "repo-context-forge"
+CACHE_CHECKOUT_DIRS = ("analysis-worktrees", "analysis-checkouts", "worktrees")
+CACHE_CHECKOUT_TTL_SECONDS = 24 * 60 * 60
 TOOL_CACHE_DIRS = (".soulforge", ".codex", ".gitnexus", workflow_index.INDEX_DIR)
 TOOL_CACHE_PATHS = (*TOOL_CACHE_DIRS, ".claude/skills/gitnexus")
 TOOL_CACHE_PREFIXES = tuple(f"{name}/" for name in TOOL_CACHE_PATHS)
@@ -606,6 +610,36 @@ def safe_rmtree(path: Path, cache_root: Path) -> None:
     shutil.rmtree(resolved)
 
 
+def sweep_cache_checkouts(cache_dir: Path) -> list[Path]:
+    """Delete cache checkouts unused for longer than the TTL, with their gitnexus lock files.
+
+    Symlinks are never followed. A checkout whose gitnexus lock another process
+    holds (it is being indexed), or that a concurrent sweep already removed, is
+    skipped rather than reported.
+    """
+    cutoff = time.time() - CACHE_CHECKOUT_TTL_SECONDS
+    removed: list[Path] = []
+    for name in CACHE_CHECKOUT_DIRS:
+        parent = cache_dir / name
+        if parent.is_symlink() or not parent.is_dir():
+            continue
+        for checkout in parent.iterdir():
+            if checkout.is_symlink() or not checkout.is_dir():
+                continue
+            lock = parent / f".{checkout.name}.gitnexus.lock"
+            try:
+                if checkout.stat().st_mtime > cutoff:
+                    continue
+                with lock.open("a") as holder:
+                    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    safe_rmtree(checkout, cache_dir)
+            except (BlockingIOError, FileNotFoundError):
+                continue
+            lock.unlink(missing_ok=True)
+            removed.append(checkout)
+    return removed
+
+
 def require_cache_path(path: Path, cache_root: Path) -> Path:
     resolved = path.resolve()
     root = cache_root.resolve()
@@ -723,6 +757,7 @@ def checkout_uses_external_git_dir(checkout: Path) -> bool:
 def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cache_dir: Path) -> None:
     require_cache_path(checkout.parent, cache_dir)
     if checkout.exists():
+        os.utime(checkout)
         remove_checkout = True
         if is_git_repo(checkout) and not checkout_uses_external_git_dir(checkout):
             existing_sha = run_git(checkout, ["rev-parse", "HEAD"], allow_fail=True)
@@ -2410,6 +2445,7 @@ def make_packet(
     source_repo = repo_root(repo)
     source_status_before = porcelain_status(source_repo)
     target_state = resolve_target_state(repo, mode, base_ref, head_ref, cache_dir)
+    sweep_cache_checkouts(cache_dir)
     candidate_repo = (
         target_state.source_repo
         if mode in {"local", "intent"}
@@ -3653,6 +3689,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser_for_event.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
         parser_for_event.add_argument("paths", nargs="+")
 
+    gc = subcommands.add_parser("gc", help="Delete cache checkouts unused for more than a day")
+    gc.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+
     gitnexus_merge = subcommands.add_parser("gitnexus-merge", help="Merge GitNexus findings into a packet")
     gitnexus_merge.add_argument("--repo", required=True, type=Path)
     gitnexus_merge.add_argument("--packet", required=True, type=Path)
@@ -3733,6 +3772,11 @@ def render_benchmark_markdown(report: dict[str, object]) -> str:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.command == "gc":
+        cache_dir = args.cache_dir.resolve()
+        removed = sweep_cache_checkouts(cache_dir)
+        print(f"removed {len(removed)} cache checkouts unused for more than a day from {cache_dir}")
+        return 0
     repo = args.repo.resolve()
     if not is_git_repo(repo):
         print(f"not a git repository: {repo}", file=sys.stderr)
