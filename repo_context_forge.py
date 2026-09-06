@@ -2582,14 +2582,17 @@ def make_packet(
     if isinstance(analysis, dict):
         if coverage_gaps:
             gap_text = coverage_gap_text(coverage_gaps)
-            if resolved_required_anchor(analysis, plan):
+            # A path absent from the repository names nothing the graph could cover: it is
+            # reported, never planned, and never blocks.
+            blocking_gaps = [gap for gap in coverage_gaps if gap["kind"] != "absent_file"]
+            if not blocking_gaps or resolved_required_anchor(analysis, plan):
                 coverage_gap_warning = f"intent coverage gaps recorded: {gap_text}"
             else:
                 unresolved = analysis.get("unresolved_checks")
                 if isinstance(unresolved, list):
                     unresolved.extend(
                         {**gap, "status": "coverage_gap"}
-                        for gap in coverage_gaps
+                        for gap in blocking_gaps
                     )
                 analysis["status"] = "blocked"
                 gitnexus_status.update(

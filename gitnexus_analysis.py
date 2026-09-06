@@ -382,11 +382,13 @@ def result_is_resolved(value: object) -> bool:
         return False
     return all(
         isinstance(entry, dict)
-        and entry.get("status") == "resolved"
         and bool(entry.get("kind"))
         and bool(entry.get("file"))
         and bool(entry.get("target"))
-        and bool(entry.get("resolved_identity"))
+        and (
+            (entry.get("status") == "resolved" and bool(entry.get("resolved_identity")))
+            or (entry.get("status") == "unindexed" and entry.get("kind") == "file_context")
+        )
         for entry in entries
     )
 
@@ -435,11 +437,27 @@ def execute(
         return gitnexus_status
 
     repo_name = str(gitnexus_status["repo"])
+    analysis_repo = Path(str(gitnexus_status.get("expected_repo_path") or ""))
     seen: set[tuple[str, str, str, str]] = set()
     resolved_symbols: dict[tuple[str, str], str] = {}
     entries = analysis["entries"]
     unresolved = analysis["unresolved_checks"]
     assert isinstance(entries, list) and isinstance(unresolved, list)
+
+    def unindexed_file(entry: dict[str, object], error: object) -> bool:
+        # GitNexus indexes source files only. A file that exists in the checkout but has no
+        # File node (a lockfile) cannot resolve a file_context check and must not block the
+        # plan; a file that does not exist keeps blocking as the absent-file gap.
+        target = str(entry["target"])
+        if (
+            entry["kind"] != "file_context"
+            or error != f"Symbol 'File:{target}' not found"
+            or not (analysis_repo / target).is_file()
+        ):
+            return False
+        entry.update(status="unindexed", diagnostic="GitNexus does not index this file")
+        return True
+
     for item in plan:
         key = _check_key(item)
         if key in seen:
@@ -515,7 +533,8 @@ def execute(
                 else proc.stderr.strip() or "GitNexus returned malformed output"
             )
             entry["diagnostic"] = diagnostic[:1000]
-            unresolved.append(dict(entry))
+            if not unindexed_file(entry, payload.get("error") if isinstance(payload, dict) else None):
+                unresolved.append(dict(entry))
             continue
 
         entity = payload.get("symbol") if kind.endswith("context") else payload.get("target")

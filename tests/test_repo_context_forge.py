@@ -161,10 +161,10 @@ class RepoContextForgeTests(unittest.TestCase):
                 cleanup()
         return changed.is_set(), result, packet
 
-    def assert_public_intent_gap(self, intent: str, gap: dict[str, object], marker: str) -> None:
+    def assert_public_intent_gap(self, intent: str, gap: dict[str, object], marker: str, *, blocks: bool = True) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent=intent, top=1)
-        self.assertEqual((result.returncode == 0, packet["coverage_gaps"], packet["gitnexus"]["required_checks_resolved"]), (False, [gap], False), marker)
+        self.assertEqual((result.returncode == 0, packet["coverage_gaps"], packet["gitnexus"]["required_checks_resolved"]), (not blocks, [gap], not blocks), marker)
 
     def run_off_mode_bootstrap(
         self,
@@ -474,18 +474,18 @@ class RepoContextForgeTests(unittest.TestCase):
                     "PROSE_TERM_RELEVANCE_RESOLVED_FALSE_SEAM",
                 )
 
-    def test_public_bootstrap_blocks_absent_root_file(self) -> None:
+    def test_public_bootstrap_reports_absent_root_file(self) -> None:
         for path in ("workflow_documents.py", "CLAUDE.md"):
-            self.assert_public_intent_gap(f"Update {path} behavior", {"kind": "absent_file", "reference": path, "candidates": []}, "ROOT_EXACT_FILE_NOT_ABSENT_FILE")
+            self.assert_public_intent_gap(f"Update {path} behavior", {"kind": "absent_file", "reference": path, "candidates": []}, "ROOT_EXACT_FILE_NOT_ABSENT_FILE", blocks=False)
 
-    def test_public_bootstrap_blocks_backticked_absent_root_file(self) -> None:
-        self.assert_public_intent_gap("Update `missing.py` behavior", {"kind": "absent_file", "reference": "missing.py", "candidates": []}, "BACKTICK_ROOT_FILE_NOT_ABSENT_FILE")
+    def test_public_bootstrap_reports_backticked_absent_root_file(self) -> None:
+        self.assert_public_intent_gap("Update `missing.py` behavior", {"kind": "absent_file", "reference": "missing.py", "candidates": []}, "BACKTICK_ROOT_FILE_NOT_ABSENT_FILE", blocks=False)
 
-    def test_public_bootstrap_blocks_hidden_absent_root_file(self) -> None:
-        self.assert_public_intent_gap("Update `.env` behavior", {"kind": "absent_file", "reference": ".env", "candidates": []}, "HIDDEN_ROOT_FILE_NOT_ABSENT_FILE")
+    def test_public_bootstrap_reports_hidden_absent_root_file(self) -> None:
+        self.assert_public_intent_gap("Update `.env` behavior", {"kind": "absent_file", "reference": ".env", "candidates": []}, "HIDDEN_ROOT_FILE_NOT_ABSENT_FILE", blocks=False)
 
-    def test_public_bootstrap_blocks_punctuated_absent_root_file(self) -> None:
-        self.assert_public_intent_gap("Update missing.py.", {"kind": "absent_file", "reference": "missing.py", "candidates": []}, "PUNCTUATED_ROOT_FILE_NOT_ABSENT_FILE")
+    def test_public_bootstrap_reports_punctuated_absent_root_file(self) -> None:
+        self.assert_public_intent_gap("Update missing.py.", {"kind": "absent_file", "reference": "missing.py", "candidates": []}, "PUNCTUATED_ROOT_FILE_NOT_ABSENT_FILE", blocks=False)
 
     def test_public_bootstrap_does_not_treat_ambiguous_slash_as_file(self) -> None:
         for intent in ("Update premise/occurrence checks", "Update missing/tool behavior", "Update missing/Makefile behavior"):
@@ -497,9 +497,20 @@ class RepoContextForgeTests(unittest.TestCase):
                 _result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent=intent, top=1)
             self.assertFalse(any(gap.get("kind") == "absent_file" for gap in packet["coverage_gaps"]), "CREATION_PATH_REPORTED_ABSENT_FILE")
 
-    def test_public_bootstrap_blocks_absent_exact_file(self) -> None:
+    def test_public_bootstrap_does_not_block_on_an_absent_intent_path(self) -> None:
+        marker = "ABSENT_INTENT_PATH_BLOCKS"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent="Update src/missing.py behavior", top=1)
+        planned = {item["path"] for item in packet["targets"]} | {item["file"] for item in packet["gitnexus_plan"]}
+        self.assertEqual(
+            (result.returncode, [gap["kind"] for gap in packet["coverage_gaps"]], packet["gitnexus"]["required_checks_resolved"], "src/missing.py" in planned),
+            (0, ["absent_file"], True, False),
+            marker + ": " + (result.stderr[-400:] if result.returncode else ""),
+        )
+
+    def test_public_bootstrap_reports_absent_exact_file(self) -> None:
         for reference, path, marker in (("src/missing.py", "src/missing.py", "ABSENT_EXACT_FILE_REPORTED_RESOLVED"), ("src/Makefile", "src/Makefile", "EXTENSIONLESS_ABSENT_FILE_REPORTED_RESOLVED"), ("missing/missing.py", "missing/missing.py", "MISSING_PARENT_ABSENT_FILE_REPORTED_OTHER_GAP"), ("missing/missing.py.", "missing/missing.py", "PUNCTUATED_MISSING_FILE_REPORTED_OTHER_GAP"), ("`missing/missing.py`", "missing/missing.py", "EXPLICIT_DOTTED_ABSENT_FILE_REPORTED_OTHER_GAP"), ("`missing/tool`", "missing/tool", "EXPLICIT_LOWERCASE_ABSENT_FILE_REPORTED_OTHER_GAP"), ("`missing/Makefile`", "missing/Makefile", "EXPLICIT_EXTENSIONLESS_ABSENT_FILE_REPORTED_OTHER_GAP")):
-            self.assert_public_intent_gap(f"Update {reference} behavior", {"kind": "absent_file", "reference": path, "candidates": []}, marker)
+            self.assert_public_intent_gap(f"Update {reference} behavior", {"kind": "absent_file", "reference": path, "candidates": []}, marker, blocks=False)
 
     def test_public_bootstrap_requires_all_explicit_replay_symbols(self) -> None:
         required_names = {
@@ -1012,6 +1023,25 @@ class RepoContextForgeTests(unittest.TestCase):
             result.returncode == 0 and status.get("status") == "blocked"
             and status.get("reindex_attempted") is False,
             "CONTEXTVAR_TRANSACTION_OWNERSHIP_ESCAPED")
+
+    def test_public_bootstrap_does_not_block_on_a_symbolless_intent_named_file(self) -> None:
+        marker = "LOCKFILE_BLOCKS_GRAPH"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            lockfile = repo / "package-lock.json"
+            lockfile.write_text('{"name": "app", "lockfileVersion": 3, "packages": {}}\n', encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "package-lock.json"], cwd=repo)
+            repo_context_forge.run_cmd(["git", "commit", "-q", "-m", "lockfile"], cwd=repo)
+            lockfile.write_text('{"name": "app", "lockfileVersion": 3, "packages": {"": {}}}\n', encoding="utf-8")
+
+            result, packet = self.run_public_bootstrap(
+                repo, cache_dir, runtime_home, mode="local",
+                intent="Bump the dependency recorded in package-lock.json", gitnexus_mode="auto")
+
+            status = packet.get("gitnexus", {})
+            self.assertEqual(
+                (result.returncode, status.get("required_checks_resolved"), status.get("missing_required_symbols")),
+                (0, True, []),
+                marker + ": " + (result.stderr[-400:] if result.returncode else repo_context_forge.json.dumps(status)[:400]))
 
     def test_public_bootstrap_blocks_graph_time_candidate_mutation(self) -> None:
         marker = "GRAPH_TIME_CANDIDATE_MUTATION_VALIDATED_FOR_WRONG_REASON"
@@ -1700,7 +1730,8 @@ class RepoContextForgeTests(unittest.TestCase):
                 top=1,
             )
 
-            self.assertNotEqual(explicit_result.returncode, 0, explicit_result.stdout)
+            self.assertEqual(explicit_result.returncode, 0, explicit_result.stdout or explicit_result.stderr)
+            explicit_analysis = explicit_packet["gitnexus"]["analysis"]
             self.assertEqual(
                 (
                     [target["path"] for target in explicit_packet["targets"]],
@@ -1709,14 +1740,18 @@ class RepoContextForgeTests(unittest.TestCase):
                         for item in explicit_packet["gitnexus_plan"]
                     ],
                     [
-                        (item["kind"], item["file"], item["target"])
-                        for item in explicit_packet["gitnexus"]["analysis"]["unresolved_checks"]
+                        (item["kind"], item["file"], item["target"], item["status"])
+                        for item in explicit_analysis["entries"]
                     ],
+                    explicit_analysis["unresolved_checks"],
+                    explicit_packet["gitnexus"]["required_checks_resolved"],
                 ),
                 (
                     [go_sum],
                     [("file_context", go_sum, go_sum, True)],
-                    [("file_context", go_sum, go_sum)],
+                    [("file_context", go_sum, go_sum, "unindexed")],
+                    [],
+                    True,
                 ),
             )
 
