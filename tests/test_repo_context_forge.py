@@ -1755,6 +1755,52 @@ class RepoContextForgeTests(unittest.TestCase):
                 ),
             )
 
+    def test_public_bootstrap_resolves_an_ambiguous_symbol_by_its_single_function_candidate(self) -> None:
+        marker = "AMBIGUOUS_SYMBOL_BLOCKS"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "model.py").write_text(
+                "from dataclasses import dataclass\n\n\n"
+                "def pass_condition(kind: str) -> dict:\n    return {\"kind\": kind}\n\n\n"
+                "@dataclass\nclass Finding:\n    pass_condition: dict\n",
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "shared name"])
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, intent="Update pass_condition in src/model.py", top=1)
+        analysis = packet["gitnexus"]["analysis"]
+        identities = {
+            (entry["kind"], entry["status"], entry.get("resolved_identity"))
+            for entry in analysis["entries"] if entry["target"] == "pass_condition"
+        }
+        self.assertEqual(
+            (result.returncode, packet["gitnexus"]["required_checks_resolved"], analysis["unresolved_checks"], identities),
+            (0, True, [], {
+                ("symbol_context", "resolved", "Function:src/model.py:pass_condition"),
+                ("symbol_impact", "resolved", "Function:src/model.py:pass_condition"),
+            }),
+            marker + ": " + (result.stderr[-400:] if result.returncode else ""),
+        )
+
+    def test_public_bootstrap_keeps_blocking_an_ambiguous_symbol_with_two_eligible_candidates(self) -> None:
+        marker = "AMBIGUOUS_MULTI_CANDIDATE_RESOLVED"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "job.py").write_text(
+                "def finalize_batch() -> int:\n    return 1\n\n\n"
+                "class Job:\n    def finalize_batch(self) -> int:\n        return 2\n",
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "function and method"])
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, intent="Update finalize_batch in src/job.py", top=1)
+        unresolved = {(item["kind"], item["target"]) for item in packet["gitnexus"]["analysis"]["unresolved_checks"]}
+        self.assertEqual(
+            (result.returncode == 0, packet["gitnexus"]["required_checks_resolved"], ("symbol_context", "finalize_batch") in unresolved),
+            (False, False, True),
+            marker,
+        )
+
     def test_public_bootstrap_resolves_when_intent_names_future_symbol(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             (repo / "src" / "db.py").write_text(

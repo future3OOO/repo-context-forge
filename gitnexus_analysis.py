@@ -458,6 +458,53 @@ def execute(
         entry.update(status="unindexed", diagnostic="GitNexus does not index this file")
         return True
 
+    def graph_reply(entry: dict[str, object], command: list[str]) -> dict[str, object] | None:
+        """One bounded GitNexus call: its JSON reply, or None with the diagnostic recorded.
+
+        A structured error reply is returned as-is so the caller can classify it."""
+        try:
+            proc = run_command(
+                command,
+                allow_fail=True,
+                suppress_core_dump=True,
+                capture_output_to_file=True,
+                timeout=max(0.0, min(CALL_TIMEOUT_SECONDS, TOTAL_TIMEOUT_SECONDS - (time.monotonic() - started))),
+            )
+        except subprocess.TimeoutExpired:
+            entry["diagnostic"] = "GitNexus check timed out"
+            return None
+        analysis["process_count"] = int(analysis["process_count"]) + 1
+        analysis["graph_call_count"] = int(analysis["graph_call_count"]) + 1
+        output_bytes = len(proc.stdout.encode("utf-8")) + len(proc.stderr.encode("utf-8"))
+        analysis["output_bytes"] = int(analysis["output_bytes"]) + output_bytes
+        if output_bytes > MAX_OUTPUT_BYTES:
+            entry["diagnostic"] = "GitNexus check output exceeded the byte limit"
+            return None
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            payload = None
+        if proc.returncode != 0 or not isinstance(payload, dict) or payload.get("error"):
+            structured = isinstance(payload, dict) and bool(payload.get("error"))
+            diagnostic = str(payload.get("error")) if structured else proc.stderr.strip() or "GitNexus returned malformed output"
+            entry["diagnostic"] = diagnostic[:1000]
+            return payload if structured else None
+        return payload
+
+    def single_eligible_candidate(payload: dict[str, object], file_path: str) -> str | None:
+        # GitNexus answers "ambiguous" when a name is shared inside one file (a module
+        # function and a dataclass field, say); the planned symbol is the one
+        # Function/Class/Method candidate in the planned file, re-queried by uid.
+        candidates = payload.get("candidates")
+        eligible = [
+            str(candidate["uid"])
+            for candidate in (candidates if isinstance(candidates, list) else [])
+            if isinstance(candidate, dict)
+            and str(candidate.get("filePath") or "") == file_path
+            and str(candidate.get("uid") or "").split(":", 1)[0] in {"Function", "Class", "Method"}
+        ]
+        return eligible[0] if len(eligible) == 1 else None
+
     for item in plan:
         key = _check_key(item)
         if key in seen:
@@ -502,40 +549,21 @@ def execute(
             entry["diagnostic"] = f"unsupported GitNexus check kind: {kind}"
             unresolved.append(dict(entry))
             continue
-        try:
-            proc = run_command(
-                command,
-                allow_fail=True,
-                suppress_core_dump=True,
-                capture_output_to_file=True,
-                timeout=min(CALL_TIMEOUT_SECONDS, TOTAL_TIMEOUT_SECONDS - elapsed),
-            )
-        except subprocess.TimeoutExpired:
-            entry["diagnostic"] = "GitNexus check timed out"
-            unresolved.append(dict(entry))
-            continue
-        analysis["process_count"] = int(analysis["process_count"]) + 1
-        analysis["graph_call_count"] = int(analysis["graph_call_count"]) + 1
-        output_bytes = len(proc.stdout.encode("utf-8")) + len(proc.stderr.encode("utf-8"))
-        analysis["output_bytes"] = int(analysis["output_bytes"]) + output_bytes
-        if output_bytes > MAX_OUTPUT_BYTES:
-            entry["diagnostic"] = "GitNexus check output exceeded the byte limit"
-            unresolved.append(dict(entry))
-            continue
-        try:
-            payload = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            payload = None
-        if proc.returncode != 0 or not isinstance(payload, dict) or payload.get("error"):
-            diagnostic = (
-                str(payload.get("error"))
-                if isinstance(payload, dict) and payload.get("error")
-                else proc.stderr.strip() or "GitNexus returned malformed output"
-            )
-            entry["diagnostic"] = diagnostic[:1000]
-            if not unindexed_file(entry, payload.get("error") if isinstance(payload, dict) else None):
+        payload = graph_reply(entry, command)
+        if payload is None or payload.get("error"):
+            if not unindexed_file(entry, payload.get("error") if payload else None):
                 unresolved.append(dict(entry))
             continue
+        if kind == "symbol_context" and payload.get("status") == "ambiguous":
+            uid = single_eligible_candidate(payload, file_path)
+            if uid is None:
+                entry["diagnostic"] = "GitNexus result is ambiguous and no single candidate matches the planned file"
+                unresolved.append(dict(entry))
+                continue
+            payload = graph_reply(entry, [binary, "context", "-r", repo_name, "-u", uid])
+            if payload is None or payload.get("error"):
+                unresolved.append(dict(entry))
+                continue
 
         entity = payload.get("symbol") if kind.endswith("context") else payload.get("target")
         if not isinstance(entity, dict):
