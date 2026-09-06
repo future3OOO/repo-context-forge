@@ -56,6 +56,8 @@ silently switch to sibling worktrees.
   request.
 - `repo` mode maps a clean current project folder for ambient whole-repo
   context.
+- cache checkouts unused for more than a day are deleted by the next run;
+  `gc` deletes them on demand.
 - native ranking combines changed hunks, production/test role, workflow-index
   relevance, optional SoulForge graph/co-change data, semantic summaries, and
   task refresh signals.
