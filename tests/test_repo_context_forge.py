@@ -1523,9 +1523,29 @@ class RepoContextForgeTests(unittest.TestCase):
                         "PROSE_NAME_BLOCKED_AS_SYMBOL",
                     )
 
+    def test_workflow_index_does_not_require_joined_prose(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            native_index = self.build_workflow_index(repo)
+            for prose in (
+                "Review this work here.I've left another agent in charge.",
+                "The agent is an idiot.You need to take over.",
+                "This is code we're shipping.No more delays.",
+                "The parser has an issue then.If that's the case, resolve it.",
+            ):
+                with self.subTest(prose=prose):
+                    resolution = native_index.resolve_intent(f"Update src/a.py. {prose}")
+                    self.assertEqual(
+                        resolution.coverage_gaps, (), "JOINED_PROSE_REQUIRED_AS_CODE")
+
     def test_public_bootstrap_blocks_absent_qualified_symbol(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             for intent, reference, marker in (
+                ("src.a.MissingAnchor", "src.a.MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
+                ("Inspect src.a.MissingAnchor() next", "src.a.MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
+                ("Review `src.a.MissingAnchor` next", "src.a.MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
+                ("Fix src.a.MissingAnchor before shipping", "src.a.MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
                 ("Update src.a.MissingAnchor behavior", "src.a.MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
                 ("Update MissingAnchor behavior", "MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
                 ("Update MissingAnchor", "MissingAnchor", "DIRECT_ABSENT_IDENTIFIER_CONTRACT_REGRESSED"),
