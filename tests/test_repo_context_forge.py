@@ -5429,6 +5429,50 @@ class SoulforgeGitignoreCleanupTests(unittest.TestCase):
         repo_context_forge.cleanup_soulforge_gitignore_change(repo)
         self.assertEqual(self.dirty(repo), " M .gitignore\n")
 
+    def untracked_case(self, content: bytes):
+        """The shape real indexing leaves: a .gitignore the repository never had,
+        so the repository is committed without one and the file appears after."""
+        repo = Path(tempfile.mkdtemp(prefix="rcf-untracked-gitignore-"))
+        self.addCleanup(shutil.rmtree, repo, True)
+        for args in (["init", "-q"], ["config", "user.email", "t@example.com"],
+                     ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", str(repo), *args], check=True)
+        (repo / "app.py").write_text("def compute():\n    return 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "app.py"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        # The baseline is the tree BEFORE indexing writes anything, which is what
+        # make_packet fixes as expected_candidate_tree.
+        before = repo_context_forge.candidate_tree(repo)
+        (repo / ".gitignore").write_bytes(content)
+        repo_context_forge.cleanup_soulforge_gitignore_change(repo)
+        path = repo / ".gitignore"
+        return before, path
+
+    def test_removes_an_untracked_cache_only_gitignore(self) -> None:
+        marker = "CACHE_ONLY_GITIGNORE_SURVIVES_CLEANUP"
+        before, path = self.untracked_case(b".gitnexus\n")
+        self.assertFalse(path.exists(), marker)
+        self.assertEqual(
+            repo_context_forge.candidate_tree(path.parent), before, marker)
+
+    def test_keeps_an_untracked_gitignore_carrying_a_real_rule(self) -> None:
+        marker = "MIXED_GITIGNORE_REWRITTEN"
+        content = b".gitnexus\n*.log\n"
+        _before, path = self.untracked_case(content)
+        self.assertEqual(path.read_bytes(), content, marker)
+
+    def test_keeps_untracked_comment_only_and_blank_only_gitignores(self) -> None:
+        marker = "COMMENT_OR_BLANK_GITIGNORE_REMOVED"
+        for content in (b"# mine\n", b"\n\n"):
+            _before, path = self.untracked_case(content)
+            self.assertEqual(path.read_bytes(), content, marker + f": {content!r}")
+
+    def test_keeps_an_untracked_non_utf8_gitignore(self) -> None:
+        marker = "NON_UTF8_GITIGNORE_MANGLED_OR_RAISED"
+        content = b".gitnexus\ncaf\xe9/\n"
+        _before, path = self.untracked_case(content)
+        self.assertEqual(path.read_bytes(), content, marker)
+
 
 if __name__ == "__main__":
     unittest.main()

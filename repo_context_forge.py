@@ -368,6 +368,11 @@ def cleanup_soulforge_gitignore_change(repo: Path) -> None:
         removed = []
     if added and not removed and all(line in tool_cache_lines for line in added):
         run_git(repo, ["checkout", "--", ".gitignore"])
+    elif not run_git(repo, ["ls-files", "--", ".gitignore"]):
+        path = repo / ".gitignore"
+        lines = path.read_bytes().splitlines()
+        if lines and set(lines) <= {line.encode() for line in tool_cache_lines}:
+            remove_path(path)
 
 
 def is_dirty(repo: Path, *, ignore_tool_cache: bool = False) -> bool:
