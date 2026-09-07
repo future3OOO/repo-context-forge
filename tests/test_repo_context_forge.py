@@ -1132,6 +1132,75 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertIn("candidate analysis transaction is already running", result.stderr,
                           "PACKET_CONTENTION_REGRESSED")
 
+    def candidate_lock_run(self, slot_for_lock: bool, repo, cache_dir, runtime_home):
+        """Hold the real lock for one slot, then run a candidate bootstrap."""
+        head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+        analysis_repo, _key = repo_context_forge.analysis_checkout_path(
+            repo, head, Path(cache_dir), "local", candidate_slot=slot_for_lock)
+        lock_path = repo_context_forge.gitnexus_analysis.analysis_transaction_path(
+            analysis_repo)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, candidate_slot=True)
+
+    def test_a_held_candidate_lock_blocks_a_candidate_run(self) -> None:
+        marker = "CANDIDATE_WORK_UNPROTECTED_BY_ITS_OWN_LOCK"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            result, _packet = self.candidate_lock_run(True, repo, cache_dir, runtime_home)
+            self.assertNotEqual(result.returncode, 0, marker)
+            self.assertIn("candidate analysis transaction is already running",
+                          result.stderr, marker)
+
+    def test_a_held_ordinary_lock_does_not_block_a_candidate_run(self) -> None:
+        marker = "ORDINARY_LOCK_SERIALIZES_THE_CANDIDATE_SLOT"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            result, _packet = self.candidate_lock_run(False, repo, cache_dir, runtime_home)
+            self.assertEqual(result.returncode, 0, marker + result.stderr[-400:])
+
+    def test_one_candidate_slot_serves_every_mode_a_pass_reruns_in(self) -> None:
+        """A pass reruns in a different mode as its tree goes clean to dirty. The
+        candidate must be a different physical checkout from the one the pass
+        started with, each mode must keep its own file selection, and switching
+        mode must not mint a second candidate."""
+        marker = "CANDIDATE_SLOT_NOT_SHARED_ACROSS_MODES"
+        with tempfile.TemporaryDirectory() as root:
+            repo, cache = Path(root) / "repo", Path(root) / "cache"
+            repo.mkdir()
+            self.make_git_repo(repo)
+            head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+
+            pr_plain = repo_context_forge.resolve_target_state(
+                repo, "pr", "HEAD", "HEAD", cache, False)
+            pr_candidate = repo_context_forge.resolve_target_state(
+                repo, "pr", "HEAD", "HEAD", cache, True)
+            self.assertNotEqual(
+                pr_candidate.analysis_repo, pr_plain.analysis_repo, marker)
+            self.assertEqual(pr_candidate.mode, "pr", marker)
+
+            local_candidate = repo_context_forge.resolve_target_state(
+                repo, "local", "HEAD", "HEAD", cache, True)
+            self.assertEqual(
+                local_candidate.analysis_repo, pr_candidate.analysis_repo,
+                marker + ": switching mode minted a second candidate")
+            self.assertEqual(local_candidate.mode, "local", marker)
+
+            candidates = [
+                path for directory in repo_context_forge.CACHE_CHECKOUT_DIRS
+                for path in (cache / directory).glob(f"{repo.name}-{head[:12]}-*")
+                if path.resolve() == pr_candidate.analysis_repo
+            ]
+            self.assertEqual(len(candidates), 1, marker + f": {candidates}")
+
+            # The lock the decorator would take names that one candidate checkout.
+            self.assertEqual(
+                repo_context_forge.gitnexus_analysis.analysis_transaction_path(
+                    pr_candidate.analysis_repo),
+                repo_context_forge.gitnexus_analysis.analysis_transaction_path(
+                    local_candidate.analysis_repo),
+                marker + ": the two modes would lock different candidate paths")
+
     def test_standalone_refresh_contends_with_packet_transaction(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             result, packet = self.run_public_intent_bootstrap(

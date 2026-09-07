@@ -195,8 +195,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--gitnexus-mode", choices=["off", "check", "auto"], default="auto")
     parser.add_argument(
         "--candidate-slot", action="store_true",
-        help="local and intent modes: index into the candidate slot, leaving the "
-             "checkout an earlier intake built resolvable under its own selector")
+        help="index into this pass's candidate slot, leaving the checkout an "
+             "earlier intake built resolvable under its own selector")
     parser.add_argument("--enforce-intake", action="store_true")
     parser.add_argument("--allow-stale-pr-head", action="store_true")
     parser.add_argument("--out", type=Path)

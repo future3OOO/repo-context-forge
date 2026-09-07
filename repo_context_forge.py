@@ -535,13 +535,18 @@ def analysis_checkout_path(
 ) -> tuple[Path, str]:
     """Map repo, head and mode to a cache-owned checkout and its GitNexus selector.
 
-    `candidate_slot` selects a second checkout for the same three, so a later
-    intake does not re-populate the one an earlier intake indexed. There are only
-    ever these two; the value is internal, and the existing sweep reclaims both.
+    `candidate_slot` selects one further checkout per repo and head, so a later
+    intake does not re-populate the one an earlier intake indexed. It is
+    deliberately mode-independent: one pass reruns in a different mode as its tree
+    goes from clean to dirty, and a candidate per mode would grow the cache by one
+    checkout per mode rather than one per pass. Unset, every mode keeps its own
+    key and directory unchanged.
     """
-    extra = "repo-analysis" if mode == "repo" else "local-analysis" if mode != "pr" else ""
     if candidate_slot:
-        extra = f"{extra}-candidate" if extra else "candidate"
+        key = cache_key_for(repo, head_sha, "candidate")
+        return (cache_dir / "analysis-worktrees"
+                / f"{repo.name}-{head_sha[:12]}-{key}").resolve(), key
+    extra = "repo-analysis" if mode == "repo" else "local-analysis" if mode != "pr" else ""
     key = cache_key_for(repo, head_sha, extra)
     directory = "worktrees" if mode == "pr" else "analysis-checkouts" if mode == "repo" else "analysis-worktrees"
     return (cache_dir / directory / f"{repo.name}-{head_sha[:12]}-{key}").resolve(), key
@@ -804,9 +809,12 @@ def ensure_cached_checkout(source_repo: Path, head_sha: str, checkout: Path, cac
         remove_path(checkout / ".gitnexus")
 
 
-def ensure_pr_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
+def ensure_pr_worktree(
+    source_repo: Path, head_ref: str, cache_dir: Path, candidate_slot: bool = False,
+) -> TargetState:
     head_sha = run_git(source_repo, ["rev-parse", head_ref])
-    worktree, key = analysis_checkout_path(source_repo, head_sha, cache_dir, "pr")
+    worktree, key = analysis_checkout_path(
+        source_repo, head_sha, cache_dir, "pr", candidate_slot)
 
     ensure_cached_checkout(source_repo, head_sha, worktree, cache_dir)
     cleanup_soulforge_gitignore_change(worktree)
@@ -827,9 +835,12 @@ def ensure_pr_worktree(source_repo: Path, head_ref: str, cache_dir: Path) -> Tar
     )
 
 
-def ensure_repo_analysis_checkout(source_repo: Path, head_ref: str, cache_dir: Path) -> TargetState:
+def ensure_repo_analysis_checkout(
+    source_repo: Path, head_ref: str, cache_dir: Path, candidate_slot: bool = False,
+) -> TargetState:
     head_sha = run_git(source_repo, ["rev-parse", head_ref])
-    checkout, key = analysis_checkout_path(source_repo, head_sha, cache_dir, "repo")
+    checkout, key = analysis_checkout_path(
+        source_repo, head_sha, cache_dir, "repo", candidate_slot)
 
     ensure_cached_checkout(source_repo, head_sha, checkout, cache_dir)
     cleanup_soulforge_gitignore_change(checkout)
@@ -884,7 +895,7 @@ def resolve_target_state(
 ) -> TargetState:
     source_repo = repo_root(repo)
     if mode == "pr":
-        target = ensure_pr_worktree(source_repo, head_ref, cache_dir)
+        target = ensure_pr_worktree(source_repo, head_ref, cache_dir, candidate_slot)
         return TargetState(
             mode=target.mode,
             source_repo=target.source_repo,
@@ -898,7 +909,7 @@ def resolve_target_state(
         )
 
     if mode == "repo":
-        target = ensure_repo_analysis_checkout(source_repo, head_ref, cache_dir)
+        target = ensure_repo_analysis_checkout(source_repo, head_ref, cache_dir, candidate_slot)
         return TargetState(
             mode=target.mode,
             source_repo=target.source_repo,
@@ -2442,8 +2453,11 @@ def candidate_analysis_transaction(function):
         arguments = signature.bind(*args, **kwargs).arguments
         source_repo = repo_root(Path(arguments["repo"]))
         head_sha = run_git(source_repo, ["rev-parse", str(arguments["head_ref"])])
+        # The lock must name the checkout the body mutates, so it takes the same
+        # slot decision the resolver does.
         analysis_repo, _key = analysis_checkout_path(
-            source_repo, head_sha, Path(arguments["cache_dir"]), arguments["mode"])
+            source_repo, head_sha, Path(arguments["cache_dir"]), arguments["mode"],
+            bool(arguments.get("candidate_slot")))
         with gitnexus_analysis.analysis_transaction(
             gitnexus_analysis.analysis_transaction_path(analysis_repo)
         ):
@@ -3640,8 +3654,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     analyze.add_argument("--mode", choices=["pr", "local", "intent", "repo"], default="pr")
     analyze.add_argument(
         "--candidate-slot", action="store_true",
-        help="local and intent modes: index into the candidate slot, leaving the "
-             "checkout an earlier intake built resolvable under its own selector")
+        help="index into this pass's candidate slot, leaving the checkout an "
+             "earlier intake built resolvable under its own selector")
     analyze.add_argument("--base", default="main")
     analyze.add_argument("--head", default="HEAD")
     analyze.add_argument("--intent")
