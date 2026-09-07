@@ -67,6 +67,170 @@ class TrackedConnection:
 
 
 class RepoContextForgeTests(unittest.TestCase):
+    def detect_changes(self, selector: str, worktree: Path, runtime_home: str):
+        return repo_context_forge.run_cmd(
+            ["gitnexus", "detect-changes", "-r", selector, "--worktree", str(worktree)],
+            env={**os.environ, "HOME": runtime_home}, allow_fail=True)
+
+    def test_the_candidate_slot_is_a_separate_checkout_and_selector(self) -> None:
+        marker = "CANDIDATE_SLOT_NOT_A_SEPARATE_SLOT"
+        with tempfile.TemporaryDirectory() as cache_dir:
+            repo, head, cache = Path("/repo"), "0" * 40, Path(cache_dir)
+            plain = repo_context_forge.analysis_checkout_path(repo, head, cache, "local")
+            slotted = repo_context_forge.analysis_checkout_path(
+                repo, head, cache, "local", candidate_slot=True)
+            self.assertNotEqual(plain[1], slotted[1], marker)
+            self.assertNotEqual(plain[0], slotted[0], marker)
+            self.assertEqual(plain[0].parent, slotted[0].parent, marker)
+
+    def test_an_unslotted_selector_is_unchanged_for_every_mode(self) -> None:
+        """Every index already on disk was built under these selectors, so an unset
+        slot must still resolve to them. The expected values are the measurement
+        taken from the producer as it stood before the candidate slot existed
+        (9e10481), frozen here: comparing against the installed copy instead would
+        compare this code to itself once it ships."""
+        marker = "UNSLOTTED_SELECTOR_DRIFTED"
+        before = {
+            "pr": ("/cache/worktrees/repo-000000000000-32c186c700e9b827", "32c186c700e9b827"),
+            "repo": ("/cache/analysis-checkouts/repo-000000000000-d7570194426deb44",
+                     "d7570194426deb44"),
+            "local": ("/cache/analysis-worktrees/repo-000000000000-5facef2f95f5e691",
+                      "5facef2f95f5e691"),
+            "intent": ("/cache/analysis-worktrees/repo-000000000000-5facef2f95f5e691",
+                       "5facef2f95f5e691"),
+        }
+        for mode, (expected_path, expected_key) in before.items():
+            path, key = repo_context_forge.analysis_checkout_path(
+                Path("/repo"), "0" * 40, Path("/cache"), mode)
+            self.assertEqual((str(path), key), (expected_path, expected_key), marker + f": {mode}")
+
+    def test_producer_exclusions_are_added_without_destroying_existing_ones(self) -> None:
+        """Driven at ensure_cached_checkout, the owner that populates the checkout,
+        because nothing here needs a packet or an index."""
+        marker = "EXISTING_EXCLUDES_DESTROYED_OR_DUPLICATED"
+        with tempfile.TemporaryDirectory() as root:
+            repo, cache = Path(root) / "repo", Path(root) / "cache"
+            repo.mkdir()
+            self.make_git_repo(repo)
+            head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+            checkout, _key = repo_context_forge.analysis_checkout_path(
+                repo, head, cache, "local")
+            repo_context_forge.ensure_cached_checkout(repo, head, checkout, cache)
+
+            exclude = checkout / ".git" / "info" / "exclude"
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "operator-owned-line\n",
+                encoding="utf-8")
+            repo_context_forge.ensure_cached_checkout(repo, head, checkout, cache)
+
+            lines = exclude.read_text(encoding="utf-8").splitlines()
+            self.assertIn("operator-owned-line", lines, marker)
+            for path in repo_context_forge.TOOL_CACHE_DIRS:
+                self.assertEqual(lines.count(path), 1, marker + f": {path} in {lines}")
+
+            # The exclusion is only useful if the capture's own scan honours it.
+            ledger = checkout / repo_context_forge.workflow_index.INDEX_DIR
+            ledger.mkdir(parents=True, exist_ok=True)
+            (ledger / "workflow-index.sqlite3").write_bytes(bytes(range(64)))
+            self.assertEqual(
+                repo_context_forge.run_git(
+                    checkout, ["ls-files", "--others", "--exclude-standard"]).split(),
+                [], marker + ": the ledger is still visible to git add -A")
+
+    def test_a_pass_keeps_its_baseline_across_candidate_reruns(self) -> None:
+        """The one integrated exercise, because only these obligations need a real
+        index: the pass-start tree survives its own reruns, the producer's ledger is
+        never a gap, the cache gains one slot rather than one per edit, a genuine
+        deletion is still reported, and the source checkout is never written."""
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "a.py").write_text(
+                "def compute():\n    return 0\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "src/a.py"], cwd=repo)
+            repo_context_forge.run_cmd(["git", "commit", "-m", "a real symbol"], cwd=repo)
+            head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+            source_exclude = repo / ".git" / "info" / "exclude"
+            exclude_before = source_exclude.read_bytes() if source_exclude.exists() else b""
+
+            intake, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            self.assertEqual(intake.returncode, 0, intake.stderr[-800:])
+            self.assertIn(
+                packet.get("gitnexus", {}).get("status"), {"fresh", "reindexed"},
+                "ORDINARY_INTAKE_REGRESSED")
+            pass_start, _key = repo_context_forge.analysis_checkout_path(
+                repo, head, Path(cache_dir), "intent")
+            recorded_tree = repo_context_forge.json.loads(
+                (pass_start / ".gitnexus" / "meta.json").read_text(encoding="utf-8")
+            )["indexedTree"]
+            # The ledger is the producer's own, written into its own checkout; no
+            # source repository contains or ignores it.
+            self.assertTrue(
+                (pass_start / repo_context_forge.workflow_index.INDEX_DIR).is_dir(),
+                "LEDGER_NOT_WRITTEN_BY_THE_PRODUCER")
+
+            for value in (1, 2, 3):
+                (repo / "src" / "a.py").write_text(
+                    f"def compute():\n    return {value}\n", encoding="utf-8")
+                rerun, _packet = self.run_public_intent_bootstrap(
+                    repo, cache_dir, runtime_home, candidate_slot=True)
+                self.assertEqual(rerun.returncode, 0, rerun.stderr[-800:])
+
+            after = repo_context_forge.json.loads(
+                (pass_start / ".gitnexus" / "meta.json").read_text(encoding="utf-8")
+            )["indexedTree"]
+            self.assertEqual(after, recorded_tree, "PASS_START_BASELINE_DESTROYED")
+
+            prefix = f"{repo.name}-{head[:12]}-"
+            slots = sorted(
+                path.name for path in (Path(cache_dir) / "analysis-worktrees").iterdir()
+                if path.is_dir() and path.name.startswith(prefix))
+            self.assertEqual(len(slots), 2, "SLOT_COUNT_UNBOUNDED: " + str(slots))
+
+            probe = self.detect_changes(pass_start.name, repo, runtime_home)
+            self.assertEqual(probe.returncode, 0, "LEDGER_CAPTURED_AS_A_GAP: " + probe.stderr[-800:])
+            analysis = repo_context_forge.json.loads(probe.stdout)["analysis"]
+            self.assertEqual(
+                (analysis.get("status"),
+                 [gap.get("path") for gap in analysis.get("gaps") or []]),
+                ("complete", []),
+                "LEDGER_CAPTURED_AS_A_GAP")
+
+            changed = {
+                line[3:] for line in
+                repo_context_forge.porcelain_status(repo).splitlines() if line[3:]
+            }
+            self.assertEqual(changed, {"src/a.py"}, "SOURCE_CHECKOUT_WRITTEN: " + str(sorted(changed)))
+            self.assertFalse(
+                (repo / repo_context_forge.workflow_index.INDEX_DIR).exists(),
+                "SOURCE_CHECKOUT_WRITTEN: the producer wrote its ledger into the source")
+            self.assertEqual(
+                source_exclude.read_bytes() if source_exclude.exists() else b"",
+                exclude_before, "SOURCE_CHECKOUT_WRITTEN")
+
+            # Excluding the producer's own artifacts must not swallow a real
+            # deletion. Assert against changed_symbols, not the whole payload: the
+            # path also appears in gaps, so a string search would pass on a gap.
+            def changed_paths(result):
+                payload = repo_context_forge.json.loads(result.stdout)
+                return [
+                    symbol.get("filePath")
+                    for symbol in payload.get("changed_symbols") or []
+                ]
+
+            self.assertIn(
+                "src/a.py", changed_paths(probe),
+                "TRACKED_DELETION_SWALLOWED: the edited symbol was never attributed")
+            self.assertIn(
+                "compute",
+                [symbol.get("name") for symbol in
+                 repo_context_forge.json.loads(probe.stdout).get("changed_symbols") or []],
+                "TRACKED_DELETION_SWALLOWED: compute was never attributed")
+
+            (repo / "src" / "a.py").unlink()
+            deletion = self.detect_changes(pass_start.name, repo, runtime_home)
+            self.assertEqual(deletion.returncode, 0, deletion.stderr[-800:])
+            self.assertIn(
+                "src/a.py", changed_paths(deletion), "TRACKED_DELETION_SWALLOWED")
+
     def make_git_repo(self, root: Path) -> None:
         repo_context_forge.run_cmd(["git", "init"], cwd=root)
         repo_context_forge.run_cmd(["git", "config", "user.email", "test@example.com"], cwd=root)
@@ -109,7 +273,7 @@ class RepoContextForgeTests(unittest.TestCase):
     def run_public_bootstrap(
         self, repo: Path, cache_dir: str, runtime_home: str, *,
         mode: str, intent: str | None = None, base: str | None = None,
-        top: int = 1, gitnexus_mode: str = "auto",
+        top: int = 1, gitnexus_mode: str = "auto", candidate_slot: bool = False,
     ):
         packet_path = Path(runtime_home) / "packet.json"
         packet_path.unlink(missing_ok=True)
@@ -120,6 +284,8 @@ class RepoContextForgeTests(unittest.TestCase):
             "--gitnexus-mode", gitnexus_mode, "--enforce-intake",
             "--packet-json-out", str(packet_path),
         ]
+        if candidate_slot:
+            command.append("--candidate-slot")
         if intent is not None:
             command.extend(("--intent", intent))
         if base is not None:
@@ -133,10 +299,11 @@ class RepoContextForgeTests(unittest.TestCase):
     def run_public_intent_bootstrap(
         self, repo: Path, cache_dir: str, runtime_home: str, *,
         intent: str = "Update src/a.py", top: int = 1, gitnexus_mode: str = "auto",
+        candidate_slot: bool = False,
     ):
         return self.run_public_bootstrap(
             repo, cache_dir, runtime_home, mode="intent", intent=intent, top=top,
-            gitnexus_mode=gitnexus_mode)
+            gitnexus_mode=gitnexus_mode, candidate_slot=candidate_slot)
 
     def run_public_intent_bootstrap_after(
         self, repo, cache_dir, runtime_home, ready, mutate, cleanup=None):
@@ -964,6 +1131,75 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, "PACKET_CONTENTION_REGRESSED")
             self.assertIn("candidate analysis transaction is already running", result.stderr,
                           "PACKET_CONTENTION_REGRESSED")
+
+    def candidate_lock_run(self, slot_for_lock: bool, repo, cache_dir, runtime_home):
+        """Hold the real lock for one slot, then run a candidate bootstrap."""
+        head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+        analysis_repo, _key = repo_context_forge.analysis_checkout_path(
+            repo, head, Path(cache_dir), "local", candidate_slot=slot_for_lock)
+        lock_path = repo_context_forge.gitnexus_analysis.analysis_transaction_path(
+            analysis_repo)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, candidate_slot=True)
+
+    def test_a_held_candidate_lock_blocks_a_candidate_run(self) -> None:
+        marker = "CANDIDATE_WORK_UNPROTECTED_BY_ITS_OWN_LOCK"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            result, _packet = self.candidate_lock_run(True, repo, cache_dir, runtime_home)
+            self.assertNotEqual(result.returncode, 0, marker)
+            self.assertIn("candidate analysis transaction is already running",
+                          result.stderr, marker)
+
+    def test_a_held_ordinary_lock_does_not_block_a_candidate_run(self) -> None:
+        marker = "ORDINARY_LOCK_SERIALIZES_THE_CANDIDATE_SLOT"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            result, _packet = self.candidate_lock_run(False, repo, cache_dir, runtime_home)
+            self.assertEqual(result.returncode, 0, marker + result.stderr[-400:])
+
+    def test_one_candidate_slot_serves_every_mode_a_pass_reruns_in(self) -> None:
+        """A pass reruns in a different mode as its tree goes clean to dirty. The
+        candidate must be a different physical checkout from the one the pass
+        started with, each mode must keep its own file selection, and switching
+        mode must not mint a second candidate."""
+        marker = "CANDIDATE_SLOT_NOT_SHARED_ACROSS_MODES"
+        with tempfile.TemporaryDirectory() as root:
+            repo, cache = Path(root) / "repo", Path(root) / "cache"
+            repo.mkdir()
+            self.make_git_repo(repo)
+            head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+
+            pr_plain = repo_context_forge.resolve_target_state(
+                repo, "pr", "HEAD", "HEAD", cache, False)
+            pr_candidate = repo_context_forge.resolve_target_state(
+                repo, "pr", "HEAD", "HEAD", cache, True)
+            self.assertNotEqual(
+                pr_candidate.analysis_repo, pr_plain.analysis_repo, marker)
+            self.assertEqual(pr_candidate.mode, "pr", marker)
+
+            local_candidate = repo_context_forge.resolve_target_state(
+                repo, "local", "HEAD", "HEAD", cache, True)
+            self.assertEqual(
+                local_candidate.analysis_repo, pr_candidate.analysis_repo,
+                marker + ": switching mode minted a second candidate")
+            self.assertEqual(local_candidate.mode, "local", marker)
+
+            candidates = [
+                path for directory in repo_context_forge.CACHE_CHECKOUT_DIRS
+                for path in (cache / directory).glob(f"{repo.name}-{head[:12]}-*")
+                if path.resolve() == pr_candidate.analysis_repo
+            ]
+            self.assertEqual(len(candidates), 1, marker + f": {candidates}")
+
+            # The lock the decorator would take names that one candidate checkout.
+            self.assertEqual(
+                repo_context_forge.gitnexus_analysis.analysis_transaction_path(
+                    pr_candidate.analysis_repo),
+                repo_context_forge.gitnexus_analysis.analysis_transaction_path(
+                    local_candidate.analysis_repo),
+                marker + ": the two modes would lock different candidate paths")
 
     def test_standalone_refresh_contends_with_packet_transaction(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):

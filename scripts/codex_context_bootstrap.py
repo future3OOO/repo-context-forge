@@ -193,6 +193,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--allow-empty", action="store_true")
     parser.add_argument("--gitnexus-repo")
     parser.add_argument("--gitnexus-mode", choices=["off", "check", "auto"], default="auto")
+    parser.add_argument(
+        "--candidate-slot", action="store_true",
+        help="index into this pass's candidate slot, leaving the checkout an "
+             "earlier intake built resolvable under its own selector")
     parser.add_argument("--enforce-intake", action="store_true")
     parser.add_argument("--allow-stale-pr-head", action="store_true")
     parser.add_argument("--out", type=Path)
@@ -276,6 +280,7 @@ def main(argv: list[str]) -> int:
         allow_missing_map=not args.require_map,
         gitnexus_repo=args.gitnexus_repo,
         gitnexus_mode=args.gitnexus_mode,
+        candidate_slot=args.candidate_slot,
     )
     return output_packet(packet, args)
 
