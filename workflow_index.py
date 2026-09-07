@@ -440,6 +440,17 @@ class WorkflowIndex:
                 not selected
                 and reference not in created_references
                 and (candidates or reference not in path_bound_references)
+                and (
+                    candidates
+                    or re.search(
+                        rf"(?:`{re.escape(reference)}`|^\s*{re.escape(reference)}[.!?]?\s*$"
+                        rf"|\b(?:update|modify|change|fix|edit|remove|delete)\s+{re.escape(reference)}\b"
+                        rf"|\b{re.escape(reference)}\s*\("
+                        rf"|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
+                        intent,
+                        re.IGNORECASE,
+                    )
+                )
             ):
                 gaps.append(IntentCoverageGap(
                     kind="ambiguous_symbol" if candidates else "absent_symbol",
