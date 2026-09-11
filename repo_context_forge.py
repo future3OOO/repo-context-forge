@@ -711,6 +711,27 @@ def candidate_tree(repo: Path) -> str:
         return run_cmd(["git", "write-tree"], cwd=repo, env=env).stdout.strip()
 
 
+def overlay_source_paths(repo: Path) -> list[str]:
+    """The files that differ from HEAD: what an overlay actually has to copy.
+
+    The analysis checkout is reset to HEAD immediately before the overlay, so
+    every tracked file already holds its committed content and copying it again
+    is pure work. Only what the source worktree changed can differ: paths git
+    reports against HEAD, which covers staged, unstaged and both halves of a
+    rename, plus untracked files. Renames are read from `diff --name-only`
+    rather than porcelain, whose `R old -> new` line is not a path.
+    """
+    changed = split_lines(run_git(repo, ["diff", "--name-only", "HEAD"], allow_fail=True))
+    untracked = split_lines(
+        run_git(repo, ["ls-files", "--others", "--exclude-standard"], allow_fail=True)
+    )
+    return [
+        path
+        for path in unique_ordered([*changed, *untracked])
+        if not is_generated_or_cache_path(path)
+    ]
+
+
 def locally_deleted_files(repo: Path) -> list[str]:
     unstaged = split_lines(
         run_git(repo, ["diff", "--name-only", "--diff-filter=D"], allow_fail=True)
@@ -748,7 +769,7 @@ def overlay_source_worktree(source_repo: Path, analysis_repo: Path) -> None:
         target = analysis_repo / repo_relative_path(path)
         remove_path(target)
 
-    for path in source_worktree_files(source_repo):
+    for path in overlay_source_paths(source_repo):
         relative = repo_relative_path(path)
         source = source_repo / relative
         target = analysis_repo / relative
