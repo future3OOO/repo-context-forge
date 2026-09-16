@@ -2830,6 +2830,14 @@ class RepoContextForgeTests(unittest.TestCase):
     def test_compute_token_budget_respects_explicit_value(self) -> None:
         self.assertEqual(repo_context_forge.compute_token_budget(100_000, 1234), 1234)
 
+    def test_default_token_budget_fits_one_tool_result(self) -> None:
+        # BM_DEFAULT_BUDGET_FITS_DELIVERY_CAP: Codex delivers about 10k tokens of one tool
+        # result and the adapters prepend a ~1.3k-token intake header; a 16k default meant
+        # every full packet arrived truncated with <targets> cut off (CX2 lead, ordinals
+        # 68 and 3676: 13,479 and 14,243 produced, ~10.2k delivered).
+        self.assertEqual(repo_context_forge.compute_token_budget(None, None), 8_000,
+                         "DEFAULT_BUDGET_EXCEEDS_DELIVERY_CAP")
+
     def test_compute_token_budget_expands_for_long_context(self) -> None:
         early = repo_context_forge.compute_token_budget(0, None)
         late = repo_context_forge.compute_token_budget(100_000, None)
@@ -4227,6 +4235,183 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertEqual(impact["exported_symbols_at_risk"][0]["name"], "Handle")
             self.assertEqual(impact["exported_symbols_at_risk"][0]["usage_files"], 3)
 
+    @staticmethod
+    def _soulforge_map_with_refs(
+        repo: Path,
+        files: list[tuple[int, str]],
+        refs: list[tuple[int, str, int | None, str | None]],
+        edges: tuple[tuple[int, int, float, int], ...] = (),
+    ) -> "repo_context_forge.SoulForgeMap":
+        """A minimal repomap.db carrying files, edges and refs rows shaped like SoulForge's."""
+        db_dir = repo / ".soulforge"
+        db_dir.mkdir(exist_ok=True)
+        with closing(sqlite3.connect(db_dir / "repomap.db")) as conn, conn:
+            conn.executescript(
+                """
+                CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT, pagerank REAL,
+                                    symbol_count INTEGER, line_count INTEGER);
+                CREATE TABLE edges (source_file_id INTEGER, target_file_id INTEGER,
+                                    weight REAL, confidence INTEGER);
+                CREATE TABLE cochanges (file_id_a INTEGER, file_id_b INTEGER, count INTEGER);
+                CREATE TABLE symbols (id INTEGER PRIMARY KEY, file_id INTEGER, name TEXT, kind TEXT,
+                                      line INTEGER, end_line INTEGER, is_exported INTEGER, signature TEXT);
+                CREATE TABLE refs (file_id INTEGER, name TEXT, source_file_id INTEGER, import_source TEXT);
+                CREATE TABLE calls (caller_symbol_id INTEGER, callee_name TEXT, callee_symbol_id INTEGER,
+                                    callee_file_id INTEGER, line INTEGER);
+                """
+            )
+            conn.executemany(
+                "INSERT INTO files VALUES (?, ?, 0.1, 1, 20)", files)
+            conn.executemany("INSERT INTO edges VALUES (?, ?, ?, ?)", list(edges))
+            conn.executemany("INSERT INTO refs VALUES (?, ?, ?, ?)", refs)
+        return repo_context_forge.SoulForgeMap(repo)
+
+    def test_soulforge_dependents_resolve_native_python_import_refs(self) -> None:
+        # BM_NATIVE_INDEX_IMPORT_DEPENDENTS: the index is a real SoulForge 2.13.2 product,
+        # and the expected importers are the corpus's own import statements (absolute, plain,
+        # aliased, relative, parent-relative, multi-name, package-form, __init__ importer, and a
+        # package re-export name that must bind to __init__.py rather than a submodule).
+        fixture = Path(__file__).parent / "fixtures" / "soulforge_python_imports.sql"
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            (repo / ".soulforge").mkdir()
+            with closing(sqlite3.connect(repo / ".soulforge" / "repomap.db")) as conn, conn:
+                conn.executescript(fixture.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM refs WHERE import_source IS NOT NULL "
+                                 "AND source_file_id IS NOT NULL").fetchone()[0],
+                    0, "fixture provenance: the producer resolved no Python import")
+            soul_map = repo_context_forge.SoulForgeMap(repo)
+
+            alpha = soul_map.impact_summary_for_file("pkg/lib/alpha.py")
+            self.assertEqual(alpha["direct_dependents"], 6, "NATIVE_IMPORT_DEPENDENTS_NOT_COUNTED")
+            self.assertEqual(
+                {entry["path"] for entry in alpha["dependents"]},
+                {"pkg/eta.py", "pkg/gamma.py", "pkg/lib/__init__.py", "pkg/lib/beta.py", "pkg/sub/delta.py", "tools/run-it.py"},
+                "NATIVE_IMPORT_DEPENDENTS_NOT_COUNTED",
+            )
+            package = soul_map.impact_summary_for_file("pkg/lib/__init__.py")
+            self.assertIn("pkg/theta.py", {entry["path"] for entry in package["dependents"]},
+                          "NATIVE_IMPORT_DEPENDENTS_NOT_COUNTED")
+            self.assertNotIn("pkg/theta.py", {entry["path"] for entry in alpha["dependents"]},
+                             "NATIVE_IMPORT_DEPENDENTS_NOT_COUNTED")
+            beta = soul_map.impact_summary_for_file("pkg/lib/beta.py")
+            self.assertIn("pkg/sub/eps.py", {entry["path"] for entry in beta["dependents"]},
+                          "NATIVE_IMPORT_DEPENDENTS_NOT_COUNTED")
+            self.assertEqual(soul_map.impact_summary_for_file("pkg/zeta.py")["direct_dependents"], 0,
+                             "NATIVE_IMPORT_DEPENDENTS_NOT_COUNTED")
+
+    def test_soulforge_transitive_scope_walks_import_links_and_terminates_cycles(self) -> None:
+        # BM_TRANSITIVE_IMPORT_SCOPE: A->B->C->A cycle plus a diamond D->B, D->C.
+        with tempfile.TemporaryDirectory() as repo_dir:
+            soul_map = self._soulforge_map_with_refs(
+                Path(repo_dir),
+                [(1, "src/a.py"), (2, "src/b.py"), (3, "src/c.py"), (4, "src/d.py")],
+                [
+                    (1, "b_fn", None, "from src.b import b_fn"),
+                    (2, "c_fn", None, "from src.c import c_fn"),
+                    (3, "a_fn", None, "from src.a import a_fn"),
+                    (4, "b_fn", None, "from src.b import b_fn"),
+                    (4, "c_fn", None, "from src.c import c_fn"),
+                ],
+            )
+            impact = soul_map.impact_summary_for_file("src/c.py")
+            self.assertEqual({entry["path"] for entry in impact["dependents"]}, {"src/b.py", "src/d.py"},
+                             "TRANSITIVE_IMPORT_SCOPE_MISSING")
+            self.assertEqual(impact["total_affected_scope"], 3, "TRANSITIVE_IMPORT_SCOPE_MISSING")
+
+    def test_soulforge_dependents_union_counts_each_importer_once(self) -> None:
+        # BM_NO_DOUBLE_COUNT_OR_SELF: edge duplicated by an import ref, several imported
+        # names from one importer, repeated identical rows, a self-import, non-Python text.
+        with tempfile.TemporaryDirectory() as repo_dir:
+            soul_map = self._soulforge_map_with_refs(
+                Path(repo_dir),
+                [(1, "src/t.py"), (2, "src/x.py"), (3, "src/y.py"), (4, "web/z.ts"), (5, "src/big.py")],
+                [
+                    (2, "a", None, "from src.t import a, b"),
+                    (2, "b", None, "from src.t import a, b"),
+                    (3, "a", None, "from src.t import a"),
+                    (3, "a", None, "from src.t import a"),
+                    (1, "a", None, "from src.t import a"),
+                    (4, "t", None, 'import { t } from "../src/t"'),
+                ],
+                edges=[(2, 1, 1.0, 1), (5, 1, 5.0, 1)],
+            )
+            impact = soul_map.impact_summary_for_file("src/t.py")
+            self.assertEqual(impact["direct_dependents"], 3, "DEPENDENT_DOUBLE_COUNTED")
+            self.assertEqual([(entry["path"], entry["weight"]) for entry in impact["dependents"]],
+                             [("src/big.py", 5.0), ("src/x.py", 2.0), ("src/y.py", 1.0)],
+                             "DEPENDENT_DOUBLE_COUNTED")
+            self.assertEqual(impact["total_affected_scope"], 3, "DEPENDENT_DOUBLE_COUNTED")
+
+    def test_soulforge_dependents_skip_ineligible_importers_and_requery_live(self) -> None:
+        # BM_INELIGIBLE_TARGETS_SKIPPED: absent module, cache-path importer, then a rebuilt
+        # index read through a fresh map instance (a live instance reads its map once).
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            soul_map = self._soulforge_map_with_refs(
+                repo,
+                [(1, "src/t.py"), (2, "src/w.py"), (3, "__pycache__/stale.py"), (4, "src/v.py")],
+                [
+                    (2, "q", None, "from src.missing import q"),
+                    (3, "a", None, "from src.t import a"),
+                ],
+            )
+            self.assertEqual(soul_map.impact_summary_for_file("src/t.py")["direct_dependents"], 0,
+                             "INELIGIBLE_IMPORT_COUNTED")
+            self.assertEqual(soul_map.impact_summary_for_file("src/w.py")["dependencies"], 0,
+                             "INELIGIBLE_IMPORT_COUNTED")
+            with closing(sqlite3.connect(repo / ".soulforge" / "repomap.db")) as conn, conn:
+                conn.execute("INSERT INTO refs VALUES (4, 'a', NULL, 'from src.t import a')")
+            self.assertEqual(repo_context_forge.SoulForgeMap(repo).impact_summary_for_file("src/t.py")["direct_dependents"], 1,
+                             "INELIGIBLE_IMPORT_COUNTED")
+
+    def test_soulforge_import_resolution_follows_python_rules(self) -> None:
+        # BM_PYTHON_RESOLUTION_RULES (PR 30 review): beyond-package relative imports link
+        # nothing, a package beats a same-named module, LF and CRLF continuations resolve.
+        with tempfile.TemporaryDirectory() as repo_dir:
+            soul_map = self._soulforge_map_with_refs(
+                Path(repo_dir),
+                [(1, "foo.py"), (2, "foo/__init__.py"), (3, "pkg/sub/mod.py"), (4, "user.py"),
+                 (5, "a.py"), (6, "b.py"), (7, "cont.py"), (8, "crlf.py"), (9, "c.py")],
+                [
+                    (3, "bar", None, "from ...foo import bar"),
+                    (4, "foo", None, "import foo"),
+                    (4, "bar", None, "from foo import bar"),
+                    (7, "a", None, "import a, \\\n    b"),
+                    (8, "a", None, "import a, \\\r\n    c"),
+                ],
+            )
+            self.assertEqual(soul_map.impact_summary_for_file("foo.py")["direct_dependents"], 0,
+                             "PYTHON_RESOLUTION_RULE_VIOLATED")
+            self.assertEqual([entry["path"] for entry in soul_map.impact_summary_for_file("foo/__init__.py")["dependents"]],
+                             ["user.py"], "PYTHON_RESOLUTION_RULE_VIOLATED")
+            self.assertEqual(soul_map.impact_summary_for_file("a.py")["direct_dependents"], 2,
+                             "PYTHON_RESOLUTION_RULE_VIOLATED")
+            self.assertEqual(soul_map.impact_summary_for_file("b.py")["direct_dependents"], 1,
+                             "PYTHON_RESOLUTION_RULE_VIOLATED")
+            self.assertEqual(soul_map.impact_summary_for_file("c.py")["direct_dependents"], 1,
+                             "PYTHON_RESOLUTION_RULE_VIOLATED")
+
+    def test_soulforge_neighbors_and_symbols_ignore_import_refs(self) -> None:
+        # BM_NEIGHBORS_AND_SYMBOLS_UNCHANGED: import refs must not leak into the edge-only
+        # neighbor ranking or the name-based symbol usage counts.
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            soul_map = self._soulforge_map_with_refs(
+                repo,
+                [(1, "src/t.py"), (2, "src/x.py"), (3, "src/y.py")],
+                [(3, "a", None, "from src.t import a"), (2, "a", 1, None)],
+                edges=[(2, 1, 1.5, 1)],
+            )
+            with closing(sqlite3.connect(repo / ".soulforge" / "repomap.db")) as conn, conn:
+                conn.execute("INSERT INTO symbols VALUES (10, 1, 'a', 'function', 1, 2, 1, 'def a()')")
+            self.assertEqual(soul_map.graph_neighbors_for_file("src/t.py"),
+                             [{"path": "src/x.py", "weight": 1.5}], "NEIGHBOR_OR_SYMBOL_OUTPUT_DRIFTED")
+            symbols = soul_map.exported_symbols_at_risk("src/t.py")
+            self.assertEqual((symbols[0]["name"], symbols[0]["usage_files"]), ("a", 1),
+                             "NEIGHBOR_OR_SYMBOL_OUTPUT_DRIFTED")
+
     def test_symbols_prefer_cached_llm_summary_and_fill_synthetic(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:
             repo = Path(repo_dir)
@@ -4766,7 +4951,7 @@ class RepoContextForgeTests(unittest.TestCase):
 
         self.assertIsNone(reason)
 
-    def test_bootstrap_defaults_to_analysis_gitnexus_repo_and_large_budget(self) -> None:
+    def test_bootstrap_defaults_to_analysis_gitnexus_repo_and_default_budget(self) -> None:
         captured: dict[str, object] = {}
         originals = {
             "is_git_repo": codex_context_bootstrap.forge.is_git_repo,
@@ -4803,7 +4988,6 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIsNone(captured["gitnexus_repo"])
         self.assertEqual(captured["token_budget"], repo_context_forge.DEFAULT_TOKEN_BUDGET)
-        self.assertGreaterEqual(captured["token_budget"], 16_000)
 
     def test_bootstrap_can_emit_required_intake_before_packet(self) -> None:
         captured: dict[str, str] = {}
@@ -4985,7 +5169,7 @@ class RepoContextForgeTests(unittest.TestCase):
         rendered = repo_context_forge.render_prompt(packet)
 
         self.assertIn("<repo_context_packet", rendered)
-        self.assertIn("<token_budget>16000</token_budget>", rendered)
+        self.assertIn(f"<token_budget>{repo_context_forge.DEFAULT_TOKEN_BUDGET}</token_budget>", rendered)
         self.assertIn("<context_digest>", rendered)
         self.assertIn("<required_agent_intake>", rendered)
         self.assertIn("<coverage_plan required=\"true\" delegation_required=\"false\">", rendered)

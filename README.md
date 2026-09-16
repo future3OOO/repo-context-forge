@@ -66,8 +66,9 @@ silently switch to sibling worktrees.
   fill missing symbols, and live LLM generation is not performed on routine
   prompt injection.
 - output can be Markdown, JSON, or an XML prompt packet for upstream injection.
-- prompt packets default to a 16k token budget and compact optional symbol
-  detail before dropping required status, target identity, or GitNexus checks.
+- prompt packets default to an 8k token budget, sized so one tool result
+  delivers the packet whole, and compact optional symbol detail before dropping
+  required status, target identity, or GitNexus checks.
 - packets execute their bounded GitNexus context/impact plan serially and include
   normalized, identity-bound semantic answers plus timing and output metrics.
 - packets include workflow-index and architecture summaries, optional SoulForge
