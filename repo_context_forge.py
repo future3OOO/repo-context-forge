@@ -37,7 +37,9 @@ CACHE_CHECKOUT_TTL_SECONDS = 24 * 60 * 60
 TOOL_CACHE_DIRS = (".soulforge", ".codex", ".gitnexus", workflow_index.INDEX_DIR)
 TOOL_CACHE_PATHS = (*TOOL_CACHE_DIRS, ".claude/skills/gitnexus")
 TOOL_CACHE_PREFIXES = tuple(f"{name}/" for name in TOOL_CACHE_PATHS)
-MIN_TOKEN_BUDGET = 16_000
+# One tool result delivers about 10k tokens (measured on Codex); the intake header
+# the adapters prepend takes ~1.3k of that, so a bigger packet arrives truncated.
+MIN_TOKEN_BUDGET = 8_000
 MAX_TOKEN_BUDGET = 32_000
 DEFAULT_TOKEN_BUDGET = MIN_TOKEN_BUDGET
 MAX_GITNEXUS_CHECKS = 20
@@ -941,6 +943,39 @@ def resolve_target_state(
     )
 
 
+_PYTHON_FROM_IMPORT = re.compile(r"^\s*from\s+([.\w]+)\s+import\s+\(?([^)]*)\)?\s*$", re.S)
+_PYTHON_IMPORT = re.compile(r"^\s*import\s+([\w.,\s]+?)\s*$", re.S)
+
+
+def _python_import_targets(importer: str, statement: str, ids: dict[str, int]) -> list[int]:
+    """File ids a Python import statement names, one per imported name that resolves
+    (a name resolves to module/name.py before the module itself). Absolute modules are
+    repository-root relative; leading dots walk up from the importer's directory."""
+    def resolve(parts: list[str]) -> int | None:
+        joined = "/".join(parts)
+        return ids.get(f"{joined}.py", ids.get(f"{joined}/__init__.py"))
+
+    matched = _PYTHON_FROM_IMPORT.match(statement)
+    if matched:
+        module, names = matched.group(1), matched.group(2)
+        dots = len(module) - len(module.lstrip("."))
+        base = importer.split("/")[:-1]
+        base = base[: len(base) - (dots - 1)] if dots > 1 else (base if dots else [])
+        parts = base + [part for part in module.lstrip(".").split(".") if part]
+        targets = []
+        for name in (item.split(" as ")[0].strip() for item in names.replace("\\", " ").split(",")):
+            target = resolve(parts + [name]) if name and name != "*" else None
+            target = target if target is not None else resolve(parts)
+            if target is not None:
+                targets.append(target)
+        return targets
+    matched = _PYTHON_IMPORT.match(statement)
+    if not matched:
+        return []
+    modules = (item.split(" as ")[0].strip().split(".") for item in matched.group(1).split(","))
+    return [target for target in (resolve(parts) for parts in modules) if target is not None]
+
+
 def find_soulforge_binary(explicit: str | None) -> str | None:
     if explicit:
         return explicit
@@ -998,6 +1033,7 @@ class SoulForgeMap:
     ) -> None:
         self.native_index = native_index or workflow_index.WorkflowIndex(repo, file_role)
         self.db_path = repo / ".soulforge" / "repomap.db"
+        self._graph: tuple[dict[str, int], dict[int, str], list[tuple[int, int, float]]] | None = None
 
     @property
     def available(self) -> bool:
@@ -1156,65 +1192,76 @@ class SoulForgeMap:
     ) -> list[dict[str, float | str]]:
         if not self.available:
             return []
-        if direction == "dependents":
-            source_join = "other.id = e.source_file_id"
-            edge_filter = "e.target_file_id = f.id"
-        else:
-            source_join = "other.id = e.target_file_id"
-            edge_filter = "e.source_file_id = f.id"
-        with self._connect() as conn:
-            if not self._has_table(conn, "edges"):
-                return []
-            rows = conn.execute(
-                f"""
-                SELECT other.path AS path, SUM(e.weight) AS weight
-                FROM files f
-                JOIN edges e ON {edge_filter}
-                JOIN files other ON {source_join}
-                WHERE f.path = ? AND other.path != f.path
-                GROUP BY other.path
-                ORDER BY weight DESC, other.path ASC
-                LIMIT ?
-                """,
-                (path, limit),
-            ).fetchall()
-        return [
-            {"path": str(row["path"]), "weight": float(row["weight"] or 0)}
-            for row in rows
-            if not is_generated_or_cache_path(str(row["path"]))
-        ]
+        ids, paths, edges = self._file_graph()
+        me = ids.get(path)
+        weights: dict[int, float] = {}
+        for source, target, weight in edges:
+            other, mine = (source, target) if direction == "dependents" else (target, source)
+            if mine == me and other != me:
+                weights[other] = weights.get(other, 0.0) + weight
+        links = sorted(
+            ((weight, paths[other]) for other, weight in weights.items()
+             if not is_generated_or_cache_path(paths[other])),
+            key=lambda item: (-item[0], item[1]),
+        )
+        return [{"path": other, "weight": weight} for weight, other in (links if limit < 0 else links[:limit])]
 
     def transitive_dependent_count_for_file(self, path: str, limit: int = 200) -> int:
+        ids, paths, edges = self._file_graph()
+        me = ids.get(path)
+        dependents: dict[int, set[int]] = {}
+        for source, target, _weight in edges:
+            dependents.setdefault(target, set()).add(source)
+        seen: set[int] = set()
+        frontier = {me}
+        for _depth in range(4):
+            frontier = {source for target in frontier for source in dependents.get(target, ())} - seen
+            seen |= frontier
+            if not frontier or len(seen) >= limit:
+                break
+        return sum(1 for other in list(seen)[:limit]
+                   if other != me and not is_generated_or_cache_path(paths[other]))
+
+    def _file_graph(self) -> tuple[dict[str, int], dict[int, str], list[tuple[int, int, float]]]:
+        """File ids by path, paths by id, and every (source, target, weight) file link:
+        SoulForge's edges plus the Python import statements it records (refs.import_source
+        and external_imports.package) but never resolves to a file. An import link weighs
+        1.0, inside the measured edge range (0.06-6.3, median 0.5), so a real importer ranks
+        above an identifier-matched edge without hiding a strongly linked one. The map is
+        read-only for the life of this instance, so the graph is built once."""
+        if self._graph is None:
+            self._graph = self._load_file_graph()
+        return self._graph
+
+    def _load_file_graph(self) -> tuple[dict[str, int], dict[int, str], list[tuple[int, int, float]]]:
         if not self.available:
-            return 0
+            return {}, {}, []
         with self._connect() as conn:
             if not self._has_table(conn, "edges"):
-                return 0
-            rows = conn.execute(
-                """
-                WITH RECURSIVE upstream(file_id, depth) AS (
-                  SELECT e.source_file_id, 1
-                  FROM edges e
-                  JOIN files f ON f.id = e.target_file_id
-                  WHERE f.path = ?
-                  UNION
-                  SELECT e.source_file_id, upstream.depth + 1
-                  FROM edges e
-                  JOIN upstream ON upstream.file_id = e.target_file_id
-                  WHERE upstream.depth < 4
-                )
-                SELECT DISTINCT f.path
-                FROM upstream
-                JOIN files f ON f.id = upstream.file_id
-                LIMIT ?
-                """,
-                (path, limit),
-            ).fetchall()
-        return sum(
-            1
-            for row in rows
-            if str(row["path"]) != path and not is_generated_or_cache_path(str(row["path"]))
-        )
+                return {}, {}, []
+            paths = {int(row["id"]): str(row["path"]) for row in conn.execute("SELECT id, path FROM files")}
+            ids = {file_path: file_id for file_id, file_path in paths.items()}
+            edges = [
+                (int(row["source_file_id"]), int(row["target_file_id"]), float(row["weight"] or 0))
+                for row in conn.execute("SELECT source_file_id, target_file_id, weight FROM edges")
+                if int(row["source_file_id"]) in paths and int(row["target_file_id"]) in paths
+            ]
+            statements: set[tuple[int, str]] = set()
+            if self._has_table(conn, "refs"):
+                statements.update(
+                    (int(row["file_id"]), str(row["import_source"])) for row in conn.execute(
+                        "SELECT file_id, import_source FROM refs "
+                        "WHERE import_source IS NOT NULL AND source_file_id IS NULL"))
+            if self._has_table(conn, "external_imports"):
+                statements.update(
+                    (int(row["file_id"]), str(row["package"])) for row in conn.execute(
+                        "SELECT file_id, package FROM external_imports WHERE package IS NOT NULL"))
+        links: set[tuple[int, int]] = set()
+        for importer, statement in statements:
+            if importer in paths:
+                links.update((importer, target) for target in _python_import_targets(paths[importer], statement, ids)
+                             if target != importer)
+        return ids, paths, edges + [(source, target, 1.0) for source, target in sorted(links)]
 
     def exported_symbols_at_risk(self, path: str, limit: int = 8) -> list[dict[str, object]]:
         if not self.available:
