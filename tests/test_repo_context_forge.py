@@ -2835,8 +2835,8 @@ class RepoContextForgeTests(unittest.TestCase):
         # result and the adapters prepend a ~1.3k-token intake header; a 16k default meant
         # every full packet arrived truncated with <targets> cut off (CX2 lead, ordinals
         # 68 and 3676: 13,479 and 14,243 produced, ~10.2k delivered).
-        self.assertLessEqual(repo_context_forge.compute_token_budget(None, None), 8_000,
-                             "DEFAULT_BUDGET_EXCEEDS_DELIVERY_CAP")
+        self.assertEqual(repo_context_forge.compute_token_budget(None, None), 8_000,
+                         "DEFAULT_BUDGET_EXCEEDS_DELIVERY_CAP")
 
     def test_compute_token_budget_expands_for_long_context(self) -> None:
         early = repo_context_forge.compute_token_budget(0, None)
