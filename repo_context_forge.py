@@ -953,17 +953,20 @@ def _python_import_targets(importer: str, statement: str, ids: dict[str, int]) -
     repository-root relative; leading dots walk up from the importer's directory."""
     def resolve(parts: list[str]) -> int | None:
         joined = "/".join(parts)
-        return ids.get(f"{joined}.py", ids.get(f"{joined}/__init__.py"))
+        return ids.get(f"{joined}/__init__.py", ids.get(f"{joined}.py"))
 
+    statement = statement.replace("\\\n", " ")
     matched = _PYTHON_FROM_IMPORT.match(statement)
     if matched:
         module, names = matched.group(1), matched.group(2)
         dots = len(module) - len(module.lstrip("."))
         base = importer.split("/")[:-1]
+        if dots > len(base):
+            return []
         base = base[: len(base) - (dots - 1)] if dots > 1 else (base if dots else [])
         parts = base + [part for part in module.lstrip(".").split(".") if part]
         targets = []
-        for name in (item.split(" as ")[0].strip() for item in names.replace("\\", " ").split(",")):
+        for name in (item.split(" as ")[0].strip() for item in names.split(",")):
             target = resolve(parts + [name]) if name and name != "*" else None
             target = target if target is not None else resolve(parts)
             if target is not None:

@@ -4366,6 +4366,30 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertEqual(repo_context_forge.SoulForgeMap(repo).impact_summary_for_file("src/t.py")["direct_dependents"], 1,
                              "INELIGIBLE_IMPORT_COUNTED")
 
+    def test_soulforge_import_resolution_follows_python_rules(self) -> None:
+        # BM_PYTHON_RESOLUTION_RULES (PR 30 review): beyond-package relative imports link
+        # nothing, a package beats a same-named module, continuations resolve.
+        with tempfile.TemporaryDirectory() as repo_dir:
+            soul_map = self._soulforge_map_with_refs(
+                Path(repo_dir),
+                [(1, "foo.py"), (2, "foo/__init__.py"), (3, "pkg/sub/mod.py"), (4, "user.py"),
+                 (5, "a.py"), (6, "b.py"), (7, "cont.py")],
+                [
+                    (3, "bar", None, "from ...foo import bar"),
+                    (4, "foo", None, "import foo"),
+                    (4, "bar", None, "from foo import bar"),
+                    (7, "a", None, "import a, \\\n    b"),
+                ],
+            )
+            self.assertEqual(soul_map.impact_summary_for_file("foo.py")["direct_dependents"], 0,
+                             "PYTHON_RESOLUTION_RULE_VIOLATED")
+            self.assertEqual([entry["path"] for entry in soul_map.impact_summary_for_file("foo/__init__.py")["dependents"]],
+                             ["user.py"], "PYTHON_RESOLUTION_RULE_VIOLATED")
+            self.assertEqual(soul_map.impact_summary_for_file("a.py")["direct_dependents"], 1,
+                             "PYTHON_RESOLUTION_RULE_VIOLATED")
+            self.assertEqual(soul_map.impact_summary_for_file("b.py")["direct_dependents"], 1,
+                             "PYTHON_RESOLUTION_RULE_VIOLATED")
+
     def test_soulforge_neighbors_and_symbols_ignore_import_refs(self) -> None:
         # BM_NEIGHBORS_AND_SYMBOLS_UNCHANGED: import refs must not leak into the edge-only
         # neighbor ranking or the name-based symbol usage counts.
