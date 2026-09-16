@@ -955,7 +955,7 @@ def _python_import_targets(importer: str, statement: str, ids: dict[str, int]) -
         joined = "/".join(parts)
         return ids.get(f"{joined}/__init__.py", ids.get(f"{joined}.py"))
 
-    statement = statement.replace("\\\n", " ")
+    statement = re.sub(r"\\\r?\n", " ", statement)
     matched = _PYTHON_FROM_IMPORT.match(statement)
     if matched:
         module, names = matched.group(1), matched.group(2)
