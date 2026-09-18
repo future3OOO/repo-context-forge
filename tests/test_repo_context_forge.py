@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import json
 import unittest
 from collections import namedtuple
 from contextlib import closing, contextmanager
@@ -5676,6 +5677,48 @@ class SoulforgeGitignoreCleanupTests(unittest.TestCase):
         content = b".gitnexus\ncaf\xe9/\n"
         _before, path = self.untracked_case(content)
         self.assertEqual(path.read_bytes(), content, marker)
+
+
+class PluginSurfaceTests(unittest.TestCase):
+    """The producer ships an engine, not a skill.
+
+    A second repo-context-forge skill served from this repo carries its own
+    bootstrap.py and its own SKILL.md, which document none of the governed
+    workflow flags. An agent that finds them records no workflow evidence and
+    reads the resulting argparse rejection as version skew.
+    """
+
+    MANIFEST = ROOT / ".codex-plugin" / "plugin.json"
+
+    def manifest(self) -> dict:
+        return json.loads(self.MANIFEST.read_text(encoding="utf-8"))
+
+    def test_the_manifest_declares_no_skill_surface(self) -> None:
+        # BM_NO_SECOND_SKILL_SURFACE
+        marker = "PLUGIN_STILL_SERVES_A_SKILL"
+        manifest = self.manifest()
+        self.assertNotIn("skills", manifest, marker)
+        declared = ROOT / str(manifest.get("skills", "skills/")).lstrip("./")
+        self.assertFalse(declared.exists(), f"{marker}: {declared}")
+        served = [path for path in ROOT.rglob("SKILL.md")] + [
+            path for path in ROOT.rglob("bootstrap.py")
+        ]
+        self.assertEqual(served, [], marker + ": " + ", ".join(str(p) for p in served))
+
+    def test_the_manifest_still_loads_for_a_marketplace_consumer(self) -> None:
+        # BM_MANIFEST_STILL_LOADS
+        marker = "MANIFEST_INVALID"
+        manifest = self.manifest()
+        for key in ("name", "version", "description", "license", "interface"):
+            self.assertIn(key, manifest, marker)
+        self.assertEqual(manifest["name"], "repo-context-forge", marker)
+
+    def test_the_engine_the_governed_wrapper_runs_is_present(self) -> None:
+        # BM_ENGINE_STILL_PRODUCES: the wrapper executes this path and imports this module.
+        marker = "FORGE_REGRESSED"
+        self.assertTrue((ROOT / "scripts" / "codex_context_bootstrap.py").is_file(), marker)
+        self.assertTrue((ROOT / "repo_context_forge.py").is_file(), marker)
+
 
 
 if __name__ == "__main__":

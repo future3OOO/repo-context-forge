@@ -13,7 +13,6 @@
     "soulforge",
     "code-context"
   ],
-  "skills": "./skills/",
   "interface": {
     "displayName": "Repo Context Forge",
     "shortDescription": "Inject clean repo maps before Codex starts code work.",
