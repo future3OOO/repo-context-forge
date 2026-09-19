@@ -5680,7 +5680,7 @@ class PluginSurfaceTests(unittest.TestCase):
         tracked = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
                                  text=True, check=True).stdout.split()
         served = [path for path in tracked
-                  if path.endswith(("SKILL.md", "/bootstrap.py", "plugin.json"))]
+                  if path.split("/")[-1] in ("SKILL.md", "bootstrap.py", "plugin.json")]
         self.assertEqual(served, [], marker + ": " + ", ".join(served))
 
     def test_the_installer_registers_no_plugin(self) -> None:
@@ -5690,3 +5690,7 @@ class PluginSurfaceTests(unittest.TestCase):
         source = (ROOT / "scripts" / "install_local_plugin.py").read_text(encoding="utf-8")
         for token in ("marketplace", "plugin_entry", "INSTALLED_BY_DEFAULT", '"plugins"'):
             self.assertNotIn(token, source, f"{marker}: {token}")
+
+
+if __name__ == "__main__":
+    unittest.main()
