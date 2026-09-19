@@ -20,23 +20,24 @@ python3 scripts/install_local_plugin.py [--commit <ref>]
 That clones a commit-addressed runtime snapshot into
 `~/.local/share/repo-context-forge/<sha>/`, verifies the snapshot is clean and
 at the requested commit, atomically repoints the single
-`~/.local/share/repo-context-forge/current` symlink at it, links
-`~/plugins/repo-context-forge` through `current`, and registers the
-`repo-context-forge` Codex plugin in the local plugin marketplace as installed
-by default. Consumers resolve through `current` only, so activating a new
+`~/.local/share/repo-context-forge/current` symlink at it. Consumers resolve
+through `current` only, so activating a new
 commit — including a PR head for live validation — swaps one symlink and never
 edits consumer configuration; after the PR merges, rerun against merged `main`.
 Snapshots are commit-pinned and treated as immutable: a snapshot with local
 modifications refuses to activate. Installer runs are serialized by an
-exclusive lock, and pointer/marketplace updates are atomic. After installation, Codex can use the plugin skill at the start of
-code work in any git repository. Users should not need to run context commands
-per task.
+exclusive lock, and pointer updates are atomic. This repository ships the engine only. It
+declares no skill, no command and no hook, so nothing here is an entry point:
+the governed wrapper in codex-skills, installed at
+`~/.codex/skills/repo-context-forge/scripts/bootstrap.py` and its Claude
+counterpart, is the sole caller, and it is the only form that records the
+packet against an active workflow.
 
-The plugin startup path is:
+The startup path is:
 
-1. Codex loads `repo-context-forge`.
-2. The plugin skill runs `scripts/codex_context_bootstrap.py` for the current
-   git repo.
+1. The governed wrapper resolves this engine through `current`.
+2. It runs `scripts/codex_context_bootstrap.py` for the current git repo,
+   passing the active workflow so the packet is recorded as evidence.
 3. The bootstrap script auto-selects `pr`, `local`, `intent`, or `repo` mode.
 4. Forge builds an atomic workflow index in the cache-owned analysis checkout.
 5. The generated XML packet becomes the initial repo context for the task.

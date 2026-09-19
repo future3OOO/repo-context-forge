@@ -5414,13 +5414,6 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertEqual(env["REPO_CONTEXT_FORGE_TARGET_SHA"], "abc123")
         self.assertEqual(env["REPO_CONTEXT_FORGE_GITNEXUS_REPO"], "example")
 
-    def test_plugin_manifest_points_to_existing_skill_root(self) -> None:
-        manifest_path = ROOT / ".codex-plugin" / "plugin.json"
-        manifest = repo_context_forge.json.loads(manifest_path.read_text())
-
-        self.assertEqual(manifest["name"], "repo-context-forge")
-        self.assertTrue((ROOT / manifest["skills"]).resolve().is_dir())
-
     def test_bootstrap_auto_mode_prefers_intent_when_clean_without_base(self) -> None:
         original_is_dirty = codex_context_bootstrap.forge.is_dirty
         codex_context_bootstrap.forge.is_dirty = lambda _repo, **_kwargs: False
@@ -5484,13 +5477,6 @@ class RepoContextForgeTests(unittest.TestCase):
 
         self.assertEqual(mode, "intent")
 
-    def test_install_plugin_entry_is_installed_by_default(self) -> None:
-        entry = install_local_plugin.plugin_entry()
-
-        self.assertEqual(entry["name"], "repo-context-forge")
-        self.assertEqual(entry["source"]["path"], "./plugins/repo-context-forge")
-        self.assertEqual(entry["policy"]["installation"], "INSTALLED_BY_DEFAULT")
-
     def test_install_activates_verified_snapshot_through_current_pointer(self) -> None:
         script = ROOT / "scripts" / "install_local_plugin.py"
         sha = repo_context_forge.run_git(ROOT, ["rev-parse", "HEAD^{commit}"])
@@ -5501,10 +5487,8 @@ class RepoContextForgeTests(unittest.TestCase):
             base = Path(home) / ".local" / "share" / "repo-context-forge"
             snapshot = base / sha
             current = base / "current"
-            link = Path(home) / "plugins" / "repo-context-forge"
+            plugins_link = Path(home) / "plugins" / "repo-context-forge"
             marketplace_path = Path(home) / ".agents" / "plugins" / "marketplace.json"
-            marketplace = repo_context_forge.json.loads(
-                marketplace_path.read_text(encoding="utf-8"))
             current_after_install = os.readlink(current)
             (snapshot / "DIRTY_MARKER").write_text("dirty", encoding="utf-8")
             second = repo_context_forge.subprocess.run(
@@ -5514,8 +5498,8 @@ class RepoContextForgeTests(unittest.TestCase):
                     first.returncode,
                     repo_context_forge.run_git(snapshot, ["rev-parse", "HEAD"]),
                     current_after_install,
-                    os.readlink(link),
-                    [plugin["name"] for plugin in marketplace["plugins"]],
+                    plugins_link.exists() or plugins_link.is_symlink(),
+                    marketplace_path.exists(),
                     second.returncode,
                     "refusing to activate" in second.stderr,
                     os.readlink(current),
@@ -5524,8 +5508,8 @@ class RepoContextForgeTests(unittest.TestCase):
                     0,
                     sha,
                     str(snapshot),
-                    str(current),
-                    ["repo-context-forge"],
+                    False,
+                    False,
                     1,
                     True,
                     str(snapshot),
@@ -5540,13 +5524,14 @@ class RepoContextForgeTests(unittest.TestCase):
             env = {**os.environ, "HOME": home}
             base = Path(home) / ".local" / "share" / "repo-context-forge"
             current = base / "current"
-            link = Path(home) / "plugins" / "repo-context-forge"
+            plugins_link = Path(home) / "plugins" / "repo-context-forge"
             marketplace_path = Path(home) / ".agents" / "plugins" / "marketplace.json"
-            link.mkdir(parents=True)
+            current.parent.mkdir(parents=True)
+            current.mkdir()
             rogue = repo_context_forge.subprocess.run(
                 [sys.executable, str(script)], capture_output=True, text=True, env=env)
             rogue_left_no_activation = not current.is_symlink() and not marketplace_path.exists()
-            link.rmdir()
+            current.rmdir()
             first = repo_context_forge.subprocess.Popen(
                 [sys.executable, str(script)],
                 stdout=repo_context_forge.subprocess.PIPE,
@@ -5557,8 +5542,6 @@ class RepoContextForgeTests(unittest.TestCase):
                 stderr=repo_context_forge.subprocess.PIPE, env=env)
             first.communicate(timeout=60)
             second.communicate(timeout=60)
-            marketplace = repo_context_forge.json.loads(
-                marketplace_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 (
                     rogue.returncode,
@@ -5567,8 +5550,8 @@ class RepoContextForgeTests(unittest.TestCase):
                     first.returncode,
                     second.returncode,
                     os.readlink(current),
-                    os.readlink(link),
-                    [plugin["name"] for plugin in marketplace["plugins"]],
+                    plugins_link.exists() or plugins_link.is_symlink(),
+                    marketplace_path.exists(),
                 ),
                 (
                     1,
@@ -5577,8 +5560,8 @@ class RepoContextForgeTests(unittest.TestCase):
                     0,
                     0,
                     str(base / sha),
-                    str(current),
-                    ["repo-context-forge"],
+                    False,
+                    False,
                 ),
                 "INSTALL_PREVALIDATION_OR_SERIALIZATION_VIOLATED",
             )
@@ -5676,6 +5659,37 @@ class SoulforgeGitignoreCleanupTests(unittest.TestCase):
         content = b".gitnexus\ncaf\xe9/\n"
         _before, path = self.untracked_case(content)
         self.assertEqual(path.read_bytes(), content, marker)
+
+
+class PluginSurfaceTests(unittest.TestCase):
+    """The producer ships an engine, not a plugin.
+
+    A plugin surface served from this repo carries its own bootstrap.py and its
+    own SKILL.md, which document none of the governed workflow flags. An agent
+    that finds them records no workflow evidence and reads the resulting
+    argparse rejection as version skew.
+    """
+
+    def test_no_plugin_surface_is_shipped(self) -> None:
+        # BM_NO_SECOND_SKILL_SURFACE
+        marker = "PLUGIN_STILL_SERVES_A_SKILL"
+        self.assertFalse((ROOT / ".codex-plugin").exists(), marker)
+        self.assertFalse((ROOT / "skills").exists(), marker)
+        # Tracked content is what a snapshot serves. The working tree also holds
+        # GitNexus-generated skill files under .claude, which are not this surface.
+        tracked = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
+                                 text=True, check=True).stdout.split()
+        served = [path for path in tracked
+                  if path.split("/")[-1] in ("SKILL.md", "bootstrap.py", "plugin.json")]
+        self.assertEqual(served, [], marker + ": " + ", ".join(served))
+
+    def test_the_installer_registers_no_plugin(self) -> None:
+        # BM_NO_PLUGIN_REGISTRATION: the installer publishes a snapshot and the
+        # current pointer only; it writes no marketplace entry and no ~/plugins link.
+        marker = "INSTALLER_STILL_REGISTERS_A_PLUGIN"
+        source = (ROOT / "scripts" / "install_local_plugin.py").read_text(encoding="utf-8")
+        for token in ("marketplace", "plugin_entry", "INSTALLED_BY_DEFAULT", '"plugins"'):
+            self.assertNotIn(token, source, f"{marker}: {token}")
 
 
 if __name__ == "__main__":

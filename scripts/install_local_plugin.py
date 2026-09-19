@@ -8,7 +8,6 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 
 
 PLUGIN_NAME = "repo-context-forge"
@@ -24,44 +23,6 @@ def run_git(repo: Path, args: list[str]) -> str:
         text=True,
     )
     return result.stdout.strip()
-
-
-def load_marketplace(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {
-            "name": "local-codex-plugins",
-            "interface": {"displayName": "Local Codex Plugins"},
-            "plugins": [],
-        }
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def plugin_entry() -> dict[str, Any]:
-    return {
-        "name": PLUGIN_NAME,
-        "source": {
-            "source": "local",
-            "path": f"./plugins/{PLUGIN_NAME}",
-        },
-        "policy": {
-            "installation": "INSTALLED_BY_DEFAULT",
-            "authentication": "ON_USE",
-        },
-        "category": "Coding",
-    }
-
-
-def update_marketplace(marketplace: dict[str, Any]) -> dict[str, Any]:
-    plugins = marketplace.setdefault("plugins", [])
-    if not isinstance(plugins, list):
-        raise RuntimeError("marketplace plugins field must be a list")
-    entry = plugin_entry()
-    for index, existing in enumerate(plugins):
-        if isinstance(existing, dict) and existing.get("name") == PLUGIN_NAME:
-            plugins[index] = entry
-            return marketplace
-    plugins.append(entry)
-    return marketplace
 
 
 def ensure_snapshot(source_repo: Path, sha: str) -> Path:
@@ -93,16 +54,6 @@ def require_replaceable(link: Path) -> None:
         raise RuntimeError(f"refusing to replace non-symlink path: {link}")
 
 
-def write_marketplace(path: Path, marketplace: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    staging = path.parent / f".{path.name}.tmp"
-    staging.write_text(
-        json.dumps(marketplace, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(staging, path)
-
-
 def point_symlink(link: Path, target: Path) -> None:
     if link.is_symlink() and os.readlink(link) == str(target):
         return
@@ -116,7 +67,7 @@ def point_symlink(link: Path, target: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Install a commit-addressed runtime snapshot and activate it through the current symlink.",
+        description="Install a commit-addressed engine snapshot and activate it through the current symlink.",
     )
     parser.add_argument(
         "--commit",
@@ -131,18 +82,10 @@ def main() -> int:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         sha = run_git(source_repo, ["rev-parse", f"{args.commit}^{{commit}}"])
         snapshot = ensure_snapshot(source_repo, sha)
-        link_path = Path.home() / "plugins" / PLUGIN_NAME
         require_replaceable(CURRENT_LINK)
-        require_replaceable(link_path)
-        marketplace_path = Path.home() / ".agents" / "plugins" / "marketplace.json"
-        marketplace = update_marketplace(load_marketplace(marketplace_path))
-        point_symlink(link_path, CURRENT_LINK)
-        write_marketplace(marketplace_path, marketplace)
         point_symlink(CURRENT_LINK, snapshot)
     print(f"installed snapshot {sha}")
     print(f"current: {CURRENT_LINK} -> {snapshot}")
-    print(f"plugin link: {link_path} -> {CURRENT_LINK}")
-    print(f"registered {PLUGIN_NAME} in {marketplace_path}")
     return 0
 
 
