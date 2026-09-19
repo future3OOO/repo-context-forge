@@ -1230,8 +1230,10 @@ class SoulForgeMap:
         SoulForge's edges plus the Python import statements it records (refs.import_source
         and external_imports.package) but never resolves to a file. An import link weighs
         1.0, inside the measured edge range (0.06-6.3, median 0.5), so a real importer ranks
-        above an identifier-matched edge without hiding a strongly linked one. The map is
-        read-only for the life of this instance, so the graph is built once."""
+        above an identifier-matched edge without hiding a strongly linked one. A pair
+        present as both an edge and a parsed statement is one import seen through two
+        lenses: it weighs max(edge, 1.0), never their sum. The map is read-only for the
+        life of this instance, so the graph is built once."""
         if self._graph is None:
             self._graph = self._load_file_graph()
         return self._graph
@@ -1264,7 +1266,10 @@ class SoulForgeMap:
             if importer in paths:
                 links.update((importer, target) for target in _python_import_targets(paths[importer], statement, ids)
                              if target != importer)
-        return ids, paths, edges + [(source, target, 1.0) for source, target in sorted(links)]
+        merged: dict[tuple[int, int], float] = {(source, target): 1.0 for source, target in links}
+        for source, target, weight in edges:
+            merged[(source, target)] = max(weight, merged.get((source, target), 0.0))
+        return ids, paths, [(source, target, weight) for (source, target), weight in merged.items()]
 
     def exported_symbols_at_risk(self, path: str, limit: int = 8) -> list[dict[str, object]]:
         if not self.available:
