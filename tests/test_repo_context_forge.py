@@ -4323,6 +4323,8 @@ class RepoContextForgeTests(unittest.TestCase):
     def test_soulforge_dependents_union_counts_each_importer_once(self) -> None:
         # BM_NO_DOUBLE_COUNT_OR_SELF: edge duplicated by an import ref, several imported
         # names from one importer, repeated identical rows, a self-import, non-Python text.
+        # A pair present as both an edge and a parsed link is ONE import seen through
+        # two lenses: it keeps max(edge weight, link weight), never their sum.
         with tempfile.TemporaryDirectory() as repo_dir:
             soul_map = self._soulforge_map_with_refs(
                 Path(repo_dir),
@@ -4334,13 +4336,14 @@ class RepoContextForgeTests(unittest.TestCase):
                     (3, "a", None, "from src.t import a"),
                     (1, "a", None, "from src.t import a"),
                     (4, "t", None, 'import { t } from "../src/t"'),
+                    (5, "a", None, "from src.t import a"),
                 ],
                 edges=[(2, 1, 1.0, 1), (5, 1, 5.0, 1)],
             )
             impact = soul_map.impact_summary_for_file("src/t.py")
             self.assertEqual(impact["direct_dependents"], 3, "DEPENDENT_DOUBLE_COUNTED")
             self.assertEqual([(entry["path"], entry["weight"]) for entry in impact["dependents"]],
-                             [("src/big.py", 5.0), ("src/x.py", 2.0), ("src/y.py", 1.0)],
+                             [("src/big.py", 5.0), ("src/x.py", 1.0), ("src/y.py", 1.0)],
                              "DEPENDENT_DOUBLE_COUNTED")
             self.assertEqual(impact["total_affected_scope"], 3, "DEPENDENT_DOUBLE_COUNTED")
 
