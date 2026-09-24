@@ -318,26 +318,10 @@ def is_reference_only_path(path: str, prefixes: Iterable[str]) -> bool:
     return any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in prefixes)
 
 
-def is_test_path(path: str) -> bool:
-    parts = path.split("/")
-    name = Path(path).name.lower()
-    return (
-        "test" in parts
-        or "tests" in parts
-        or name.startswith("test_")
-        or name.endswith(
-            (
-                ".test.js", ".test.jsx", ".test.mjs", ".test.ts", ".test.tsx",
-                ".spec.js", ".spec.jsx", ".spec.mjs", ".spec.ts", ".spec.tsx",
-            )
-        )
-    )
-
-
 def file_role(path: str) -> str:
     if is_generated_or_cache_path(path):
         return "generated"
-    if is_test_path(path):
+    if workflow_index.is_test_path(path):
         return "test"
     return "production"
 
@@ -1874,10 +1858,10 @@ def make_target_entries(
         )
         for path in targets
     }
-    required_symbol_keys: set[tuple[str, int, str]] = set(
-        (match.path, match.symbol.line, match.symbol.name)
+    required_symbol_keys: dict[tuple[str, int, str], str] = {
+        (match.path, match.symbol.line, match.symbol.name): ".".join(filter(None, (match.owner, match.symbol.name)))
         for match in intent_resolution.required_symbols
-    )
+    }
     directory_owner_paths: set[str] = set()
     for reference in intent_path_references(intent or ""):
         owner = next(
@@ -1950,7 +1934,8 @@ def make_target_entries(
             "changed_symbols": [symbol.__dict__ for symbol in changed_symbols],
             "symbols": [symbol.__dict__ for symbol in display_symbols],
             "_planner_symbols": [symbol.__dict__ for symbol in planner_symbols],
-            "intent_required_symbols": [symbol.name for symbol in intent_required_symbols],
+            "intent_required_symbols": [
+                required_symbol_keys[(path, symbol.line, symbol.name)] for symbol in intent_required_symbols],
             "intent_required_file": intent_required_file,
             "dependent_count": soul_map.dependent_count_for_file(path),
             "graph_neighbors": soul_map.graph_neighbors_for_file(path),
@@ -2015,7 +2000,7 @@ def build_gitnexus_plan(
             for name in entry.get("intent_required_symbols") or []
             if isinstance(name, str) and name
         )
-        required_name_set = set(required_names)
+        required_name_set = {name.rsplit(".", 1)[-1] for name in required_names}
         planned_symbols = [(name, True) for name in required_names]
         for symbol in symbols:
             if not isinstance(symbol, dict):
@@ -2029,7 +2014,8 @@ def build_gitnexus_plan(
             ):
                 continue
             planned_symbols.append((name, False))
-        for name, required in planned_symbols:
+        for qualified_name, required in planned_symbols:
+            name = qualified_name.rsplit(".", 1)[-1]
             context_item: dict[str, object] = {
                 "kind": "symbol_context",
                 "target": name,
@@ -2041,11 +2027,13 @@ def build_gitnexus_plan(
                 "file": path,
                 "direction": "upstream",
             }
+            if qualified_name != name:
+                context_item["qualified_target"] = impact_item["qualified_target"] = qualified_name
             if repo_name:
                 context_item["repo"] = repo_name
                 impact_item["repo"] = repo_name
-            context_key = ("symbol_context", path, name, "")
-            impact_key = ("symbol_impact", path, name, "upstream")
+            context_key = ("symbol_context", path, qualified_name, "")
+            impact_key = ("symbol_impact", path, qualified_name, "upstream")
             if context_key in seen and impact_key in seen:
                 continue
             seen.update((context_key, impact_key))
