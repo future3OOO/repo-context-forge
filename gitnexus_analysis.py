@@ -438,7 +438,7 @@ def execute(
 
     repo_name = str(gitnexus_status["repo"])
     analysis_repo = Path(str(gitnexus_status.get("expected_repo_path") or ""))
-    seen: set[tuple[str, str, str, str]] = set()
+    seen: set[tuple[str, ...]] = set()
     resolved_symbols: dict[tuple[str, str], str] = {}
     entries = analysis["entries"]
     unresolved = analysis["unresolved_checks"]
@@ -491,10 +491,12 @@ def execute(
             return payload if structured else None
         return payload
 
-    def single_eligible_candidate(payload: dict[str, object], file_path: str) -> str | None:
+    def single_eligible_candidate(payload: dict[str, object], file_path: str, target: str) -> str | None:
         # GitNexus answers "ambiguous" when a name is shared inside one file (a module
         # function and a dataclass field, say); the planned symbol is the one
-        # Function/Class/Method candidate in the planned file, re-queried by uid.
+        # Function/Class/Method candidate in the planned file, re-queried by uid. Among
+        # several (a function and a same-named method), it is the one named exactly,
+        # class-qualified when the intent qualified it.
         candidates = payload.get("candidates")
         eligible = [
             str(candidate["uid"])
@@ -503,14 +505,17 @@ def execute(
             and str(candidate.get("filePath") or "") == file_path
             and str(candidate.get("uid") or "").split(":", 1)[0] in {"Function", "Class", "Method"}
         ]
+        if len(eligible) > 1:
+            eligible = [uid for uid in eligible if uid.rsplit(":", 1)[-1] == target]
         return eligible[0] if len(eligible) == 1 else None
 
     for item in plan:
         key = _check_key(item)
-        if key in seen:
-            continue
-        seen.add(key)
         kind, file_path, target, direction = key
+        member = str(item.get("qualified_target") or target)
+        if (*key, member) in seen:
+            continue
+        seen.add((*key, member))
         entry: dict[str, object] = {
             "kind": kind,
             "file": file_path,
@@ -529,7 +534,7 @@ def execute(
         elif kind == "symbol_context":
             command = [binary, "context", "-r", repo_name, "-f", file_path, target]
         elif kind == "symbol_impact":
-            expected_identity = resolved_symbols.get((file_path, target))
+            expected_identity = resolved_symbols.get((file_path, member))
             if not expected_identity:
                 entry["diagnostic"] = "GitNexus impact has no file-resolved context identity"
                 unresolved.append(dict(entry))
@@ -555,7 +560,7 @@ def execute(
                 unresolved.append(dict(entry))
             continue
         if kind == "symbol_context" and payload.get("status") == "ambiguous":
-            uid = single_eligible_candidate(payload, file_path)
+            uid = single_eligible_candidate(payload, file_path, member)
             if uid is None:
                 entry["diagnostic"] = "GitNexus result is ambiguous and no single candidate matches the planned file"
                 unresolved.append(dict(entry))
@@ -584,7 +589,7 @@ def execute(
             unresolved.append(dict(entry))
             continue
         if kind == "symbol_impact":
-            expected_identity = resolved_symbols.get((file_path, target))
+            expected_identity = resolved_symbols.get((file_path, member))
             if not expected_identity or resolved_identity != expected_identity:
                 entry["diagnostic"] = "GitNexus impact identity does not match file-resolved context"
                 unresolved.append(dict(entry))
@@ -600,7 +605,7 @@ def execute(
             entity={"name": resolved_name, "file": resolved_file},
         )
         if kind == "symbol_context":
-            resolved_symbols[(file_path, target)] = resolved_identity
+            resolved_symbols[(file_path, member)] = resolved_identity
             entry["callers"] = _references(payload.get("incoming"))
         elif kind == "file_context":
             entry["references"] = _references(payload.get("incoming"))

@@ -44,6 +44,22 @@ def synthetic_symbol_summary(path: str, name: str, kind: str) -> str:
     return f"{kind}: {words}"
 
 
+def is_test_path(path: str) -> bool:
+    parts = path.split("/")
+    name = Path(path).name.lower()
+    return (
+        "test" in parts
+        or "tests" in parts
+        or name.startswith("test_")
+        or name.endswith(
+            (
+                ".test.js", ".test.jsx", ".test.mjs", ".test.ts", ".test.tsx",
+                ".spec.js", ".spec.jsx", ".spec.mjs", ".spec.ts", ".spec.tsx",
+            )
+        )
+    )
+
+
 @dataclass(frozen=True)
 class IndexedFile:
     """Compatibility DTO; pagerank is workflow relevance, not graph PageRank."""
@@ -71,6 +87,7 @@ class IndexedSymbol:
 class IntentSymbolMatch:
     path: str
     symbol: IndexedSymbol
+    owner: str = ""
 
 
 @dataclass(frozen=True)
@@ -433,7 +450,7 @@ class WorkflowIndex:
                 else []
             )
             required.extend(
-                IntentSymbolMatch(path=path, symbol=symbol)
+                IntentSymbolMatch(path=path, symbol=symbol, owner=qualifier if selected is class_matches else "")
                 for path, symbol in selected
             )
             if (
@@ -444,7 +461,7 @@ class WorkflowIndex:
                     candidates
                     or re.search(
                         rf"(?:`{re.escape(reference)}`|^\s*{re.escape(reference)}[.!?]?\s*$"
-                        rf"|\b(?:update|modify|change|fix|edit|remove|delete)\s+{re.escape(reference)}\b"
+                        rf"|\b(?:updat(?:e[sd]?|ing)|modif(?:y|ies|ied|ying)|chang(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|edit(?:s|ed|ing)?|remov(?:e[sd]?|ing)|delet(?:e[sd]?|ing))\s+{re.escape(reference)}\b"
                         rf"|\b{re.escape(reference)}\s*\("
                         rf"|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
                         intent,
@@ -459,18 +476,20 @@ class WorkflowIndex:
                 ))
         unqualified_matches = self.exact_symbols(identifiers)
         for reference in identifiers:
-            matches = unqualified_matches.get(reference, [])
+            definitions = unqualified_matches.get(reference, [])
+            matches = [match for match in definitions if not is_test_path(match[0])]
             if len(matches) == 1:
                 required.append(IntentSymbolMatch(path=matches[0][0], symbol=matches[0][1]))
             elif matches or (
-                reference not in created_identifiers
+                not definitions
+                and reference not in created_identifiers
                 and (
                     reference in code_identifiers
                     or (
                         reference in bare_identifiers
                         and not reference.isupper()
                         and re.search(
-                            rf"(?:\b(?:update|modify|change|fix|edit|remove|delete)\s+{re.escape(reference)}\b[.!?]?\s*$|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
+                            rf"(?:\b(?:updat(?:e[sd]?|ing)|modif(?:y|ies|ied|ying)|chang(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|edit(?:s|ed|ing)?|remov(?:e[sd]?|ing)|delet(?:e[sd]?|ing))\s+{re.escape(reference)}\b[.!?]?\s*$|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
                             intent,
                             re.IGNORECASE,
                         )

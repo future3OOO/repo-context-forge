@@ -1723,6 +1723,29 @@ class RepoContextForgeTests(unittest.TestCase):
                 "DISCOVERY_GAP_REPORTED_RESOLVED",
             )
 
+    def test_public_bootstrap_decides_an_intent_symbol_by_its_production_definitions(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "tests").mkdir()
+            (repo / "src" / "ledger.py").write_text("def checkpoint():\n    return 1\n", encoding="utf-8")
+            for file_name, names in (("test_left.py", ("checkpoint", "verify", "status")),
+                                     ("test_right.py", ("checkpoint", "verify"))):
+                (repo / "tests" / file_name).write_text(
+                    "".join(f"def {name}():\n    return 2\n\n\n" for name in names), encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "test copies"])
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, intent="Fix `checkpoint`, `status` and `verify` output", top=1)
+        required = {
+            (item["kind"], item["file"], item["target"])
+            for item in packet["gitnexus_plan"] if item.get("required") is True
+        }
+        self.assertEqual(
+            (result.returncode, packet["coverage_gaps"], required),
+            (0, [], {("symbol_context", "src/ledger.py", "checkpoint"),
+                     ("symbol_impact", "src/ledger.py", "checkpoint")}),
+            "TEST_DEFINITION_DECIDED_INTENT_SYMBOL",
+        )
+
     @contextmanager
     def anchored_gap_repo(self):
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -2038,16 +2061,48 @@ class RepoContextForgeTests(unittest.TestCase):
             marker + ": " + (result.stderr[-400:] if result.returncode else ""),
         )
 
+    def test_public_bootstrap_resolves_an_ambiguous_symbol_by_its_exact_name_candidate(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "job.py").write_text(
+                "def finalize_batch() -> int:\n    return 1\n\n\n"
+                "class Job:\n    def finalize_batch(self) -> int:\n        return 2\n\n\n"
+                "class Batch:\n    def finalize_batch(self) -> int:\n        return 3\n",
+                encoding="utf-8",
+            )
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "function and methods"])
+            for intent, members, marker in (
+                ("Update finalize_batch in src/job.py", ("finalize_batch",),
+                 "EXACT_NAME_CANDIDATE_NOT_PREFERRED"),
+                ("Update `Job.finalize_batch` in src/job.py", ("Job.finalize_batch",),
+                 "QUALIFIED_MEMBER_RESOLVED_TO_ANOTHER_CANDIDATE"),
+                ("Update `Job.finalize_batch` and `Batch.finalize_batch` in src/job.py",
+                 ("Job.finalize_batch", "Batch.finalize_batch"), "QUALIFIED_MEMBER_CHECK_COLLAPSED"),
+            ):
+                result, packet = self.run_public_intent_bootstrap(
+                    repo, cache_dir, runtime_home, intent=intent, top=1)
+                analysis = packet["gitnexus"]["analysis"]
+                identities = {
+                    (entry["kind"], entry["status"], entry.get("resolved_identity"))
+                    for entry in analysis["entries"] if entry["target"] == "finalize_batch"
+                }
+                self.assertEqual(
+                    (result.returncode, analysis["unresolved_checks"], identities),
+                    (0, [], {(kind, "resolved", f"Function:src/job.py:{member}")
+                             for kind in ("symbol_context", "symbol_impact") for member in members}),
+                    marker,
+                )
+
     def test_public_bootstrap_keeps_blocking_an_ambiguous_symbol_with_two_eligible_candidates(self) -> None:
         marker = "AMBIGUOUS_MULTI_CANDIDATE_RESOLVED"
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             (repo / "src" / "job.py").write_text(
-                "def finalize_batch() -> int:\n    return 1\n\n\n"
-                "class Job:\n    def finalize_batch(self) -> int:\n        return 2\n",
+                "class Job:\n    def finalize_batch(self) -> int:\n        return 1\n\n\n"
+                "class Batch:\n    def finalize_batch(self) -> int:\n        return 2\n",
                 encoding="utf-8",
             )
             repo_context_forge.run_git(repo, ["add", "-A"])
-            repo_context_forge.run_git(repo, ["commit", "-m", "function and method"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "two methods"])
             result, packet = self.run_public_intent_bootstrap(
                 repo, cache_dir, runtime_home, intent="Update finalize_batch in src/job.py", top=1)
         unresolved = {(item["kind"], item["target"]) for item in packet["gitnexus"]["analysis"]["unresolved_checks"]}
