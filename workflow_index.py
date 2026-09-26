@@ -415,8 +415,6 @@ class WorkflowIndex:
             intent,
             re.IGNORECASE,
         ))
-        created_identifiers = {
-            reference.rsplit(".", 1)[-1] for reference in created_references}
         for reference in qualified_references:
             if reference in path_prefix_references:
                 continue
@@ -453,24 +451,9 @@ class WorkflowIndex:
                 IntentSymbolMatch(path=path, symbol=symbol, owner=qualifier if selected is class_matches else "")
                 for path, symbol in selected
             )
-            if (
-                not selected
-                and reference not in created_references
-                and (candidates or reference not in path_bound_references)
-                and (
-                    candidates
-                    or re.search(
-                        rf"(?:`{re.escape(reference)}`|^\s*{re.escape(reference)}[.!?]?\s*$"
-                        rf"|\b(?:updat(?:e[sd]?|ing)|modif(?:y|ies|ied|ying)|chang(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|edit(?:s|ed|ing)?|remov(?:e[sd]?|ing)|delet(?:e[sd]?|ing))\s+{re.escape(reference)}\b"
-                        rf"|\b{re.escape(reference)}\s*\("
-                        rf"|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
-                        intent,
-                        re.IGNORECASE,
-                    )
-                )
-            ):
+            if not selected and candidates and reference not in created_references:
                 gaps.append(IntentCoverageGap(
-                    kind="ambiguous_symbol" if candidates else "absent_symbol",
+                    kind="ambiguous_symbol",
                     reference=reference,
                     candidates=tuple(path for path, _symbol in candidates),
                 ))
@@ -480,24 +463,9 @@ class WorkflowIndex:
             matches = [match for match in definitions if not is_test_path(match[0])]
             if len(matches) == 1:
                 required.append(IntentSymbolMatch(path=matches[0][0], symbol=matches[0][1]))
-            elif matches or (
-                not definitions
-                and reference not in created_identifiers
-                and (
-                    reference in code_identifiers
-                    or (
-                        reference in bare_identifiers
-                        and not reference.isupper()
-                        and re.search(
-                            rf"(?:\b(?:updat(?:e[sd]?|ing)|modif(?:y|ies|ied|ying)|chang(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|edit(?:s|ed|ing)?|remov(?:e[sd]?|ing)|delet(?:e[sd]?|ing))\s+{re.escape(reference)}\b[.!?]?\s*$|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
-                            intent,
-                            re.IGNORECASE,
-                        )
-                    )
-                )
-            ):
+            elif matches:
                 gaps.append(IntentCoverageGap(
-                    kind="ambiguous_symbol" if matches else "absent_symbol",
+                    kind="ambiguous_symbol",
                     reference=reference,
                     candidates=tuple(path for path, _symbol in matches),
                 ))

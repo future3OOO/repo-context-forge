@@ -675,6 +675,25 @@ class RepoContextForgeTests(unittest.TestCase):
             marker + ": " + (result.stderr[-400:] if result.returncode else ""),
         )
 
+    def test_public_bootstrap_reports_an_absent_file_beside_a_resolved_symbol(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "owner.py").write_text("def settle_ledger():\n    return 1\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "owner"])
+            beside_result, beside = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, intent="Update settle_ledger in src/missing.py", top=1)
+        self.assertEqual(
+            (beside_result.returncode, beside["coverage_gaps"],
+             [gap for gap in beside["advisorProjection"]["coverageGaps"] if "reference" in gap], {
+                (item["kind"], item["file"], item["target"])
+                for item in beside["gitnexus_plan"] if item.get("required") is True}),
+            (0, [{"kind": "absent_file", "reference": "src/missing.py", "candidates": []}],
+             [{"kind": "absent_file", "reference": "src/missing.py", "candidates": []}],
+             {("symbol_context", "src/owner.py", "settle_ledger"),
+              ("symbol_impact", "src/owner.py", "settle_ledger")}),
+            "ABSENT_FILE_BESIDE_SYMBOL_CHANGED",
+        )
+
     def test_public_bootstrap_reports_absent_exact_file(self) -> None:
         for reference, path, marker in (("src/missing.py", "src/missing.py", "ABSENT_EXACT_FILE_REPORTED_RESOLVED"), ("src/Makefile", "src/Makefile", "EXTENSIONLESS_ABSENT_FILE_REPORTED_RESOLVED"), ("missing/missing.py", "missing/missing.py", "MISSING_PARENT_ABSENT_FILE_REPORTED_OTHER_GAP"), ("missing/missing.py.", "missing/missing.py", "PUNCTUATED_MISSING_FILE_REPORTED_OTHER_GAP"), ("`missing/missing.py`", "missing/missing.py", "EXPLICIT_DOTTED_ABSENT_FILE_REPORTED_OTHER_GAP"), ("`missing/tool`", "missing/tool", "EXPLICIT_LOWERCASE_ABSENT_FILE_REPORTED_OTHER_GAP"), ("`missing/Makefile`", "missing/Makefile", "EXPLICIT_EXTENSIONLESS_ABSENT_FILE_REPORTED_OTHER_GAP")):
             self.assert_public_intent_gap(f"Update {reference} behavior", {"kind": "absent_file", "reference": path, "candidates": []}, marker, blocks=False)
@@ -1518,7 +1537,6 @@ class RepoContextForgeTests(unittest.TestCase):
                             for gap in packet.get("coverage_gaps", [])}
                     self.assertTrue(
                         result.returncode != 0
-                        and ("absent_symbol", name) not in gaps
                         and ("no_relevant_seam", intent) in gaps,
                         "PROSE_NAME_BLOCKED_AS_SYMBOL",
                     )
@@ -1539,29 +1557,58 @@ class RepoContextForgeTests(unittest.TestCase):
                     self.assertEqual(
                         resolution.coverage_gaps, (), "JOINED_PROSE_REQUIRED_AS_CODE")
 
-    def test_public_bootstrap_blocks_absent_qualified_symbol(self) -> None:
+    def test_public_bootstrap_blocks_unmatched_names_only_as_no_relevant_seam(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
-            for intent, reference, marker in (
-                ("src.a.MissingAnchor", "src.a.MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
-                ("Inspect src.a.MissingAnchor() next", "src.a.MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
-                ("Review `src.a.MissingAnchor` next", "src.a.MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
-                ("Fix src.a.MissingAnchor before shipping", "src.a.MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
-                ("Update src.a.MissingAnchor behavior", "src.a.MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
-                ("Update MissingAnchor behavior", "MissingAnchor", "EXACT_REFERENCE_REQUIREMENT_LOST"),
-                ("Update MissingAnchor", "MissingAnchor", "DIRECT_ABSENT_IDENTIFIER_CONTRACT_REGRESSED"),
-                ("Fix MissingAnchor", "MissingAnchor", "DIRECT_ABSENT_IDENTIFIER_CONTRACT_REGRESSED"),
-                ("Update `MissingAnchor` database behavior", "MissingAnchor", "BACKTICKED_ABSENT_IDENTIFIER_NOT_REQUIRED"),
-                ("Update `MISSING_ANCHOR` database behavior", "MISSING_ANCHOR", "BACKTICKED_ABSENT_IDENTIFIER_NOT_REQUIRED"),
+            for intent in (
+                "pkg.MissingAnchor",
+                "Update pkg.MissingAnchor behavior",
+                "Update MissingAnchor",
+                "Update `MISSING_ANCHOR` database behavior",
+                "Add pkg.FutureAnchor while updating pkg.MissingAnchor",
             ):
                 result, packet = self.run_public_intent_bootstrap(
                     repo, cache_dir, runtime_home, intent=intent, top=1)
-                self.assertTrue(
-                    result.returncode != 0
-                    and any(gap.get("kind") == "absent_symbol"
-                            and gap.get("reference") == reference
-                            for gap in packet.get("coverage_gaps", [])),
-                    marker,
+                self.assertEqual(
+                    (result.returncode != 0, packet["coverage_gaps"]),
+                    (True, [{"kind": "no_relevant_seam", "reference": intent, "candidates": []}]),
+                    "UNMATCHED_NAME_NOT_NO_RELEVANT_SEAM: " + intent,
                 )
+
+    def test_public_bootstrap_ignores_unmatched_names_beside_resolved_intent(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "owner.py").write_text("def settle_ledger():\n    return 1\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "owner"])
+            for intent in (
+                "Fix `settle_ledger` and update `impacted_tests`",
+                "Fix settle_ledger while updating pkg.MissingAnchor",
+                "Fix settle_ledger; keep the JSON keys `checks`, `errors` and `JSON.stringify` output",
+            ):
+                result, packet = self.run_public_intent_bootstrap(
+                    repo, cache_dir, runtime_home, intent=intent, top=1)
+                self.assertEqual(
+                    (result.returncode, packet["coverage_gaps"],
+                     {(item["kind"], item["file"], item["target"])
+                      for item in packet["gitnexus_plan"] if item.get("required") is True},
+                     [target["path"] for target in packet["targets"]]),
+                    (0, [], {("symbol_context", "src/owner.py", "settle_ledger"),
+                                 ("symbol_impact", "src/owner.py", "settle_ledger")}, ["src/owner.py"]),
+                    "UNMATCHED_WORD_REPORTED_ABSENT: " + intent,
+                )
+
+    def test_public_bootstrap_does_not_block_a_file_target_on_an_unmatched_name(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "impact_report.py").write_text(
+                "def render_impact_report(rows):\n    return rows\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "report"])
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, intent="Include `impacted_tests` in the impact report", top=1)
+            self.assertEqual(
+                (result.returncode, packet["coverage_gaps"], [target["path"] for target in packet["targets"]]),
+                (0, [], ["src/impact_report.py"]),
+                "UNMATCHED_WORD_BLOCKED_INTAKE",
+            )
 
     def test_public_bootstrap_requires_qualified_symbol_outside_top_file(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -1677,11 +1724,7 @@ class RepoContextForgeTests(unittest.TestCase):
                     evidence = target.get("intent_evidence", {})
                     self.assertTrue(
                         evidence.get("exact_file") is True
-                        and relative_path in evidence.get("matched_terms", [])
-                        and not any(
-                            gap.get("kind") == "absent_symbol"
-                            for gap in packet["coverage_gaps"]
-                        ),
+                        and relative_path in evidence.get("matched_terms", []),
                         "DOTTED_EXISTING_FILE_REPORTED_SYMBOL_GAP",
                     )
                     if relative_path == "config.d/settings.py":
@@ -1723,6 +1766,49 @@ class RepoContextForgeTests(unittest.TestCase):
                 "DISCOVERY_GAP_REPORTED_RESOLVED",
             )
 
+    def test_public_bootstrap_blocks_ambiguous_qualified_symbol(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            for file_name in ("left.py", "right.py"):
+                (repo / "src" / file_name).write_text("class SharedAnchor:\n    pass\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "ambiguous symbol"])
+            qualified_result, qualified = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, intent="Update pkg.SharedAnchor behavior", top=1)
+            self.assertEqual(
+                (qualified_result.returncode != 0, qualified["coverage_gaps"]),
+                (True, [{"kind": "ambiguous_symbol", "reference": "pkg.SharedAnchor",
+                         "candidates": ["src/left.py", "src/right.py"]}]),
+                "QUALIFIED_AMBIGUITY_NOT_BLOCKING",
+            )
+
+    def test_public_bootstrap_exempts_a_created_qualified_name_from_ambiguity(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            for file_name in ("left.py", "right.py"):
+                (repo / "src" / file_name).write_text("class SharedAnchor:\n    pass\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "ambiguous symbol"])
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, intent="Add pkg.SharedAnchor", top=1)
+        self.assertEqual((result.returncode, packet["coverage_gaps"]), (0, []),
+                         "CREATED_QUALIFIED_NAME_BLOCKED_AS_AMBIGUOUS")
+
+    def test_public_bootstrap_resolves_a_file_qualified_shared_symbol(self) -> None:
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            for file_name in ("left.py", "right.py"):
+                (repo / "src" / file_name).write_text("class SharedAnchor:\n    pass\n", encoding="utf-8")
+            repo_context_forge.run_git(repo, ["add", "-A"])
+            repo_context_forge.run_git(repo, ["commit", "-m", "ambiguous symbol"])
+            selected_result, selected = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, intent="Update left.SharedAnchor behavior", top=1)
+            self.assertEqual(
+                (selected_result.returncode, selected["coverage_gaps"], {
+                    (item["kind"], item["file"], item["target"])
+                    for item in selected["gitnexus_plan"] if item.get("required") is True}),
+                (0, [], {("symbol_context", "src/left.py", "SharedAnchor"),
+                         ("symbol_impact", "src/left.py", "SharedAnchor")}),
+                "QUALIFIED_DISAMBIGUATION_LOST",
+            )
+
     def test_public_bootstrap_decides_an_intent_symbol_by_its_production_definitions(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             (repo / "tests").mkdir()
@@ -1750,6 +1836,9 @@ class RepoContextForgeTests(unittest.TestCase):
     def anchored_gap_repo(self):
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             (repo / "src" / "db.py").write_text("def connect():\n    return 1\n", encoding="utf-8")
+            for file_name in ("left.py", "right.py"):
+                (repo / "src" / file_name).write_text(
+                    "class SharedAnchor:\n    pass\n\n\nclass OtherAnchor:\n    pass\n", encoding="utf-8")
             repo_context_forge.run_git(repo, ["add", "-A"])
             repo_context_forge.run_git(repo, ["commit", "-m", "anchored"])
             yield repo, cache_dir, runtime_home
@@ -1758,7 +1847,7 @@ class RepoContextForgeTests(unittest.TestCase):
         with self.anchored_gap_repo() as (repo, cache_dir, runtime_home):
             return self.run_public_intent_bootstrap(
                 repo, cache_dir, runtime_home, gitnexus_mode=gitnexus_mode, top=1,
-                intent="Update src/db.py honoring `materialConsequence.result` and `premise.claim`")
+                intent="Update src/db.py honoring SharedAnchor and OtherAnchor")
 
     def gap_terms(self, packet: dict[str, object]) -> list[str]:
         return [f"{gap['kind']} {gap['reference']}" for gap in packet["coverage_gaps"]]
@@ -1869,8 +1958,10 @@ class RepoContextForgeTests(unittest.TestCase):
         intent_gaps = [
             gap for gap in packet["advisorProjection"]["coverageGaps"] if "reference" in gap]
         self.assertEqual(
-            (intent_gaps, {key for gap in intent_gaps for key in gap}),
-            (packet["coverage_gaps"], {"kind", "reference", "candidates"}),
+            (intent_gaps, [(gap["kind"], gap["reference"]) for gap in intent_gaps],
+             {key for gap in intent_gaps for key in gap}),
+            (packet["coverage_gaps"], [("ambiguous_symbol", "SharedAnchor"), ("ambiguous_symbol", "OtherAnchor")],
+             {"kind", "reference", "candidates"}),
             "ADVISOR_PROJECTION_COVERAGE_GAP_SHAPE_CHANGED")
 
     def test_public_bootstrap_keeps_off_mode_gap_handling_unchanged(self) -> None:
@@ -1881,10 +1972,13 @@ class RepoContextForgeTests(unittest.TestCase):
             "OFF_MODE_PACKET_OUTCOME_CHANGED")
 
     def test_public_bootstrap_renders_no_candidate_suffix_for_a_gap_without_candidates(self) -> None:
-        result, packet = self.run_anchored_gap_bootstrap()
+        with self.anchored_gap_repo() as (repo, cache_dir, runtime_home):
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, top=1, intent="Update src/db.py and src/missing.py")
         self.assertTrue(
-            all(not gap["candidates"] and f"{gap['kind']} {gap['reference']} (candidates" not in result.stdout
-                for gap in packet["coverage_gaps"]),
+            packet["coverage_gaps"]
+            and all(not gap["candidates"] and f"{gap['kind']} {gap['reference']} (candidates" not in result.stdout
+                    for gap in packet["coverage_gaps"]),
             "EMPTY_CANDIDATE_LIST_RENDERED_A_SUFFIX")
 
     def test_public_bootstrap_keeps_gap_warnings_independent_of_gitnexus_status(self) -> None:
@@ -2155,10 +2249,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 result, packet = self.run_public_intent_bootstrap(
                     repo, cache_dir, runtime_home, intent=intent, top=1)
                 self.assertTrue(
-                    result.returncode == 0
-                    and not any(gap.get("kind") == "absent_symbol"
-                                and gap.get("reference") == "FutureAnchor"
-                                for gap in packet.get("coverage_gaps", [])),
+                    result.returncode == 0 and not packet["coverage_gaps"],
                     "CREATION_PHRASE_BLOCKED_FUTURE_SYMBOL",
                 )
             for intent in (
@@ -2177,25 +2268,9 @@ class RepoContextForgeTests(unittest.TestCase):
                             for gap in packet.get("coverage_gaps", [])}
                     self.assertTrue(
                         result.returncode != 0
-                        and ("absent_symbol", "FutureAnchor") not in gaps
                         and ("no_relevant_seam", intent) in gaps,
                         "CREATION_PHRASE_BLOCKED_FUTURE_SYMBOL",
                     )
-
-    def test_public_bootstrap_scopes_future_symbol_creation(self) -> None:
-        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
-            result, packet = self.run_public_intent_bootstrap(
-                repo, cache_dir, runtime_home,
-                intent="Add pkg.FutureAnchor while updating pkg.MissingAnchor", top=1,
-            )
-            gaps = {(gap.get("kind"), gap.get("reference"))
-                    for gap in packet.get("coverage_gaps", [])}
-            self.assertTrue(
-                result.returncode != 0
-                and ("absent_symbol", "pkg.MissingAnchor") in gaps
-                and ("absent_symbol", "pkg.FutureAnchor") not in gaps,
-                "MIXED_ADD_HID_ABSENT_REFERENCE",
-            )
 
     def test_public_bootstrap_allocates_optional_checks_across_targets(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
