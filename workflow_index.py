@@ -461,7 +461,7 @@ class WorkflowIndex:
                     candidates
                     or re.search(
                         rf"(?:`{re.escape(reference)}`|^\s*{re.escape(reference)}[.!?]?\s*$"
-                        rf"|\b(?:update|modify|change|fix|edit|remove|delete)\s+{re.escape(reference)}\b"
+                        rf"|\b(?:updat(?:e[sd]?|ing)|modif(?:y|ies|ied|ying)|chang(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|edit(?:s|ed|ing)?|remov(?:e[sd]?|ing)|delet(?:e[sd]?|ing))\s+{re.escape(reference)}\b"
                         rf"|\b{re.escape(reference)}\s*\("
                         rf"|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
                         intent,
@@ -489,7 +489,7 @@ class WorkflowIndex:
                         reference in bare_identifiers
                         and not reference.isupper()
                         and re.search(
-                            rf"(?:\b(?:update|modify|change|fix|edit|remove|delete)\s+{re.escape(reference)}\b[.!?]?\s*$|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
+                            rf"(?:\b(?:updat(?:e[sd]?|ing)|modif(?:y|ies|ied|ying)|chang(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|edit(?:s|ed|ing)?|remov(?:e[sd]?|ing)|delet(?:e[sd]?|ing))\s+{re.escape(reference)}\b[.!?]?\s*$|\b{re.escape(reference)}\s+(?:behavior|implementation|definition|callers?)\b)",
                             intent,
                             re.IGNORECASE,
                         )
