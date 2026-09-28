@@ -179,9 +179,9 @@ checkouts in the source checkout. Exact files, qualified existing symbols, and
 globally unambiguous explicit symbols remain required through final graph planning.
 Matching uses the complete workflow-index inventory, independently of bounded symbol
 display. Whole intent target records carry relevance score, exact-file status, matched
-terms, and matched symbols through final ordering and `advisorProjection`. Ambiguous or absent
-references become explicit coverage gaps; only the qualified reference immediately governed
-by Add/Create is treated as a future symbol. Required context/impact pairs allocate before
+terms, and matched symbols through final ordering and `advisorProjection`. Ambiguous symbols
+and absent files become explicit coverage gaps; a name matching no definition is not reported,
+and a qualified reference governed by Add/Create is exempt from ambiguity. Required context/impact pairs allocate before
 optional breadth. Required omissions are whole blocking records; optional omissions are
 counted separately and remain non-blocking. Directory-derived `go.sum` and `Cargo.lock` are
 excluded; explicitly named lockfiles remain required anchors.
