@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import importlib.util
+import json
 import os
 import shutil
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -4268,6 +4270,7 @@ class RepoContextForgeTests(unittest.TestCase):
                     CREATE TABLE files (
                       id INTEGER PRIMARY KEY,
                       path TEXT,
+                      mtime_ms REAL,
                       pagerank REAL,
                       symbol_count INTEGER,
                       line_count INTEGER
@@ -4309,7 +4312,7 @@ class RepoContextForgeTests(unittest.TestCase):
                     """
                 )
                 conn.executemany(
-                    "INSERT INTO files VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO files (id, path, pagerank, symbol_count, line_count) VALUES (?, ?, ?, ?, ?)",
                     [
                         (1, "src/core.py", 0.5, 1, 20),
                         (2, "src/app.py", 0.4, 1, 20),
@@ -4378,7 +4381,7 @@ class RepoContextForgeTests(unittest.TestCase):
         with closing(sqlite3.connect(db_dir / "repomap.db")) as conn, conn:
             conn.executescript(
                 """
-                CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT, pagerank REAL,
+                CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT, mtime_ms REAL, pagerank REAL,
                                     symbol_count INTEGER, line_count INTEGER);
                 CREATE TABLE edges (source_file_id INTEGER, target_file_id INTEGER,
                                     weight REAL, confidence INTEGER);
@@ -4391,7 +4394,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 """
             )
             conn.executemany(
-                "INSERT INTO files VALUES (?, ?, 0.1, 1, 20)", files)
+                "INSERT INTO files (id, path, pagerank, symbol_count, line_count) VALUES (?, ?, 0.1, 1, 20)", files)
             conn.executemany("INSERT INTO edges VALUES (?, ?, ?, ?)", list(edges))
             conn.executemany("INSERT INTO refs VALUES (?, ?, ?, ?)", refs)
         return repo_context_forge.SoulForgeMap(repo)
@@ -4556,6 +4559,7 @@ class RepoContextForgeTests(unittest.TestCase):
                     CREATE TABLE files (
                       id INTEGER PRIMARY KEY,
                       path TEXT,
+                      mtime_ms REAL,
                       pagerank REAL,
                       symbol_count INTEGER,
                       line_count INTEGER
@@ -4577,7 +4581,7 @@ class RepoContextForgeTests(unittest.TestCase):
                     );
                     """
                 )
-                conn.execute("INSERT INTO files VALUES (1, 'src/core.py', 1.0, 2, 20)")
+                conn.execute("INSERT INTO files (id, path, pagerank, symbol_count, line_count) VALUES (1, 'src/core.py', 1.0, 2, 20)")
                 conn.executemany(
                     "INSERT INTO symbols VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     [
@@ -4627,9 +4631,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 "HEAD",
                 Path(cache_dir),
             )
-            db_path = state.analysis_repo / ".soulforge" / "repomap.db"
-            db_path.parent.mkdir()
-            db_path.write_text("db", encoding="utf-8")
+            self.write_soulforge_map(state.analysis_repo, ["src/a.py"], head=state.head_sha)
 
             metadata = repo_context_forge.soulforge_target_metadata(
                 state,
@@ -4642,6 +4644,566 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertTrue(metadata["target_head_verified"])
             self.assertEqual(metadata["analysis_head_sha"], state.head_sha)
             self.assertTrue(metadata["analysis_repo_is_cache_owned"])
+
+    SOULFORGE_SCHEMA = """
+        CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT, mtime_ms REAL, language TEXT,
+                            line_count INTEGER, symbol_count INTEGER, pagerank REAL);
+        CREATE TABLE symbols (id INTEGER PRIMARY KEY, file_id INTEGER, name TEXT, kind TEXT,
+                              line INTEGER, end_line INTEGER, is_exported INTEGER, signature TEXT);
+        CREATE TABLE edges (source_file_id INTEGER, target_file_id INTEGER, weight REAL);
+        CREATE TABLE refs (file_id INTEGER, name TEXT, source_file_id INTEGER, import_source TEXT);
+        CREATE TABLE cochanges (file_id_a INTEGER, file_id_b INTEGER, count INTEGER);
+        CREATE TABLE calls (caller_symbol_id INTEGER, callee_name TEXT, callee_symbol_id INTEGER,
+                            callee_file_id INTEGER, line INTEGER);
+        CREATE TABLE external_imports (file_id INTEGER, package TEXT);
+        CREATE TABLE semantic_summaries (symbol_id INTEGER, source TEXT, summary TEXT);
+    """
+
+    def write_soulforge_map(
+        self, repo: Path, paths: list[str], *, edges: list[tuple[int, int]] = (),
+        head: str | None = None, schema: str = SOULFORGE_SCHEMA,
+    ) -> Path:
+        """A map shaped like a real SoulForge product for `paths`, fresh by construction
+        (files.mtime_ms copied from the working files). `head=None` is a 2.13.2 map with no
+        meta table; `head=""` is an Empryo map whose build never reached cochanges_head."""
+        db_path = repo / ".soulforge" / "repomap.db"
+        db_path.parent.mkdir(exist_ok=True)
+        with closing(sqlite3.connect(db_path)) as conn, conn:
+            conn.executescript(schema)
+            for index, path in enumerate(paths, start=1):
+                conn.execute(
+                    "INSERT INTO files VALUES (?, ?, ?, 'python', 1, 0, 0.5)",
+                    (index, path, (repo / path).stat().st_mtime_ns / 1e6))
+            if edges:
+                conn.executemany("INSERT INTO edges VALUES (?, ?, 1.0)", edges)
+            if head is not None:
+                conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                if head:
+                    conn.execute("INSERT INTO meta VALUES ('cochanges_head', ?)", (head,))
+        repo_context_forge.SoulForgeMap(repo).write_sources()
+        return db_path
+
+    @staticmethod
+    def leave_hot_journal(db_path: Path) -> None:
+        """The rollback journal an interrupted writer leaves behind: SQLite's journal magic, an
+        open record count and one page image, so a read-only open must recover and refuses."""
+        header = bytes.fromhex("d9d505f920a163d7") + struct.pack(">IIIII", 0xFFFFFFFF, 0, 1, 512, 4096)
+        record = struct.pack(">I", 1) + db_path.read_bytes()[:4096] + b"\0\0\0\0"
+        (db_path.parent / f"{db_path.name}-journal").write_bytes(header.ljust(512, b"\0") + record)
+
+    def auto_build_without_binary(self, repo: Path) -> repo_context_forge.MapBuildResult:
+        return repo_context_forge.build_soulforge_map(repo, None, "auto", 1)
+
+    def real_soulforge(self) -> str:
+        binary = repo_context_forge.find_soulforge_binary(os.environ.get("RCF_SOULFORGE_BIN"))
+        self.assertIsNotNone(
+            binary, "real SoulForge binary is required (RCF_SOULFORGE_BIN or an installed soulforge)")
+        return str(binary)
+
+    @contextmanager
+    def soulforge_home(self):
+        """An isolated HOME whose SoulForge config names a provider that needs no login and an
+        unreachable endpoint: the headless turn fails fast after the map is built (exit 0)."""
+        with tempfile.TemporaryDirectory() as home:
+            config = Path(home) / ".soulforge"
+            config.mkdir()
+            (config / "config.json").write_text(
+                '{"defaultModel":"openai/gpt-4o-mini","telemetry":false,"onboardingComplete":true,'
+                '"semanticSummaries":"synthetic"}\n', encoding="utf-8")
+            with patch.dict(os.environ, {
+                "HOME": home, "OPENAI_API_KEY": "sk-test-invalid", "OPENAI_BASE_URL": "http://127.0.0.1:9",
+            }):
+                yield
+
+    def make_import_repo(self, root: Path) -> None:
+        """make_git_repo plus a committed file in another directory: SoulForge links same-directory
+        orphans to each other, so only a real import statement can make tools/b.py a dependent."""
+        self.make_git_repo(root)
+        (root / "tools").mkdir()
+        (root / "tools" / "b.py").write_text("VALUE = 1\n", encoding="utf-8")
+        repo_context_forge.run_cmd(["git", "add", "tools/b.py"], cwd=root)
+        repo_context_forge.run_cmd(["git", "commit", "-q", "-m", "importer"], cwd=root)
+
+    def build_real_map(self, repo: Path, build_mode: str = "always") -> tuple[str, Path, repo_context_forge.MapBuildResult]:
+        """Build `repo`'s map with the real SoulForge binary; returns (binary, db_path, result)."""
+        binary = self.real_soulforge()
+        result = repo_context_forge.build_soulforge_map(repo, binary, build_mode, 1)
+        return binary, repo / ".soulforge" / "repomap.db", result
+
+    def bootstrap_with_real_map(self, repo: Path, cache_dir: str, out_dir: str, *extra: str) -> dict[str, object]:
+        """The public entrypoint in intent mode with the real SoulForge binary and no GitNexus."""
+        packet_path = Path(out_dir) / "packet.json"
+        packet_path.unlink(missing_ok=True)
+        result = repo_context_forge.run_cmd([
+            sys.executable, str(ROOT / "scripts" / "codex_context_bootstrap.py"),
+            "--repo", str(repo), "--mode", "intent", "--intent", "update src/a.py", "--top", "3",
+            "--cache-dir", cache_dir, "--gitnexus-mode", "off", "--soulforge-bin", self.real_soulforge(),
+            "--map-timeout-ms", "1", "--packet-json-out", str(packet_path), *extra,
+        ], allow_fail=True)
+        self.assertEqual(result.returncode, 0, f"public bootstrap failed: {result.stderr[-1500:]}")
+        return json.loads(packet_path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def map_rows(db_path: Path, sql: str) -> list[tuple[object, ...]]:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+            return [tuple(row) for row in conn.execute(sql).fetchall()]
+
+    def test_soulforge_map_refuses_renamed_consumed_column(self) -> None:
+        # BM_SCHEMA_GUARD: a consumed column renamed under RCF must fail at bootstrap by name,
+        # before any query returns empty impact or SQLite's own error.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            state = repo_context_forge.ensure_local_analysis_worktree(repo, "HEAD", Path(cache_dir))
+            db_path = self.write_soulforge_map(
+                state.analysis_repo, ["src/a.py"],
+                schema=self.SOULFORGE_SCHEMA.replace("weight REAL", "edge_weight REAL"))
+            for operation in (
+                lambda: repo_context_forge.SoulForgeMap(state.analysis_repo).impact_summary_for_file("src/a.py"),
+                lambda: repo_context_forge.make_packet(
+                    repo, mode="intent", base_ref="HEAD", head_ref="HEAD", intent="update src/a.py",
+                    top=5, token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET, cache_dir=Path(cache_dir),
+                    soulforge_bin=None, map_build="never", map_timeout_ms=1, allow_missing_map=True,
+                    gitnexus_repo=None),
+            ):
+                with self.assertRaises(RuntimeError, msg="SCHEMA_GUARD_MISSING") as raised:
+                    operation()
+                self.assertIn("edges.weight", str(raised.exception), "SCHEMA_GUARD_MISSING")
+                self.assertIn(str(db_path), str(raised.exception), "SCHEMA_GUARD_MISSING")
+
+    def test_soulforge_map_keeps_fallbacks_for_absent_optional_tables(self) -> None:
+        # BM_SCHEMA_OPTIONAL_TABLE: absent optional tables keep today's fallbacks; the fixture map
+        # (no meta, no semantic_summaries) and a map without edges still answer.
+        fixture = Path(__file__).parent / "fixtures" / "soulforge_python_imports.sql"
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            (repo / ".soulforge").mkdir()
+            with closing(sqlite3.connect(repo / ".soulforge" / "repomap.db")) as conn, conn:
+                conn.executescript(fixture.read_text(encoding="utf-8"))
+            soul_map = repo_context_forge.SoulForgeMap(repo)
+            self.assertEqual(soul_map.impact_summary_for_file("pkg/lib/alpha.py")["direct_dependents"], 6,
+                             "OPTIONAL_TABLE_REFUSED")
+            self.assertEqual(soul_map.symbols_for_file("pkg/lib/alpha.py")[0].summary_source,
+                             "synthetic_fallback", "OPTIONAL_TABLE_REFUSED")
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            self.write_soulforge_map(
+                repo, ["src/a.py"],
+                schema=self.SOULFORGE_SCHEMA.replace(
+                    "CREATE TABLE edges (source_file_id INTEGER, target_file_id INTEGER, weight REAL);", ""))
+            summary = repo_context_forge.SoulForgeMap(repo).impact_summary_for_file("src/a.py")
+            self.assertEqual((summary["direct_dependents"], summary["risk"]), (0, "low"), "OPTIONAL_TABLE_REFUSED")
+
+    def test_auto_build_rebuilds_when_indexed_file_mtime_moved(self) -> None:
+        # BM_STALE_MTIME_REBUILD: newer, older-but-different, and sub-millisecond drift inputs.
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            target = repo / "src" / "a.py"
+            self.write_soulforge_map(repo, ["src/a.py"])
+            stamp = target.stat().st_mtime_ns
+            for offset_ns in (5_000_000_000, -5_000_000_000):
+                os.utime(target, ns=(stamp + offset_ns, stamp + offset_ns))
+                result = self.auto_build_without_binary(repo)
+                self.assertIn("src/a.py", str(result.reason), f"STALE_MAP_NOT_REBUILT offset={offset_ns}")
+                self.assertIn("SoulForge binary not found", str(result.warning),
+                              f"STALE_MAP_NOT_REBUILT offset={offset_ns}")
+            os.utime(target, ns=(stamp + 300, stamp + 300))  # 0.0003 ms: the measured rebuilt-row drift
+            result = self.auto_build_without_binary(repo)
+            self.assertEqual((result.attempted, result.warning, result.reason), (False, None, None),
+                             "STALE_MAP_NOT_REBUILT")
+        with tempfile.TemporaryDirectory() as repo_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_import_repo(repo)
+            binary, db_path, _ = self.build_real_map(repo)
+            before = self.map_rows(db_path, "SELECT mtime_ms, symbol_count FROM files WHERE path = 'tools/b.py'")
+            time.sleep(0.01)
+            (repo / "tools" / "b.py").write_text("import src.a\n\ndef added() -> None:\n    return None\n",
+                                               encoding="utf-8")
+            result = repo_context_forge.build_soulforge_map(repo, binary, "auto", 1)
+            self.assertTrue(result.attempted, "STALE_MAP_NOT_REBUILT")
+            after = self.map_rows(db_path, "SELECT mtime_ms, symbol_count FROM files WHERE path = 'tools/b.py'")
+            self.assertNotEqual(before, after, "STALE_MAP_NOT_REBUILT")
+            self.assertAlmostEqual(float(after[0][0]), (repo / "tools" / "b.py").stat().st_mtime_ns / 1e6,
+                                   delta=0.01, msg="STALE_MAP_NOT_REBUILT")
+
+    def test_auto_build_rebuilds_when_cochanges_head_moved(self) -> None:
+        # BM_STALE_HEAD_REBUILD
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+            self.write_soulforge_map(repo, ["src/a.py"], head="0" * 40)
+            result = self.auto_build_without_binary(repo)
+            self.assertIn("0" * 40, str(result.reason), "STALE_HEAD_NOT_REBUILT")
+            self.assertIn(head, str(result.reason), "STALE_HEAD_NOT_REBUILT")
+            self.assertIn("SoulForge binary not found", str(result.warning), "STALE_HEAD_NOT_REBUILT")
+        with tempfile.TemporaryDirectory() as repo_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            binary, db_path, _ = self.build_real_map(repo)
+            self.assertEqual(self.map_rows(db_path, "SELECT value FROM meta WHERE key = 'cochanges_head'"),
+                             [(repo_context_forge.run_git(repo, ["rev-parse", "HEAD"]),)],
+                             "SoulForge >= 2.20 (Empryo) is required: set RCF_SOULFORGE_BIN")
+            (repo / "src" / "a.py").write_text("print('moved')\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "commit", "-q", "-am", "move head"], cwd=repo)
+            new_head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+            result = repo_context_forge.build_soulforge_map(repo, binary, "auto", 1)
+            self.assertTrue(result.attempted, "STALE_HEAD_NOT_REBUILT")
+            self.assertEqual(self.map_rows(db_path, "SELECT value FROM meta WHERE key = 'cochanges_head'"),
+                             [(new_head,)], "STALE_HEAD_NOT_REBUILT")
+
+    def test_auto_build_rebuilds_when_indexed_file_deleted(self) -> None:
+        # BM_STALE_MISSING_FILE_REBUILD
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_import_repo(repo)
+            self.write_soulforge_map(repo, ["src/a.py", "tools/b.py"])
+            (repo / "tools" / "b.py").unlink()
+            result = self.auto_build_without_binary(repo)
+            self.assertEqual(result.reason, repo_context_forge.SoulForgeMap.SOURCE_SET_CHANGED,
+                             "DELETED_FILE_NOT_STALE")
+        # Bulk deletion: SoulForge's incremental rescan refuses to drop >= 80% of its files, so
+        # the changed path set must be rebuilt from scratch and converge.
+        with tempfile.TemporaryDirectory() as repo_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_import_repo(repo)
+            for index in range(8):
+                (repo / f"extra{index}.py").write_text("VALUE = 1\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "."], cwd=repo)
+            repo_context_forge.run_cmd(["git", "commit", "-qm", "extra sources"], cwd=repo)
+            binary, db_path, _ = self.build_real_map(repo)
+            self.assertIn(("tools/b.py",), self.map_rows(db_path, "SELECT path FROM files"), "DELETED_FILE_NOT_STALE")
+            for path in ("tools/b.py", *(f"extra{index}.py" for index in range(8))):
+                (repo / path).unlink()
+            # A forced incremental build keeps the refused deletions; the next auto must
+            # still converge from scratch.
+            repo_context_forge.build_soulforge_map(repo, binary, "always", 1)
+            self.assertIn(("tools/b.py",), self.map_rows(db_path, "SELECT path FROM files"), "DELETED_FILE_NOT_STALE")
+            result = repo_context_forge.build_soulforge_map(repo, binary, "auto", 1)
+            self.assertTrue(result.attempted, "DELETED_FILE_NOT_STALE")
+            self.assertEqual(self.map_rows(db_path, "SELECT path FROM files WHERE path != '.gitignore'"),
+                             [("src/a.py",)], "DELETED_FILE_NOT_STALE")
+            self.assertFalse(repo_context_forge.build_soulforge_map(repo, binary, "auto", 1).attempted,
+                             "DELETED_FILE_NOT_STALE")
+            # Committed bulk deletion: the path-set change must win over the HEAD change so the
+            # single auto call rebuilds from scratch rather than incrementally.
+            (repo / "src" / "a.py").unlink()
+            for index in range(8):
+                (repo / f"again{index}.py").write_text("VALUE = 2\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "-A"], cwd=repo)
+            repo_context_forge.run_cmd(["git", "commit", "-qm", "again"], cwd=repo)
+            self.assertTrue(repo_context_forge.build_soulforge_map(repo, binary, "auto", 1).attempted)
+            for index in range(8):
+                repo_context_forge.run_cmd(["git", "rm", "-q", f"again{index}.py"], cwd=repo)
+            # An always build first records the reduced source set while SoulForge keeps the
+            # refused rows; committing then moves HEAD too. One auto call must still reset.
+            repo_context_forge.build_soulforge_map(repo, binary, "always", 1)
+            repo_context_forge.run_cmd(["git", "commit", "-qm", "bulk delete"], cwd=repo)
+            result = repo_context_forge.build_soulforge_map(repo, binary, "auto", 1)
+            self.assertEqual(result.reason, repo_context_forge.SoulForgeMap.SOURCE_SET_CHANGED, "DELETED_FILE_NOT_STALE")
+            self.assertEqual(self.map_rows(db_path, "SELECT path FROM files WHERE path != '.gitignore'"), [],
+                             "DELETED_FILE_NOT_STALE committed bulk deletion")
+            self.assertFalse(repo_context_forge.build_soulforge_map(repo, binary, "auto", 1).attempted,
+                             "DELETED_FILE_NOT_STALE")
+
+    def test_auto_build_rebuilds_when_source_file_added(self) -> None:
+        # BM_STALE_ADDED_FILE_REBUILD: an added file changes neither HEAD nor an indexed mtime;
+        # a map without a recorded source set takes one migration rebuild.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, \
+                tempfile.TemporaryDirectory() as out_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_import_repo(repo)
+            self.bootstrap_with_real_map(repo, cache_dir, out_dir)
+            (repo / "tools" / "new.py").write_text("import src.a\n", encoding="utf-8")
+            packet = self.bootstrap_with_real_map(repo, cache_dir, out_dir)
+            self.assertTrue(packet["soulforge"]["build"]["attempted"], "ADDED_FILE_NOT_STALE")
+            target = next(item for item in packet["targets"] if item["path"] == "src/a.py")
+            self.assertIn("tools/new.py", {item["path"] for item in target["soulforge_impact"]["dependents"]},
+                          "ADDED_FILE_NOT_STALE")
+            self.assertFalse(self.bootstrap_with_real_map(repo, cache_dir, out_dir)["soulforge"]["build"]["attempted"],
+                             "ADDED_FILE_NOT_STALE")
+            # A file SoulForge skipped (over its 500 KB limit) has no indexed mtime; shrinking it
+            # into an importer must still refresh the map.
+            (repo / "tools" / "big.py").write_text("# " + "x" * 600_000 + "\n", encoding="utf-8")
+            packet = self.bootstrap_with_real_map(repo, cache_dir, out_dir)
+            self.assertNotIn(("tools/big.py",), self.map_rows(
+                Path(packet["soulforge"]["target"]["db_path"]), "SELECT path FROM files"), "ADDED_FILE_NOT_STALE")
+            time.sleep(0.01)
+            (repo / "tools" / "big.py").write_text("import src.a\n", encoding="utf-8")
+            packet = self.bootstrap_with_real_map(repo, cache_dir, out_dir)
+            self.assertIn("tools/big.py", {item["path"] for item in next(
+                item for item in packet["targets"] if item["path"] == "src/a.py")["soulforge_impact"]["dependents"]},
+                "ADDED_FILE_NOT_STALE oversized")
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            self.write_soulforge_map(repo, ["src/a.py"])
+            self.assertFalse(self.auto_build_without_binary(repo).attempted, "ADDED_FILE_NOT_STALE")
+            for added in ("requirements.txt", "src/new.py"):
+                (repo / added).write_text("x\n", encoding="utf-8")
+                result = self.auto_build_without_binary(repo)
+                self.assertEqual(result.reason, repo_context_forge.SoulForgeMap.SOURCE_SET_CHANGED,
+                                 f"ADDED_FILE_NOT_STALE {added}")
+                (repo / added).unlink()
+            sources_path = repo_context_forge.SoulForgeMap(repo).sources_path
+            sources_path.write_text("src/a.py\t", encoding="utf-8")  # torn write
+            self.assertEqual(self.auto_build_without_binary(repo).reason,
+                             repo_context_forge.SoulForgeMap.SOURCE_SET_CHANGED, "TORN_RECORD_NOT_STALE")
+            sources_path.unlink()
+            self.assertEqual(self.auto_build_without_binary(repo).reason,
+                             repo_context_forge.SoulForgeMap.SOURCE_SET_CHANGED, "ADDED_FILE_NOT_STALE no manifest")
+
+    def test_retained_soulforge_paths_cannot_escape_cache(self) -> None:
+        # BM_KEEP_CACHE_BOUNDARY: the retained map may not redirect SoulForge's writes outside
+        # the cache through a symlinked directory or database.
+        for redirect in ("directory", "database", "manifest"):
+            with self.subTest(redirect=redirect), tempfile.TemporaryDirectory() as repo_dir, \
+                    tempfile.TemporaryDirectory() as cache_dir, tempfile.TemporaryDirectory() as outside_dir:
+                repo = Path(repo_dir)
+                self.make_git_repo(repo)
+                state = repo_context_forge.ensure_local_analysis_worktree(repo, "HEAD", Path(cache_dir))
+                cache = state.analysis_repo / ".soulforge"
+                outside = Path(outside_dir)
+                if redirect == "directory":
+                    cache.symlink_to(outside, target_is_directory=True)
+                elif redirect == "database":
+                    cache.mkdir()
+                    sqlite3.connect(outside / "repomap.db").close()
+                    (cache / "repomap.db").symlink_to(outside / "repomap.db")
+                else:
+                    sources = repo_context_forge.SoulForgeMap(state.analysis_repo).sources_path
+                    sources.parent.mkdir(exist_ok=True)
+                    (outside / "victim").write_text("keep\n", encoding="utf-8")
+                    sources.symlink_to(outside / "victim")
+                with self.assertRaises(RuntimeError, msg="CACHE_BOUNDARY_ESCAPED"):
+                    repo_context_forge.reset_cached_worktree(state.analysis_repo, Path(cache_dir))
+
+    def test_auto_build_rebuilds_incomplete_maps_and_keeps_complete_empty_ones(self) -> None:
+        # BM_INCOMPLETE_MAP_REBUILD
+        with tempfile.TemporaryDirectory() as repo_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+            db_path = self.write_soulforge_map(repo, ["src/a.py"], head=head)
+            self.leave_hot_journal(db_path)
+            result = self.auto_build_without_binary(repo)
+            self.assertIn("readonly", str(result.reason), "INCOMPLETE_MAP_NOT_REBUILT hot journal")
+            self.assertIn("SoulForge binary not found", str(result.warning), "INCOMPLETE_MAP_NOT_REBUILT")
+            (db_path.parent / "repomap.db-journal").unlink()
+            db_path.unlink()
+            sqlite3.connect(db_path).close()  # killed before any table was written
+            result = self.auto_build_without_binary(repo)
+            self.assertIn("no such table: files", str(result.reason), "INCOMPLETE_MAP_NOT_REBUILT empty db")
+            db_path.unlink()
+            self.write_soulforge_map(repo, [], head="")
+            result = self.auto_build_without_binary(repo)
+            self.assertIn("cochanges_head", str(result.reason), "INCOMPLETE_MAP_NOT_REBUILT no head")
+            db_path.unlink()
+            self.write_soulforge_map(repo, ["src/a.py"])  # independent file, no edges, 2.13.2 shape
+            self.assertEqual(self.auto_build_without_binary(repo).attempted, False, "INCOMPLETE_MAP_NOT_REBUILT")
+            db_path.unlink()
+            self.write_soulforge_map(repo, [], head=head)  # empty checkout on Empryo
+            self.assertEqual(self.auto_build_without_binary(repo).attempted, False, "INCOMPLETE_MAP_NOT_REBUILT")
+        with tempfile.TemporaryDirectory() as repo_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_import_repo(repo)
+            head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
+            with patch.dict(os.environ, {"SOULFORGE_NO_REPOMAP": "1"}):
+                binary, db_path, _ = self.build_real_map(repo)
+            self.assertEqual(
+                self.map_rows(db_path, "SELECT (SELECT COUNT(*) FROM files), "
+                                       "(SELECT COUNT(*) FROM sqlite_master WHERE name = 'meta')"),
+                [(0, 1)], "SoulForge >= 2.20 (Empryo) is required: set RCF_SOULFORGE_BIN")
+            result = repo_context_forge.build_soulforge_map(repo, binary, "auto", 1)
+            self.assertTrue(result.attempted, "INCOMPLETE_MAP_NOT_REBUILT")
+            self.assertEqual(self.map_rows(db_path, "SELECT COUNT(*) FROM files"), [(3,)],
+                             "INCOMPLETE_MAP_NOT_REBUILT")
+            self.assertEqual(self.map_rows(db_path, "SELECT value FROM meta WHERE key = 'cochanges_head'"),
+                             [(head,)], "INCOMPLETE_MAP_NOT_REBUILT")
+            self.assertFalse(repo_context_forge.build_soulforge_map(repo, binary, "auto", 1).attempted,
+                             "INCOMPLETE_MAP_NOT_REBUILT")
+
+    def test_unreadable_map_falls_back_to_workflow_index_packet(self) -> None:
+        # BM_UNREADABLE_MAP_FALLBACK
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            state = repo_context_forge.ensure_local_analysis_worktree(repo, "HEAD", Path(cache_dir))
+            db_path = self.write_soulforge_map(state.analysis_repo, ["src/a.py"], head=state.head_sha)
+            self.leave_hot_journal(db_path)
+            for map_build, expected_warnings in (("auto", 2), ("never", 1)):
+                packet = repo_context_forge.make_packet(
+                    repo, mode="intent", base_ref="HEAD", head_ref="HEAD", intent="update src/a.py",
+                    top=5, token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET, cache_dir=Path(cache_dir),
+                    soulforge_bin=None, map_build=map_build, map_timeout_ms=1, allow_missing_map=True,
+                    gitnexus_repo=None)
+                self.assertFalse(packet["soulforge"]["stats"]["available"],
+                                 f"UNREADABLE_MAP_CRASHES_BOOTSTRAP {map_build}")
+                self.assertEqual(packet["soulforge"]["target"]["status"], "stale",
+                                 f"UNREADABLE_MAP_CRASHES_BOOTSTRAP {map_build}")
+                relevant = [w for w in packet["warnings"] if "readonly" in w or "SoulForge binary not found" in w]
+                self.assertEqual(len(relevant), expected_warnings,
+                                 f"UNREADABLE_MAP_CRASHES_BOOTSTRAP {map_build}: {packet['warnings']}")
+                self.assertEqual([entry["path"] for entry in packet["targets"]], ["src/a.py"],
+                                 f"UNREADABLE_MAP_CRASHES_BOOTSTRAP {map_build}")
+
+    def test_packet_reports_stale_map_status_and_reason(self) -> None:
+        # BM_STALE_STATUS_REPORTED
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            state = repo_context_forge.ensure_local_analysis_worktree(repo, "HEAD", Path(cache_dir))
+            self.write_soulforge_map(state.analysis_repo, ["src/a.py"], head=state.head_sha)
+            (repo / "src" / "a.py").write_text("print('edited')\n", encoding="utf-8")
+            packet = repo_context_forge.make_packet(
+                repo, mode="intent", base_ref="HEAD", head_ref="HEAD", intent="update src/a.py",
+                top=5, token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET, cache_dir=Path(cache_dir),
+                soulforge_bin=None, map_build="auto", map_timeout_ms=1, allow_missing_map=True,
+                gitnexus_repo=None)
+            self.assertEqual(packet["soulforge"]["target"]["status"], "stale", "STALE_STATUS_MISSING")
+            self.assertIn("src/a.py", str(packet["soulforge"]["build"].get("reason")), "STALE_STATUS_MISSING")
+            self.assertIn("src/a.py", str(packet["soulforge"]["target"].get("stale_reason")), "STALE_STATUS_MISSING")
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            binary = self.real_soulforge()
+            state = repo_context_forge.ensure_repo_analysis_checkout(repo, "HEAD", Path(cache_dir))
+            with patch.dict(os.environ, {"SOULFORGE_NO_REPOMAP": "1"}):
+                build = repo_context_forge.build_soulforge_map(state.analysis_repo, binary, "always", 1)
+            metadata = repo_context_forge.soulforge_target_metadata(
+                state, build, repo_context_forge.SoulForgeMap(state.analysis_repo), Path(cache_dir))
+            self.assertEqual(metadata["status"], "stale", "STALE_STATUS_MISSING")
+            self.assertIn("cochanges_head", str(metadata.get("stale_reason")), "STALE_STATUS_MISSING")
+
+    def test_public_bootstrap_refreshes_map_after_import_edit(self) -> None:
+        # BM_ENTRYPOINT_FRESHNESS: the public entrypoint with the default map build reports the new
+        # importer; --map-build never keeps the old map.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, \
+                tempfile.TemporaryDirectory() as out_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_import_repo(repo)
+
+            def bootstrap(*extra: str) -> dict[str, object]:
+                return self.bootstrap_with_real_map(repo, cache_dir, out_dir, *extra)
+
+            def dependents(packet: dict[str, object]) -> set[str]:
+                target = next(entry for entry in packet["targets"] if entry["path"] == "src/a.py")
+                return {str(link["path"]) for link in target["soulforge_impact"]["dependents"]}
+
+            first = bootstrap()
+            self.assertNotIn("tools/b.py", dependents(first), "ENTRYPOINT_MAP_NOT_REFRESHED")
+            (repo / "tools" / "b.py").write_text("import src.a\n\nVALUE = 1\n", encoding="utf-8")
+            retained = bootstrap("--map-build", "never")
+            self.assertEqual(
+                (retained["soulforge"]["stats"]["available"], retained["soulforge"]["build"]["attempted"],
+                 dependents(retained)),
+                (True, False, dependents(first)),
+                "ENTRYPOINT_MAP_NOT_REFRESHED: never must return the previous map unchanged")
+            refreshed = bootstrap()
+            self.assertIn("tools/b.py", dependents(refreshed), "ENTRYPOINT_MAP_NOT_REFRESHED")
+            self.assertTrue(refreshed["soulforge"]["build"]["attempted"], "ENTRYPOINT_MAP_NOT_REFRESHED")
+            self.assertEqual(repo_context_forge.porcelain_status(repo), " M tools/b.py",
+                             "ENTRYPOINT_MAP_NOT_REFRESHED")
+
+    def test_public_bootstrap_keeps_map_across_unchanged_bootstraps(self) -> None:
+        # BM_MAP_RETAINED_ACROSS_BOOTSTRAPS: the second bootstrap of an unchanged tree reuses the
+        # map instead of deleting and rebuilding it, also when SoulForge indexes a tracked file
+        # under a tool-cache name RCF excludes from its own snapshot.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, \
+                tempfile.TemporaryDirectory() as out_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_import_repo(repo)
+            (repo / ".codex").mkdir()
+            (repo / ".codex" / "tool.py").write_text("TOOL = 1\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "-f", ".codex/tool.py"], cwd=repo)
+            repo_context_forge.run_cmd(["git", "commit", "-qm", "tracked tool"], cwd=repo)
+            packets = [self.bootstrap_with_real_map(repo, cache_dir, out_dir) for _round in range(2)]
+            self.assertEqual(
+                [(p["soulforge"]["build"]["attempted"], p["soulforge"]["stats"]["available"],
+                  p["soulforge"]["target"]["status"]) for p in packets],
+                [(True, True, "fresh"), (False, True, "fresh")], "MAP_REBUILT_UNCHANGED")
+            self.assertEqual(packets[0]["soulforge"]["stats"], packets[1]["soulforge"]["stats"],
+                             "MAP_REBUILT_UNCHANGED")
+
+    def test_never_build_mode_is_a_pure_read(self) -> None:
+        # BM_KEEP_NEVER_PURE_READ
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_import_repo(repo)
+            state = repo_context_forge.ensure_local_analysis_worktree(repo, "HEAD", Path(cache_dir))
+            db_path = self.write_soulforge_map(state.analysis_repo, ["src/a.py", "tools/b.py"], edges=[(2, 1)])
+            (repo / "tools" / "b.py").write_text("VALUE = 2\n", encoding="utf-8")
+            before = db_path.read_bytes()
+            result = repo_context_forge.build_soulforge_map(state.analysis_repo, "/nonexistent/soulforge", "never", 1)
+            self.assertEqual((result.attempted, result.warning, result.reason), (False, None, None),
+                             "NEVER_MODE_REBUILT")
+            packet = repo_context_forge.make_packet(
+                repo, mode="intent", base_ref="HEAD", head_ref="HEAD", intent="update src/a.py",
+                top=5, token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET, cache_dir=Path(cache_dir),
+                soulforge_bin="/nonexistent/soulforge", map_build="never", map_timeout_ms=1,
+                allow_missing_map=True, gitnexus_repo=None)
+            self.assertTrue(db_path.exists(), "NEVER_MODE_REBUILT: never discarded the existing map")
+            self.assertEqual(db_path.read_bytes(), before, "NEVER_MODE_REBUILT")
+            target = next(entry for entry in packet["targets"] if entry["path"] == "src/a.py")
+            self.assertEqual({link["path"] for link in target["soulforge_impact"]["dependents"]}, {"tools/b.py"},
+                             "NEVER_MODE_REBUILT")
+
+    def test_always_build_mode_builds_fresh_map_without_staleness(self) -> None:
+        # BM_KEEP_ALWAYS_REBUILDS
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            state = repo_context_forge.ensure_repo_analysis_checkout(repo, "HEAD", Path(cache_dir))
+            self.write_soulforge_map(state.analysis_repo, ["src/a.py"], head=state.head_sha)
+            result = repo_context_forge.build_soulforge_map(state.analysis_repo, None, "always", 1)
+            self.assertIn("SoulForge binary not found", str(result.warning), "ALWAYS_MODE_SKIPPED")
+            self.assertIsNone(result.reason, "ALWAYS_MODE_SKIPPED")
+            metadata = repo_context_forge.soulforge_target_metadata(
+                state, result, repo_context_forge.SoulForgeMap(state.analysis_repo), Path(cache_dir))
+            self.assertEqual(metadata["status"], "fresh", "ALWAYS_MODE_SKIPPED")
+        with tempfile.TemporaryDirectory() as repo_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            self.build_real_map(repo)
+            result = self.build_real_map(repo)[2]
+            self.assertEqual((result.attempted, result.returncode), (True, 0), "ALWAYS_MODE_SKIPPED")
+
+    def test_killed_soulforge_child_is_reported_and_rebuilt(self) -> None:
+        # BM_KEEP_CHILD_KILL_REPORTED: the child dies while build_soulforge_map waits.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_import_repo(repo)
+            binary = self.real_soulforge()
+            state = repo_context_forge.ensure_repo_analysis_checkout(repo, "HEAD", Path(cache_dir))
+            db_path = state.analysis_repo / ".soulforge" / "repomap.db"
+            results: list[repo_context_forge.MapBuildResult] = []
+            worker = threading.Thread(target=lambda: results.append(
+                repo_context_forge.build_soulforge_map(state.analysis_repo, binary, "always", 120_000)))
+            worker.start()
+            deadline = time.monotonic() + 60
+            while not db_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(db_path.exists(), "CHILD_KILL_NOT_REPORTED: SoulForge never created the map")
+            children = subprocess.run(
+                ["pgrep", "-P", str(os.getpid()), "-f", str(Path(binary).resolve().parent)],
+                capture_output=True, text=True).stdout.split()
+            self.assertEqual(len(children), 1, "CHILD_KILL_NOT_REPORTED: exactly one SoulForge child expected")
+            os.kill(int(children[0]), signal.SIGKILL)
+            worker.join(timeout=60)
+            self.assertEqual(len(results), 1, "CHILD_KILL_NOT_REPORTED")
+            build = results[0]
+            self.assertEqual((build.attempted, build.returncode), (True, -signal.SIGKILL), "CHILD_KILL_NOT_REPORTED")
+            self.assertIn("SoulForge exited with -9", str(build.warning), "CHILD_KILL_NOT_REPORTED")
+            metadata = repo_context_forge.soulforge_target_metadata(
+                state, build, repo_context_forge.SoulForgeMap(state.analysis_repo), Path(cache_dir))
+            self.assertEqual(metadata["status"], "failed", "CHILD_KILL_NOT_REPORTED")
+            recovery = repo_context_forge.build_soulforge_map(state.analysis_repo, binary, "auto", 1)
+            self.assertTrue(recovery.attempted, "CHILD_KILL_NOT_REPORTED")
+            self.assertEqual(self.map_rows(db_path, "SELECT value FROM meta WHERE key = 'cochanges_head'"),
+                             [(state.head_sha,)], "CHILD_KILL_NOT_REPORTED")
+
 
     def test_gitnexus_blocks_when_registered_index_storage_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as registry_dir:

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Literal
@@ -103,6 +104,26 @@ class MapBuildResult:
     stdout: str
     stderr: str
     warning: str | None
+    reason: str | None = None
+
+
+# Every SoulForge map column this module reads, by table. A map missing a consumed
+# column fails at bootstrap by name instead of producing a packet with empty impact;
+# tables other than files and symbols keep their _has_table fallbacks when absent.
+CONSUMED_MAP_COLUMNS: dict[str, tuple[str, ...]] = {
+    "files": ("id", "path", "mtime_ms", "pagerank", "symbol_count", "line_count"),
+    "symbols": ("id", "file_id", "name", "kind", "line", "end_line", "signature", "is_exported"),
+    "edges": ("source_file_id", "target_file_id", "weight"),
+    "refs": ("file_id", "import_source", "source_file_id", "name"),
+    "cochanges": ("file_id_a", "file_id_b", "count"),
+    "calls": ("caller_symbol_id", "callee_symbol_id"),
+    "external_imports": ("file_id", "package"),
+    "semantic_summaries": ("symbol_id", "source", "summary"),
+    "meta": ("key", "value"),
+}
+# Bun's mtimeMs and Python's st_mtime_ns / 1e6 agree to one double ulp (measured
+# 0.0003 ms); any real edit moves a timestamp by far more than this.
+MAP_MTIME_TOLERANCE_MS = 0.01
 
 
 def run_cmd(
@@ -723,10 +744,13 @@ def reset_cached_worktree(worktree: Path, cache_dir: Path, *, allow_fail: bool =
     run_git(worktree, ["reset", "--hard", "HEAD"], allow_fail=allow_fail)
     exclusions = [item for path in TOOL_CACHE_DIRS for item in ("-e", f"{path}/")]
     run_git(worktree, ["clean", "-fd", *exclusions], allow_fail=allow_fail)
-    soulforge_cache = worktree / ".soulforge"
-    if os.path.lexists(soulforge_cache):
-        require_cache_path(soulforge_cache, cache_dir)
-        remove_path(soulforge_cache)
+    # The map survives the reset; SoulForge writes through these paths, so neither may
+    # point outside the cache (a checked-in symlink would).
+    index_dir = worktree / workflow_index.INDEX_DIR
+    for retained in (worktree / ".soulforge", worktree / ".soulforge" / "repomap.db",
+                     index_dir, index_dir / SoulForgeMap.SOURCES_FILE):
+        if os.path.lexists(retained):
+            require_cache_path(retained, cache_dir)
 
 
 def overlay_source_worktree(source_repo: Path, analysis_repo: Path) -> None:
@@ -982,8 +1006,12 @@ def build_soulforge_map(
     db_path = repo / ".soulforge" / "repomap.db"
     if build_mode == "never":
         return MapBuildResult(False, [], None, "", "", None)
-    if db_path.exists() and build_mode == "auto":
-        return MapBuildResult(False, [], None, "", "", None)
+    reason = None
+    soul_map = SoulForgeMap(repo)
+    if build_mode == "auto" and db_path.exists():
+        reason = soul_map.stale_reason(run_git(repo, ["rev-parse", "HEAD"], allow_fail=True))
+        if reason is None:
+            return MapBuildResult(False, [], None, "", "", None)
     if not soulforge_bin:
         return MapBuildResult(
             False,
@@ -992,6 +1020,7 @@ def build_soulforge_map(
             "",
             "",
             "SoulForge binary not found; pass --soulforge-bin or install soulforge",
+            reason,
         )
 
     command = [
@@ -1003,35 +1032,145 @@ def build_soulforge_map(
         str(timeout_ms),
         "Reply exactly: OK",
     ]
+    if reason == soul_map.SOURCE_SET_CHANGED:
+        # SoulForge's incremental rescan refuses to drop more than 80% of its indexed files
+        # (measured), so a changed path set is rebuilt from scratch, as every bootstrap did
+        # before maps were retained.
+        for stale_file in db_path.parent.glob(f"{db_path.name}*"):
+            stale_file.unlink()
     proc = run_cmd(command, cwd=repo, allow_fail=True)
     warning = None
     if proc.returncode != 0:
         warning = f"SoulForge exited with {proc.returncode}"
     if not db_path.exists():
         warning = (warning + "; " if warning else "") + f"map DB not found at {db_path}"
-    return MapBuildResult(True, command, proc.returncode, proc.stdout, proc.stderr, warning)
+    elif proc.returncode == 0:
+        soul_map.write_sources()
+    return MapBuildResult(True, command, proc.returncode, proc.stdout, proc.stderr, warning, reason)
 
 
 class SoulForgeMap:
+    SOURCE_SET_CHANGED = "source files were added or removed since the map was built"
+    SOURCES_FILE = "soulforge-map-sources"
+
     def __init__(
         self,
         repo: Path,
         native_index: workflow_index.WorkflowIndex | None = None,
     ) -> None:
         self.native_index = native_index or workflow_index.WorkflowIndex(repo, file_role)
+        self.repo = repo
         self.db_path = repo / ".soulforge" / "repomap.db"
+        # The source path set the map was built from: an added or deleted file changes
+        # neither HEAD nor any indexed mtime, so it is the third freshness input.
+        self.sources_path = repo / workflow_index.INDEX_DIR / self.SOURCES_FILE
         self._graph: tuple[dict[str, int], dict[int, str], list[tuple[int, int, float]]] | None = None
+        self._schema_verified = False
+        self._read_error: str | None = None
 
     @property
     def available(self) -> bool:
-        return self.db_path.exists()
+        """The map exists, opens read-only and carries its files table. A map an interrupted
+        build left unreadable (hot rollback journal) or empty (killed before the schema was
+        written) behaves like a missing one; its error is the stale reason."""
+        if not self.db_path.exists():
+            return False
+        if not self._schema_verified and self._read_error is None:
+            try:
+                with closing(self._connect()) as conn:
+                    conn.execute("SELECT 1 FROM files LIMIT 0")
+            except sqlite3.DatabaseError as exc:
+                self._read_error = f"SoulForge map {self.db_path} is unreadable: {exc}"
+        return self._read_error is None
 
     def _connect(self) -> sqlite3.Connection:
-        if not self.available:
+        if not self.db_path.exists():
             raise FileNotFoundError(f"SoulForge map not found: {self.db_path}")
         conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
+        if not self._schema_verified:
+            try:
+                missing = [
+                    f"{table}.{column}"
+                    for table, columns in CONSUMED_MAP_COLUMNS.items()
+                    if (present := {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")})
+                    for column in columns
+                    if column not in present
+                ]
+            except sqlite3.DatabaseError:
+                conn.close()
+                raise
+            if missing:
+                conn.close()
+                raise RuntimeError(
+                    f"SoulForge map {self.db_path} lacks consumed columns: {', '.join(missing)}")
+            self._schema_verified = True
         return conn
+
+    def source_snapshot(self) -> dict[str, int]:
+        """Source paths present in the working tree with their mtimes; git still lists an
+        unstaged deletion, and a file SoulForge skipped (oversized) has no files row."""
+        snapshot = {}
+        for path in source_worktree_files(self.repo):
+            try:
+                snapshot[path] = (self.repo / path).stat().st_mtime_ns
+            except FileNotFoundError:
+                continue
+        return snapshot
+
+    def write_sources(self) -> None:
+        self.sources_path.parent.mkdir(parents=True, exist_ok=True)
+        self.sources_path.write_text(
+            "".join(f"{path}\t{mtime}\n" for path, mtime in sorted(self.source_snapshot().items())),
+            encoding="utf-8")
+
+    def recorded_sources(self) -> dict[str, int] | None:
+        """The record a successful build wrote, or None when absent or torn (unknown)."""
+        if not self.sources_path.is_file():
+            return None
+        try:
+            return {
+                path: int(mtime)
+                for path, _tab, mtime in (
+                    line.partition("\t") for line in self.sources_path.read_text(encoding="utf-8").splitlines())
+            }
+        except ValueError:
+            return None
+
+    def stale_reason(self, head_sha: str) -> str | None:
+        """Why an existing map no longer describes the checkout, or None when it does:
+        unreadable; an Empryo build that never reached its final cochanges_head write;
+        the source path set changed or was never recorded (rebuilt from scratch, so it is
+        judged before the incremental reasons); co-changes keyed to another HEAD; a source
+        file edited since the map was built."""
+        if not self.available:
+            return self._read_error
+        recorded = self.recorded_sources()
+        current = self.source_snapshot()
+        with self._connect() as conn:
+            rows = conn.execute("SELECT path, mtime_ms FROM files").fetchall()
+            head_row = (
+                conn.execute("SELECT value FROM meta WHERE key = 'cochanges_head'").fetchone()
+                if self._has_table(conn, "meta") else False
+            )
+        indexed = {str(row["path"]): float(row["mtime_ms"]) for row in rows}
+        # Judged first because only a from-scratch build repairs these: a row for an
+        # absent file is SoulForge's refused-deletion residue (it keeps rows when
+        # >= 80% of files vanish), whatever else changed since.
+        if recorded is None or recorded.keys() != current.keys() or any(
+                not os.path.lexists(self.repo / path) for path in indexed):
+            return self.SOURCE_SET_CHANGED
+        if head_row is None:
+            return "map build did not reach cochanges_head"
+        if head_row and str(head_row["value"]) != head_sha:
+            return f"map co-changes are keyed to {head_row['value']} but HEAD is {head_sha}"
+        for path, mtime in current.items():
+            if path not in indexed:
+                if recorded[path] != mtime:
+                    return f"unindexed file {path} changed after the map was built"
+            elif abs(mtime / 1e6 - indexed[path]) >= MAP_MTIME_TOLERANCE_MS:
+                return f"indexed file {path} changed after the map was built"
+        return None
 
     def stats(self) -> dict[str, int | str | bool]:
         if not self.available:
@@ -2224,17 +2363,21 @@ def soulforge_target_metadata(
     db_exists = soul_map.db_path.exists()
     db_mtime = soul_map.db_path.stat().st_mtime if db_exists else None
     head_matches = analysis_head == target_state.head_sha
-    if build_result.warning:
-        status = "failed" if build_result.attempted else "missing"
-    elif db_exists and head_matches:
-        status = "fresh"
+    stale_reason = soul_map.stale_reason(analysis_head) if db_exists else None
+    if build_result.warning and build_result.attempted:
+        status = "failed"
     elif not db_exists:
         status = "missing"
+    elif stale_reason:
+        status = "stale"
+    elif head_matches:
+        status = "fresh"
     else:
         status = "unknown"
     return {
         "status": status,
-        "target_head_verified": status == "fresh",
+        "stale_reason": stale_reason,
+        "target_head_verified": db_exists and head_matches,
         "source_head_sha": target_state.head_sha,
         "analysis_head_sha": analysis_head,
         "analysis_repo_is_cache_owned": analysis_repo_is_cache_owned(
@@ -2372,6 +2515,7 @@ def make_blocker_packet(
                 "command": [],
                 "returncode": None,
                 "warning": reason,
+                "reason": None,
             },
             "stats": {"available": False, "path": str(source_repo / ".soulforge" / "repomap.db")},
             "top_files": [],
@@ -2744,6 +2888,8 @@ def make_packet(
         warnings.append(build_result.warning)
     if not soulforge_target.get("target_head_verified"):
         warnings.append("SoulForge target head could not be verified")
+    if soulforge_target.get("stale_reason"):
+        warnings.append(f"SoulForge map is stale: {soulforge_target['stale_reason']}")
     gitnexus_warning = gitnexus_status.get("warning")
     if gitnexus_warning:
         warnings.append(str(gitnexus_warning))
@@ -2809,6 +2955,7 @@ def make_packet(
                 "command": build_result.command,
                 "returncode": build_result.returncode,
                 "warning": build_result.warning,
+                "reason": build_result.reason,
             },
             "stats": soul_map.stats(),
             "top_files": [entry.__dict__ for entry in soul_map.top_files(top)],
