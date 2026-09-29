@@ -5063,6 +5063,7 @@ class RepoContextForgeTests(unittest.TestCase):
                 soulforge_bin=None, map_build="auto", map_timeout_ms=1, allow_missing_map=True,
                 gitnexus_repo=None)
             self.assertEqual(packet["soulforge"]["target"]["status"], "stale", "STALE_STATUS_MISSING")
+            self.assertEqual((packet["soulforge"]["target"]["target_head_verified"], [w for w in packet["warnings"] if "SoulForge m" in w or "target head" in w]), (False, [f"SoulForge map is stale: {packet['soulforge']['target']['stale_reason']}"]), "STALE_MAP_HEAD_VERIFIED")
             self.assertIn("src/a.py", str(packet["soulforge"]["build"].get("reason")), "STALE_STATUS_MISSING")
             self.assertIn("src/a.py", str(packet["soulforge"]["target"].get("stale_reason")), "STALE_STATUS_MISSING")
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
@@ -5199,6 +5200,7 @@ class RepoContextForgeTests(unittest.TestCase):
             metadata = repo_context_forge.soulforge_target_metadata(
                 state, build, repo_context_forge.SoulForgeMap(state.analysis_repo), Path(cache_dir))
             self.assertEqual(metadata["status"], "failed", "CHILD_KILL_NOT_REPORTED")
+            self.assertFalse(metadata["target_head_verified"], "FAILED_MAP_HEAD_VERIFIED")
             recovery = repo_context_forge.build_soulforge_map(state.analysis_repo, binary, "auto", 1)
             self.assertTrue(recovery.attempted, "CHILD_KILL_NOT_REPORTED")
             self.assertEqual(self.map_rows(db_path, "SELECT value FROM meta WHERE key = 'cochanges_head'"),

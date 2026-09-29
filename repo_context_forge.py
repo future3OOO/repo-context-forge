@@ -107,9 +107,9 @@ class MapBuildResult:
     reason: str | None = None
 
 
-# Every SoulForge map column this module reads, by table. A map missing a consumed
-# column fails at bootstrap by name instead of producing a packet with empty impact;
-# tables other than files and symbols keep their _has_table fallbacks when absent.
+# Every SoulForge map column this module reads, by table. A present table missing a
+# consumed column fails at bootstrap by name instead of producing a packet with empty
+# impact; an absent table is skipped (only files is required, by `available`).
 CONSUMED_MAP_COLUMNS: dict[str, tuple[str, ...]] = {
     "files": ("id", "path", "mtime_ms", "pagerank", "symbol_count", "line_count"),
     "symbols": ("id", "file_id", "name", "kind", "line", "end_line", "signature", "is_exported"),
@@ -2377,7 +2377,7 @@ def soulforge_target_metadata(
     return {
         "status": status,
         "stale_reason": stale_reason,
-        "target_head_verified": db_exists and head_matches,
+        "target_head_verified": status == "fresh",
         "source_head_sha": target_state.head_sha,
         "analysis_head_sha": analysis_head,
         "analysis_repo_is_cache_owned": analysis_repo_is_cache_owned(
@@ -2887,9 +2887,8 @@ def make_packet(
     if build_result.warning:
         warnings.append(build_result.warning)
     if not soulforge_target.get("target_head_verified"):
-        warnings.append("SoulForge target head could not be verified")
-    if soulforge_target.get("stale_reason"):
-        warnings.append(f"SoulForge map is stale: {soulforge_target['stale_reason']}")
+        stale = soulforge_target.get("stale_reason")
+        warnings.append(f"SoulForge map is stale: {stale}" if stale else "SoulForge target head could not be verified")
     gitnexus_warning = gitnexus_status.get("warning")
     if gitnexus_warning:
         warnings.append(str(gitnexus_warning))
