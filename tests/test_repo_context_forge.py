@@ -4710,6 +4710,9 @@ class RepoContextForgeTests(unittest.TestCase):
             (config / "config.json").write_text(
                 '{"defaultModel":"openai/gpt-4o-mini","telemetry":false,"onboardingComplete":true,'
                 '"semanticSummaries":"synthetic"}\n', encoding="utf-8")
+            # SoulForge reads its config only from $HOME/.soulforge; GitNexus keeps its registry
+            # under the real home, so the isolated home links it through.
+            (Path(home) / ".gitnexus").symlink_to(Path.home() / ".gitnexus", target_is_directory=True)
             with patch.dict(os.environ, {
                 "HOME": home, "OPENAI_API_KEY": "sk-test-invalid", "OPENAI_BASE_URL": "http://127.0.0.1:9",
             }):
@@ -5113,6 +5116,173 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertTrue(refreshed["soulforge"]["build"]["attempted"], "ENTRYPOINT_MAP_NOT_REFRESHED")
             self.assertEqual(repo_context_forge.porcelain_status(repo), " M tools/b.py",
                              "ENTRYPOINT_MAP_NOT_REFRESHED")
+
+    CALLS_FILES = {
+        "src/a.py": "def g():\n    return 1\n\n\ndef f():\n    return g()\n",
+        "src/b.py": "from src.a import f\n\n\ndef use():\n    return f()\n",
+        "src/hub.py": "import src.a\nimport src.b\n\n\ndef hub():\n    return src.b.use()\n",
+        "tools/leaf.py": "def leaf():\n    return 0\n",
+    }
+
+    def make_calls_repo(self, root: Path) -> None:
+        self.make_git_repo(root)
+        for path, text in self.CALLS_FILES.items():
+            (root / path).parent.mkdir(exist_ok=True)
+            (root / path).write_text(text, encoding="utf-8")
+        repo_context_forge.run_cmd(["git", "add", "-A"], cwd=root)
+        repo_context_forge.run_cmd(["git", "commit", "-qm", "calls"], cwd=root)
+
+    def make_rcf_base_repo(self, root: Path) -> None:
+        """This repository at the issue-35 base commit: SoulForge's Python call graph only
+        resolves at real-repository scale (tiny fixtures record no calls rows)."""
+        repo_context_forge.run_cmd(["git", "clone", "-q", "--no-checkout", str(ROOT), str(root)])
+        repo_context_forge.run_cmd(["git", "checkout", "-q", "b32d9ce0dd7567a9eb28b4359fd6a7efacafbb13"], cwd=root)
+
+    def real_render(self, repo: Path, *args: str) -> dict[str, object]:
+        proc = repo_context_forge.run_cmd([self.real_soulforge(), "--headless", "--render-map", *args], cwd=repo)
+        return json.loads(proc.stdout)
+
+    def packet_with_real_map(self, repo: Path, cache_dir: str, intent: str, **overrides: object) -> dict[str, object]:
+        options: dict[str, object] = dict(
+            mode="intent", base_ref="HEAD", head_ref="HEAD", intent=intent, top=8,
+            token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET, cache_dir=Path(cache_dir),
+            soulforge_bin=self.real_soulforge(), map_build="auto", map_timeout_ms=1,
+            allow_missing_map=True, gitnexus_repo=None, gitnexus_mode="off")
+        options.update(overrides)
+        return repo_context_forge.make_packet(repo, **options)
+
+    def test_intent_targets_follow_soulforge_render_order(self) -> None:
+        # BM_RENDER_ORDER + BM_RENDER_MENTION: global paths order, personalized by the
+        # intent-named file, equal to the binary's own render with --mention.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_calls_repo(repo)
+            packet = self.packet_with_real_map(repo, cache_dir, "update tools/leaf.py")
+            analysis_repo = Path(packet["target_state"]["analysis_repo"])
+            targets = [entry["path"] for entry in packet["targets"]]
+            rendered = self.real_render(analysis_repo, "--mention", "tools/leaf.py")["paths"]
+            plain = self.real_render(analysis_repo)["paths"]
+            self.assertEqual(targets, [path for path in rendered if path in targets], "RENDER_ORDER_NOT_APPLIED")
+            self.assertEqual([entry.get("render_rank") for entry in packet["targets"]],
+                             [rendered.index(path) for path in targets], "RENDER_ORDER_NOT_APPLIED")
+            self.assertNotEqual(rendered, plain, "RENDER_PERSONALIZATION_NOT_PASSED: --mention changed nothing")
+            self.assertTrue(next(entry for entry in packet["targets"] if entry["path"] == "tools/leaf.py")["intent_required_file"],
+                            "RENDER_ORDER_NOT_APPLIED: required mark lost")
+
+    def test_local_targets_pass_dirty_files_as_edited(self) -> None:
+        # BM_RENDER_MENTION (edited half): dirty files reach the render as --edited.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_calls_repo(repo)
+            (repo / "tools" / "leaf.py").write_text("def leaf():\n    return 1\n", encoding="utf-8")
+            packet = self.packet_with_real_map(repo, cache_dir, None, mode="local")
+            analysis_repo = Path(packet["target_state"]["analysis_repo"])
+            edited = self.real_render(analysis_repo, "--edited", "tools/leaf.py")["paths"]
+            targets = [entry["path"] for entry in packet["targets"]]
+            self.assertEqual([entry.get("render_rank") for entry in packet["targets"]],
+                             [edited.index(path) for path in targets], "RENDER_PERSONALIZATION_NOT_PASSED")
+
+    def test_intent_symbols_carry_soulforge_render_summaries(self) -> None:
+        # BM_RENDER_SUMMARIES
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_calls_repo(repo)
+            packet = self.packet_with_real_map(repo, cache_dir, "update src.a.f")
+            content = self.real_render(Path(packet["target_state"]["analysis_repo"]), "--mention", "src/a.py")["content"]
+            entry = next(entry for entry in packet["targets"] if entry["path"] == "src/a.py")
+            rendered = [symbol for symbol in entry["symbols"] if symbol["summary_source"] == "soulforge_render"]
+            self.assertTrue(rendered, f"RENDER_SUMMARIES_NOT_APPLIED: {[s['summary_source'] for s in entry['symbols']]}")
+            for symbol in rendered:
+                self.assertIn(f":{symbol['line']}", symbol["summary"], "RENDER_SUMMARIES_NOT_APPLIED")
+                self.assertIn(symbol["summary"].split(" :")[0].strip(), content, "RENDER_SUMMARIES_NOT_APPLIED")
+
+    def test_render_falls_back_without_render_map_support(self) -> None:
+        # BM_RENDER_UNSUPPORTED: the installed 2.13.2 has no --render-map; no binary at all.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_calls_repo(repo)
+            legacy = "/home/prop_/.local/bin/soulforge"
+            for binary in (legacy, None):
+                packet = self.packet_with_real_map(repo, cache_dir, "update tools/leaf.py", soulforge_bin=binary)
+                self.assertTrue(all(entry.get("render_rank") is None for entry in packet["targets"]),
+                                f"RENDER_UNSUPPORTED_NOT_HANDLED {binary}")
+                self.assertTrue(any("SoulForge render unavailable" in w for w in packet["warnings"]),
+                                f"RENDER_UNSUPPORTED_NOT_HANDLED {binary}: {packet['warnings']}")
+                self.assertNotIn("--render-map", packet["soulforge"]["render"]["command"],
+                                 "RENDER_UNSUPPORTED_NOT_HANDLED: render attempted")
+
+    def test_killed_render_falls_back_then_recovers(self) -> None:
+        # BM_RENDER_FAILED
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_calls_repo(repo)
+            packets: list[dict[str, object]] = []
+            worker = threading.Thread(target=lambda: packets.append(self.packet_with_real_map(repo, cache_dir, "update tools/leaf.py")))
+            worker.start()
+            deadline = time.monotonic() + 120
+            killed = False
+            while time.monotonic() < deadline and not killed:
+                for pid in subprocess.run(["pgrep", "-P", str(os.getpid()), "-f", "--", "--headless --render-map"],
+                                          capture_output=True, text=True).stdout.split():
+                    os.kill(int(pid), signal.SIGKILL); killed = True
+                time.sleep(0.02)
+            worker.join(timeout=120)
+            self.assertTrue(killed and packets, "RENDER_FAILURE_NOT_HANDLED: no render child to kill")
+            first = packets[0]
+            self.assertTrue(all(entry.get("render_rank") is None for entry in first["targets"]), "RENDER_FAILURE_NOT_HANDLED")
+            self.assertTrue(any("SoulForge render unavailable" in w for w in first["warnings"]),
+                            f"RENDER_FAILURE_NOT_HANDLED: {first['warnings']}")
+            second = self.packet_with_real_map(repo, cache_dir, "update tools/leaf.py")
+            self.assertTrue(any(entry.get("render_rank") is not None for entry in second["targets"]), "RENDER_FAILURE_NOT_HANDLED")
+            self.assertFalse(any("render unavailable" in w for w in second["warnings"]), "RENDER_FAILURE_NOT_HANDLED")
+
+    def test_required_symbols_carry_callers_and_callees_from_calls(self) -> None:
+        # BM_CALLS_IMPACT: real Empryo map of this repository; the oracle is the map's own rows.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_rcf_base_repo(repo)
+            packet = self.packet_with_real_map(repo, cache_dir, "update repo_context_forge.make_packet")
+            entry = next(entry for entry in packet["targets"] if entry["path"] == "repo_context_forge.py")
+            calls = (entry.get("symbol_calls") or {}).get("make_packet")
+            db = Path(packet["soulforge"]["target"]["db_path"])
+            rows = self.map_rows(db, """
+                SELECT 'callers', cf.path, caller.name FROM calls c
+                JOIN symbols callee ON callee.id = c.callee_symbol_id JOIN files f ON f.id = callee.file_id
+                JOIN symbols caller ON caller.id = c.caller_symbol_id JOIN files cf ON cf.id = caller.file_id
+                WHERE f.path = 'repo_context_forge.py' AND callee.name = 'make_packet'
+                UNION SELECT 'callees', ef.path, callee.name FROM calls c
+                JOIN symbols caller ON caller.id = c.caller_symbol_id JOIN files f ON f.id = caller.file_id
+                JOIN symbols callee ON callee.id = c.callee_symbol_id JOIN files ef ON ef.id = callee.file_id
+                WHERE f.path = 'repo_context_forge.py' AND caller.name = 'make_packet'""")
+            expected = {side: [{"file": path, "symbol": name} for kind, path, name in sorted(rows) if kind == side]
+                        for side in ("callers", "callees")}
+            self.assertTrue(expected["callers"] and expected["callees"], f"fixture precondition: {expected}")
+            self.assertEqual(calls, expected, "CALLS_IMPACT_MISSING")
+            caller = expected["callers"][0]
+            for rendered in (repo_context_forge.render_markdown(packet), repo_context_forge.render_prompt(packet)):
+                self.assertIn(caller["symbol"], rendered, "CALLS_IMPACT_MISSING")
+                self.assertRegex(rendered, r"make_packet.{0,40}callers|symbol_calls symbol=\"make_packet\"", "CALLS_IMPACT_MISSING")
+
+    def test_never_mode_spawns_no_soulforge_process(self) -> None:
+        # BM_KEEP_NEVER_AND_MISSING: never = no build and no render.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_calls_repo(repo)
+            self.packet_with_real_map(repo, cache_dir, "update tools/leaf.py")  # builds and renders once
+            commands: list[list[str]] = []
+            original = repo_context_forge.run_cmd
+
+            def recording(args, **kwargs):
+                commands.append(list(args))
+                return original(args, **kwargs)
+
+            repo_context_forge.run_cmd = recording
+            try:
+                packet = self.packet_with_real_map(repo, cache_dir, "update tools/leaf.py", map_build="never")
+            finally:
+                repo_context_forge.run_cmd = original
+            self.assertFalse(any("soulforge" in str(cmd[0]) or "--render-map" in cmd for cmd in commands), f"FALLBACK_CHANGED: {commands}")
+            self.assertTrue(all(entry.get("render_rank") is None for entry in packet["targets"]), "FALLBACK_CHANGED")
 
     def test_public_bootstrap_keeps_map_across_unchanged_bootstraps(self) -> None:
         # BM_MAP_RETAINED_ACROSS_BOOTSTRAPS: the second bootstrap of an unchanged tree reuses the
