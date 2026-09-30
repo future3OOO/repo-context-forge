@@ -1641,7 +1641,7 @@ class SoulForgeMap:
         return [{"path": str(row["path"]), "count": int(row["count"])} for row in rows]
 
     def render(
-        self, soulforge_bin: str, *, mentioned: Iterable[str], edited: Iterable[str], budget: int | None,
+        self, soulforge_bin: str, *, mentioned: Iterable[str], edited: Iterable[str],
     ) -> tuple[dict[str, object] | None, list[str], str | None]:
         """SoulForge's own ranked map for this checkout (`--headless --render-map`, Empryo >= the
         fork's render-map PR): the parsed {paths, content, stats} document, the command, and the
@@ -1654,8 +1654,6 @@ class SoulForgeMap:
         for flag, paths in (("--mention", mentioned), ("--edited", edited)):
             for path in paths:
                 command += [flag, path]
-        if budget is not None:
-            command += ["--map-budget", str(budget)]
         proc = run_cmd(command, cwd=self.repo, allow_fail=True)
         if proc.returncode != 0:
             return None, command, f"SoulForge exited with {proc.returncode}"
@@ -1684,8 +1682,10 @@ class SoulForgeMap:
                 lines[int(match.group(2))] = f"{match.group(1).strip()} :{match.group(2)}"
         return lines
 
-    def symbol_calls(self, path: str, name: str) -> dict[str, list[dict[str, str]]]:
-        """Callers and callees of the symbol `name` defined in `path`, from the calls table."""
+    def symbol_calls(self, path: str, symbol: Symbol) -> dict[str, list[dict[str, str]]]:
+        """Callers and callees of `symbol` in `path`, from the calls table. The map's symbol is the
+        same-named one whose line lies in `symbol`'s span: the native index starts a decorated
+        symbol at its decorator, the map at its `def`."""
         empty: dict[str, list[dict[str, str]]] = {"callers": [], "callees": []}
         if not self.available:
             return empty
@@ -1700,7 +1700,7 @@ class SoulForgeMap:
                 JOIN files f ON f.id = callee.file_id
                 JOIN symbols caller ON caller.id = c.caller_symbol_id
                 JOIN files cf ON cf.id = caller.file_id
-                WHERE f.path = ? AND callee.name = ?
+                WHERE f.path = ? AND callee.name = ? AND callee.line BETWEEN ? AND ?
                 UNION
                 SELECT 'callees', ef.path, callee.name
                 FROM calls c
@@ -1708,10 +1708,10 @@ class SoulForgeMap:
                 JOIN files f ON f.id = caller.file_id
                 JOIN symbols callee ON callee.id = c.callee_symbol_id
                 JOIN files ef ON ef.id = callee.file_id
-                WHERE f.path = ? AND caller.name = ?
+                WHERE f.path = ? AND caller.name = ? AND caller.line BETWEEN ? AND ?
                 ORDER BY 1, 2, 3
                 """,
-                (path, name, path, name),
+                (path, symbol.name, symbol.line, symbol.end_line) * 2,
             ).fetchall()
         result: dict[str, list[dict[str, str]]] = {"callers": [], "callees": []}
         for row in rows:
@@ -1867,7 +1867,7 @@ def rank_target_entry(
 
 def target_entry_sort_key(entry: dict[str, object]) -> tuple[object, ...]:
     if isinstance(entry.get("render_rank"), int):
-        return (0, int(entry["render_rank"]), str(entry["path"]))
+        return (0, -float(entry.get("task_boost") or 0), int(entry["render_rank"]), str(entry["path"]))
     relevance = entry["intent_evidence"].get("relevance_score", 0) if isinstance(entry.get("intent_evidence"), dict) else 0
     return (
         1,
@@ -1912,6 +1912,7 @@ def apply_task_state_to_entries(
                 score += boost
         entry["rank_signals"] = signals
         entry["why_selected"] = reasons
+        entry["task_boost"] = round(score - float(entry.get("priority_score") or 0), 4)
         entry["priority_score"] = round(score, 4)
     return sorted(target_entries, key=target_entry_sort_key)
 
@@ -2158,7 +2159,8 @@ def make_target_entries(
             "intent_required_symbols": [
                 required_symbol_keys[(path, symbol.line, symbol.name)] for symbol in intent_required_symbols],
             "symbol_calls": {
-                symbol.name: soul_map.symbol_calls(path, symbol.name) for symbol in intent_required_symbols},
+                required_symbol_keys[(path, symbol.line, symbol.name)]: soul_map.symbol_calls(path, symbol)
+                for symbol in intent_required_symbols},
             "intent_required_file": intent_required_file,
             "dependent_count": soul_map.dependent_count_for_file(path),
             "graph_neighbors": soul_map.graph_neighbors_for_file(path),
@@ -2177,7 +2179,8 @@ def make_target_entries(
 def apply_soulforge_render(target_entries: list[dict[str, object]], document: dict[str, object]) -> None:
     """SoulForge's ranking and symbol summaries onto the packet's target entries: `render_rank`
     is the file's index in the render's paths (files it did not render follow, in their current
-    order), and a displayed symbol whose line the render printed takes that line as summary."""
+    order), and a displayed symbol takes the first rendered line in its span that names it (the
+    native index starts a decorated symbol at its decorator, the render at its `def`)."""
     paths = [str(path) for path in document["paths"]]
     content = str(document.get("content") or "")
     unrendered = len(paths)
@@ -2190,7 +2193,8 @@ def apply_soulforge_render(target_entries: list[dict[str, object]], document: di
             unrendered += 1
         rendered = SoulForgeMap.rendered_symbol_lines(content, path)
         for symbol in entry["symbols"]:
-            line = rendered.get(int(symbol["line"]))
+            line = next((text for number, text in sorted(rendered.items()) if int(symbol["line"]) <= number
+                         <= int(symbol["end_line"]) and symbol["name"] in text), None)
             if line:
                 symbol["summary"] = line
                 symbol["summary_source"] = "soulforge_render"
@@ -2878,7 +2882,7 @@ def make_packet(
         render_state["attempted"] = True
         mentioned = [item.path for item in intent_resolution.file_evidence if item.exact_file] if mode == "intent" else []
         document, render_state["command"], render_warning = soul_map.render(
-            soulforge_bin, mentioned=mentioned, edited=selected_files(source_git_state, "dirty"), budget=None)
+            soulforge_bin, mentioned=mentioned, edited=selected_files(source_git_state, "dirty"))
         if document is None:
             render_state["warning"] = f"SoulForge render unavailable: {render_warning}"
         else:
@@ -3492,6 +3496,7 @@ def trim_prompt_lines(lines: list[str], token_budget: int) -> list[str] | None:
         and (" weight=" in line or " count=" in line),
         lambda line: line.lstrip().startswith("<reason>"),
         lambda line: line.lstrip().startswith("<signal>"),
+        lambda line: line.lstrip().startswith(("<symbol_calls ", "</symbol_calls>", "<caller ", "<callee ")),
     ]
     trimmed = list(lines)
     for predicate in predicates:
