@@ -5179,19 +5179,21 @@ class RepoContextForgeTests(unittest.TestCase):
             self.assertEqual([entry.get("render_rank") for entry in packet["targets"]],
                              [edited.index(path) for path in targets], "RENDER_PERSONALIZATION_NOT_PASSED")
 
-    def test_intent_symbols_carry_soulforge_render_summaries(self) -> None:
-        # BM_RENDER_SUMMARIES
+    def test_rendered_symbols_keep_workflow_index_summaries(self) -> None:
+        # BM_NO_RENDER_SUMMARIES: the render orders targets but does not replace symbol summaries.
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
             repo = Path(repo_dir)
             self.make_calls_repo(repo)
             packet = self.packet_with_real_map(repo, cache_dir, "update src.a.f")
-            content = self.real_render(Path(packet["target_state"]["analysis_repo"]), "--mention", "src/a.py")["content"]
             entry = next(entry for entry in packet["targets"] if entry["path"] == "src/a.py")
-            rendered = [symbol for symbol in entry["symbols"] if symbol["summary_source"] == "soulforge_render"]
-            self.assertTrue(rendered, f"RENDER_SUMMARIES_NOT_APPLIED: {[s['summary_source'] for s in entry['symbols']]}")
-            for symbol in rendered:
-                self.assertIn(f":{symbol['line']}", symbol["summary"], "RENDER_SUMMARIES_NOT_APPLIED")
-                self.assertIn(symbol["summary"].split(" :")[0].strip(), content, "RENDER_SUMMARIES_NOT_APPLIED")
+            self.assertIsNotNone(entry.get("render_rank"), "precondition: the render did not run")
+            self.assertLessEqual({"f", "g"}, {symbol["name"] for symbol in entry["symbols"]},
+                                 "precondition: fixture symbols not displayed")
+            rows = {(row.name, row.line): (row.summary, row.summary_source) for row in repo_context_forge.workflow_index.WorkflowIndex(
+                Path(packet["target_state"]["analysis_repo"]), repo_context_forge.file_role).file_symbols("src/a.py", 100)}
+            self.assertEqual({(s["name"], s["line"]): (s["summary"], s["summary_source"]) for s in entry["symbols"]},
+                             {key: rows[key] for key in ((s["name"], s["line"]) for s in entry["symbols"])},
+                             "RENDER_SUMMARY_STILL_APPLIED")
 
     def test_render_falls_back_without_render_map_support(self) -> None:
         # BM_RENDER_UNSUPPORTED: an installed SoulForge without --render-map (2.13.2); no binary at all.
@@ -5310,19 +5312,6 @@ class RepoContextForgeTests(unittest.TestCase):
             last = plain["targets"][-1]["path"]
             boosted = self.packet_with_real_map(repo, cache_dir, None, mode="local", task_state={"edited_files": [last]})
             self.assertEqual(boosted["targets"][0]["path"], last, "TASK_BOOST_IGNORED")
-
-    def test_decorated_symbols_carry_render_summaries(self) -> None:
-        # BM_DECORATED_SUMMARY: the native index starts a decorated symbol at its decorator line.
-        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
-            repo = Path(repo_dir)
-            self.make_calls_repo(repo)
-            (repo / "src" / "a.py").write_text(
-                "import functools\n\n\n@functools.cache\ndef g():\n    return 1\n\n\ndef f():\n    return g()\n", encoding="utf-8")
-            repo_context_forge.run_cmd(["git", "commit", "-qam", "decorate"], cwd=repo)
-            packet = self.packet_with_real_map(repo, cache_dir, "update src.a.f")
-            symbols = next(entry for entry in packet["targets"] if entry["path"] == "src/a.py")["symbols"]
-            self.assertEqual({symbol["name"]: symbol["summary_source"] for symbol in symbols if symbol["name"] in {"f", "g"}},
-                             {"f": "soulforge_render", "g": "soulforge_render"}, "DECORATED_SUMMARY_MISSED")
 
     def test_never_mode_spawns_no_soulforge_process(self) -> None:
         # BM_KEEP_NEVER_AND_MISSING: never = no build and no render.

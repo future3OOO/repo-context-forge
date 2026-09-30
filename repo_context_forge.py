@@ -1665,23 +1665,6 @@ class SoulForgeMap:
             return None, command, "render output has no paths"
         return document, command, None
 
-    @staticmethod
-    def rendered_symbol_lines(content: str, path: str) -> dict[int, str]:
-        """The render's symbol lines for one file block, keyed by source line: the block starts
-        at `<path>:` and its lines are `  [+ ]<signature> :<line>[ [callers]]`."""
-        lines: dict[int, str] = {}
-        in_block = False
-        for raw in content.splitlines():
-            if not raw.startswith(" "):
-                in_block = raw.startswith(f"{path}:")
-                continue
-            if not in_block:
-                continue
-            match = re.match(r"  [+ ](.*?) :(\d+)(?: \[.*\])?$", raw)
-            if match:
-                lines[int(match.group(2))] = f"{match.group(1).strip()} :{match.group(2)}"
-        return lines
-
     def symbol_calls(self, path: str, symbol: Symbol) -> dict[str, list[dict[str, str]]]:
         """Callers and callees of `symbol` in `path`, from the calls table. The map's symbol is the
         same-named one whose line lies in `symbol`'s span: the native index starts a decorated
@@ -2177,12 +2160,9 @@ def make_target_entries(
 
 
 def apply_soulforge_render(target_entries: list[dict[str, object]], document: dict[str, object]) -> None:
-    """SoulForge's ranking and symbol summaries onto the packet's target entries: `render_rank`
-    is the file's index in the render's paths (files it did not render follow, in their current
-    order), and a displayed symbol takes the first rendered line in its span that names it (the
-    native index starts a decorated symbol at its decorator, the render at its `def`)."""
+    """SoulForge's ranking onto the packet's target entries: `render_rank` is the file's index in
+    the render's paths; files it did not render follow, in their current order."""
     paths = [str(path) for path in document["paths"]]
-    content = str(document.get("content") or "")
     unrendered = len(paths)
     for entry in target_entries:
         path = str(entry["path"])
@@ -2191,13 +2171,6 @@ def apply_soulforge_render(target_entries: list[dict[str, object]], document: di
         else:
             entry["render_rank"] = unrendered
             unrendered += 1
-        rendered = SoulForgeMap.rendered_symbol_lines(content, path)
-        for symbol in entry["symbols"]:
-            line = next((text for number, text in sorted(rendered.items()) if int(symbol["line"]) <= number
-                         <= int(symbol["end_line"]) and symbol["name"] in text), None)
-            if line:
-                symbol["summary"] = line
-                symbol["summary_source"] = "soulforge_render"
 
 
 def build_gitnexus_plan(
