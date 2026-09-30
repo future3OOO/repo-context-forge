@@ -1640,6 +1640,67 @@ class SoulForgeMap:
             ).fetchall()
         return [{"path": str(row["path"]), "count": int(row["count"])} for row in rows]
 
+    def render(
+        self, soulforge_bin: str, *, mentioned: Iterable[str], edited: Iterable[str],
+    ) -> tuple[dict[str, object] | None, list[str], str | None]:
+        """SoulForge's own ranked map for this checkout (`--headless --render-map`, Empryo >= the
+        fork's render-map PR): the parsed {paths, content, stats} document, the command, and the
+        reason when unavailable. A binary without the flag would treat it as a prompt and spend a
+        model turn, so support is checked through `--help` first."""
+        probe = run_cmd([soulforge_bin, "--help"], allow_fail=True)
+        if "--render-map" not in probe.stdout + probe.stderr:
+            return None, [], "binary has no --render-map"
+        command = [soulforge_bin, "--headless", "--render-map"]
+        for flag, paths in (("--mention", mentioned), ("--edited", edited)):
+            for path in paths:
+                command += [flag, path]
+        proc = run_cmd(command, cwd=self.repo, allow_fail=True)
+        if proc.returncode != 0:
+            return None, command, f"SoulForge exited with {proc.returncode}"
+        try:
+            document = json.loads(proc.stdout)
+        except ValueError:
+            return None, command, "render output is not JSON"
+        if not isinstance(document, dict) or not isinstance(document.get("paths"), list):
+            return None, command, "render output has no paths"
+        return document, command, None
+
+    def symbol_calls(self, path: str, symbol: Symbol) -> dict[str, list[dict[str, str]]]:
+        """Callers and callees of `symbol` in `path`, from the calls table. The map's symbol is the
+        same-named one whose line lies in `symbol`'s span: the native index starts a decorated
+        symbol at its decorator, the map at its `def`."""
+        empty: dict[str, list[dict[str, str]]] = {"callers": [], "callees": []}
+        if not self.available:
+            return empty
+        with self._connect() as conn:
+            if not self._has_table(conn, "calls"):
+                return empty
+            rows = conn.execute(
+                """
+                SELECT 'callers' AS side, cf.path AS file, caller.name AS symbol
+                FROM calls c
+                JOIN symbols callee ON callee.id = c.callee_symbol_id
+                JOIN files f ON f.id = callee.file_id
+                JOIN symbols caller ON caller.id = c.caller_symbol_id
+                JOIN files cf ON cf.id = caller.file_id
+                WHERE f.path = ? AND callee.name = ? AND callee.line BETWEEN ? AND ?
+                UNION
+                SELECT 'callees', ef.path, callee.name
+                FROM calls c
+                JOIN symbols caller ON caller.id = c.caller_symbol_id
+                JOIN files f ON f.id = caller.file_id
+                JOIN symbols callee ON callee.id = c.callee_symbol_id
+                JOIN files ef ON ef.id = callee.file_id
+                WHERE f.path = ? AND caller.name = ? AND caller.line BETWEEN ? AND ?
+                ORDER BY 1, 2, 3
+                """,
+                (path, symbol.name, symbol.line, symbol.end_line) * 2,
+            ).fetchall()
+        result: dict[str, list[dict[str, str]]] = {"callers": [], "callees": []}
+        for row in rows:
+            result[str(row["side"])].append({"file": str(row["file"]), "symbol": str(row["symbol"])})
+        return result
+
     @staticmethod
     def _native_symbol(entry: workflow_index.IndexedSymbol) -> Symbol:
         return Symbol(
@@ -1788,8 +1849,11 @@ def rank_target_entry(
 
 
 def target_entry_sort_key(entry: dict[str, object]) -> tuple[object, ...]:
+    if isinstance(entry.get("render_rank"), int):
+        return (0, -float(entry.get("task_boost") or 0), int(entry["render_rank"]), str(entry["path"]))
     relevance = entry["intent_evidence"].get("relevance_score", 0) if isinstance(entry.get("intent_evidence"), dict) else 0
     return (
+        1,
         -float(relevance),
         -float(entry.get("priority_score") or 0),
         0 if entry.get("surface_role") == "production" else 1,
@@ -1831,6 +1895,7 @@ def apply_task_state_to_entries(
                 score += boost
         entry["rank_signals"] = signals
         entry["why_selected"] = reasons
+        entry["task_boost"] = round(score - float(entry.get("priority_score") or 0), 4)
         entry["priority_score"] = round(score, 4)
     return sorted(target_entries, key=target_entry_sort_key)
 
@@ -2076,6 +2141,9 @@ def make_target_entries(
             "_planner_symbols": [symbol.__dict__ for symbol in planner_symbols],
             "intent_required_symbols": [
                 required_symbol_keys[(path, symbol.line, symbol.name)] for symbol in intent_required_symbols],
+            "symbol_calls": {
+                required_symbol_keys[(path, symbol.line, symbol.name)]: soul_map.symbol_calls(path, symbol)
+                for symbol in intent_required_symbols},
             "intent_required_file": intent_required_file,
             "dependent_count": soul_map.dependent_count_for_file(path),
             "graph_neighbors": soul_map.graph_neighbors_for_file(path),
@@ -2089,6 +2157,20 @@ def make_target_entries(
             rank_target_entry(entry, source_git_state, mode=mode)
         )
     return sorted(target_entries, key=target_entry_sort_key)
+
+
+def apply_soulforge_render(target_entries: list[dict[str, object]], document: dict[str, object]) -> None:
+    """SoulForge's ranking onto the packet's target entries: `render_rank` is the file's index in
+    the render's paths; files it did not render follow, in their current order."""
+    paths = [str(path) for path in document["paths"]]
+    unrendered = len(paths)
+    for entry in target_entries:
+        path = str(entry["path"])
+        if path in paths:
+            entry["render_rank"] = paths.index(path)
+        else:
+            entry["render_rank"] = unrendered
+            unrendered += 1
 
 
 def build_gitnexus_plan(
@@ -2768,6 +2850,20 @@ def make_packet(
         intent=intent,
         intent_resolution=intent_resolution,
     )
+    render_state: dict[str, object] = {"attempted": False, "command": [], "warning": None}
+    if mode in {"intent", "local"} and map_build != "never" and soul_map.available and soulforge_bin:
+        render_state["attempted"] = True
+        mentioned = [item.path for item in intent_resolution.file_evidence if item.exact_file] if mode == "intent" else []
+        document, render_state["command"], render_warning = soul_map.render(
+            soulforge_bin, mentioned=mentioned, edited=selected_files(source_git_state, "dirty"))
+        if document is None:
+            render_state["warning"] = f"SoulForge render unavailable: {render_warning}"
+        else:
+            apply_soulforge_render(target_entries, document)
+            target_entries.sort(key=target_entry_sort_key)
+    elif mode in {"intent", "local"} and map_build != "never":
+        render_state["warning"] = "SoulForge render unavailable: " + (
+            "no map" if not soul_map.available else "SoulForge binary not found")
     target_entries = apply_task_state_to_entries(target_entries, task_state)
     coverage_plan = build_coverage_plan(target_entries)
     gitnexus_status = gitnexus_analysis.ensure_index(
@@ -2887,6 +2983,8 @@ def make_packet(
     warnings = []
     if build_result.warning:
         warnings.append(build_result.warning)
+    if render_state["warning"]:
+        warnings.append(str(render_state["warning"]))
     if not soulforge_target.get("target_head_verified"):
         stale = soulforge_target.get("stale_reason")
         warnings.append(f"SoulForge map is stale: {stale}" if stale else "SoulForge target head could not be verified")
@@ -2960,6 +3058,7 @@ def make_packet(
             "stats": soul_map.stats(),
             "top_files": [entry.__dict__ for entry in soul_map.top_files(top)],
             "target": soulforge_target,
+            "render": render_state,
         },
         "semantic_summaries": semantic_summary_section(target_entries),
         "architecture_summary": workflow_index.summarize_architecture(target_entries),
@@ -3017,6 +3116,14 @@ def render_target_lines(target: dict[str, object], *, max_symbols: int = 8) -> l
                         f"  - `{symbol.get('name')}` "
                         f"used by {symbol.get('usage_files', 0)} files"
                     )
+    symbol_calls = target.get("symbol_calls")
+    if isinstance(symbol_calls, dict):
+        for name, calls in symbol_calls.items():
+            for side in ("callers", "callees"):
+                refs = calls.get(side) if isinstance(calls, dict) else None
+                if refs:
+                    lines.append(f"- `{name}` {side}: " + ", ".join(
+                        f"{ref['file']}:{ref['symbol']}" for ref in refs[:8]))
     dirty_kinds = target.get("dirty_kinds")
     if isinstance(dirty_kinds, list) and dirty_kinds:
         lines.append(f"- source dirty overlap: {', '.join(str(item) for item in dirty_kinds)}")
@@ -3362,6 +3469,7 @@ def trim_prompt_lines(lines: list[str], token_budget: int) -> list[str] | None:
         and (" weight=" in line or " count=" in line),
         lambda line: line.lstrip().startswith("<reason>"),
         lambda line: line.lstrip().startswith("<signal>"),
+        lambda line: line.lstrip().startswith(("<symbol_calls ", "</symbol_calls>", "<caller ", "<callee ")),
     ]
     trimmed = list(lines)
     for predicate in predicates:
@@ -3674,6 +3782,18 @@ def render_prompt(packet: dict[str, object]) -> str:
                         f"usage_files=\"{html.escape(str(symbol.get('usage_files') or 0))}\"/>"
                     )
         lines.append("      </exported_symbols_at_risk>")
+        symbol_calls = target.get("symbol_calls")
+        if isinstance(symbol_calls, dict):
+            for name, calls in symbol_calls.items():
+                if not isinstance(calls, dict) or not (calls.get("callers") or calls.get("callees")):
+                    continue
+                lines.append(f"      <symbol_calls symbol=\"{html.escape(str(name))}\">")
+                for side in ("callers", "callees"):
+                    for ref in (calls.get(side) or [])[:8]:
+                        lines.append(
+                            f"        <{side[:-1]} file=\"{html.escape(str(ref['file']))}\" "
+                            f"symbol=\"{html.escape(str(ref['symbol']))}\"/>")
+                lines.append("      </symbol_calls>")
         lines.append("    </file>")
     lines.extend(["  </soulforge_impact>", "  <targets>"])
     for target in targets:
