@@ -4957,8 +4957,8 @@ class RepoContextForgeTests(unittest.TestCase):
 
     def test_retained_soulforge_paths_cannot_escape_cache(self) -> None:
         # BM_KEEP_CACHE_BOUNDARY: the retained map may not redirect SoulForge's writes outside
-        # the cache through a symlinked directory or database.
-        for redirect in ("directory", "database", "manifest"):
+        # the cache through a symlinked directory, database, sidecar, memory store or manifest.
+        for redirect in ("directory", "database", "manifest", "repomap.db-shm", "memory.db", "index", "sub/x"):
             with self.subTest(redirect=redirect), tempfile.TemporaryDirectory() as repo_dir, \
                     tempfile.TemporaryDirectory() as cache_dir, tempfile.TemporaryDirectory() as outside_dir:
                 repo = Path(repo_dir)
@@ -4972,11 +4972,17 @@ class RepoContextForgeTests(unittest.TestCase):
                     cache.mkdir()
                     sqlite3.connect(outside / "repomap.db").close()
                     (cache / "repomap.db").symlink_to(outside / "repomap.db")
-                else:
+                elif redirect == "manifest":
                     sources = repo_context_forge.SoulForgeMap(state.analysis_repo).sources_path
                     sources.parent.mkdir(exist_ok=True)
                     (outside / "victim").write_text("keep\n", encoding="utf-8")
                     sources.symlink_to(outside / "victim")
+                elif redirect == "index":
+                    (state.analysis_repo / repo_context_forge.workflow_index.INDEX_DIR).symlink_to(outside, target_is_directory=True)
+                else:
+                    (cache / redirect).parent.mkdir(parents=True)
+                    (outside / "victim").write_text("keep\n", encoding="utf-8")
+                    (cache / redirect).symlink_to(outside / "victim")
                 with self.assertRaises(RuntimeError, msg="CACHE_BOUNDARY_ESCAPED"):
                     repo_context_forge.reset_cached_worktree(state.analysis_repo, Path(cache_dir))
 

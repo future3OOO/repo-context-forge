@@ -744,13 +744,14 @@ def reset_cached_worktree(worktree: Path, cache_dir: Path, *, allow_fail: bool =
     run_git(worktree, ["reset", "--hard", "HEAD"], allow_fail=allow_fail)
     exclusions = [item for path in TOOL_CACHE_DIRS for item in ("-e", f"{path}/")]
     run_git(worktree, ["clean", "-fd", *exclusions], allow_fail=allow_fail)
-    # The map survives the reset; SoulForge writes through these paths, so neither may
-    # point outside the cache (a checked-in symlink would).
-    index_dir = worktree / workflow_index.INDEX_DIR
-    for retained in (worktree / ".soulforge", worktree / ".soulforge" / "repomap.db",
-                     index_dir, index_dir / SoulForgeMap.SOURCES_FILE):
+    # The map and index survive the reset, and SoulForge writes through any path in them
+    # (map sidecars, memory.db), so none may point outside the cache (a checked-in symlink would).
+    for retained in (worktree / ".soulforge", worktree / workflow_index.INDEX_DIR):
         if os.path.lexists(retained):
             require_cache_path(retained, cache_dir)
+        for root, dirs, files in os.walk(retained):
+            for name in (*dirs, *files):
+                require_cache_path(Path(root, name), cache_dir)
 
 
 def overlay_source_worktree(source_repo: Path, analysis_repo: Path) -> None:
