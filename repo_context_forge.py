@@ -2673,26 +2673,6 @@ def make_packet(
     analysis = gitnexus_status.get("analysis")
     coverage_gap_warning = ""
     if isinstance(analysis, dict):
-        if coverage_gaps:
-            gap_text = coverage_gap_text(coverage_gaps)
-            # A path absent from the repository names nothing the graph could cover: it is
-            # reported, never planned, and never blocks.
-            blocking_gaps = [gap for gap in coverage_gaps if gap["kind"] != "absent_file"]
-            if not blocking_gaps or resolved_required_anchor(analysis, plan):
-                coverage_gap_warning = f"intent coverage gaps recorded: {gap_text}"
-            else:
-                unresolved = analysis.get("unresolved_checks")
-                if isinstance(unresolved, list):
-                    unresolved.extend(
-                        {**gap, "status": "coverage_gap"}
-                        for gap in blocking_gaps
-                    )
-                analysis["status"] = "blocked"
-                gitnexus_status.update(
-                    status="blocked",
-                    required_checks_resolved=False,
-                    warning=f"intent coverage gaps block semantic analysis: {gap_text}",
-                )
         analysis["authority"] = {
             "source_repository": str(target_state.source_repo),
             "analysis_repository": str(target_state.analysis_repo),
@@ -2702,6 +2682,8 @@ def make_packet(
             "freshness_status": index_freshness_status,
         }
         analysis["producer_revision"] = producer_revision()
+        # The graph result, before intent gaps block the packet, decides the receipt: a gap-blocked
+        # rerun of the same candidate then reuses its index instead of reanalyzing it.
         if gitnexus_mode != "off" and gitnexus_analysis.result_is_resolved(analysis):
             if mode in {"local", "intent"}:
                 source_gitignore = target_state.source_repo / ".gitignore"
@@ -2734,6 +2716,26 @@ def make_packet(
                         ),
                     })
                 gitnexus_status["required_checks_resolved"] = False
+        if coverage_gaps:
+            gap_text = coverage_gap_text(coverage_gaps)
+            # A path absent from the repository names nothing the graph could cover: it is
+            # reported, never planned, and never blocks.
+            blocking_gaps = [gap for gap in coverage_gaps if gap["kind"] != "absent_file"]
+            if not blocking_gaps or resolved_required_anchor(analysis, plan):
+                coverage_gap_warning = f"intent coverage gaps recorded: {gap_text}"
+            else:
+                unresolved = analysis.get("unresolved_checks")
+                if isinstance(unresolved, list):
+                    unresolved.extend(
+                        {**gap, "status": "coverage_gap"}
+                        for gap in blocking_gaps
+                    )
+                analysis["status"] = "blocked"
+                gitnexus_status.update(
+                    status="blocked",
+                    required_checks_resolved=False,
+                    warning=f"intent coverage gaps block semantic analysis: {gap_text}",
+                )
     source_status = source_status_proof(
         source_status_before,
         porcelain_status(target_state.source_repo),

@@ -1765,6 +1765,11 @@ class RepoContextForgeTests(unittest.TestCase):
                 result.returncode != 0 and has_expected_gap,
                 "DISCOVERY_GAP_REPORTED_RESOLVED",
             )
+            projection = packet["advisorProjection"]
+            self.assertEqual(
+                (packet["gitnexus"]["index_fresh"], projection["indexedCandidateTree"]),
+                (True, projection["expectedCandidateTree"]),
+                "GAP_BLOCKED_PACKET_PUBLISHED_NO_RECEIPT")
 
     def test_public_bootstrap_blocks_ambiguous_qualified_symbol(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -4929,6 +4934,8 @@ class RepoContextForgeTests(unittest.TestCase):
             if args[-1] == "upstream/codex/native-startup-checkout"
             else "main-sha"
             if args[-1] == "origin/main"
+            else "origin"
+            if args == ["remote"]
             else "",
         ):
             base = codex_context_bootstrap.first_existing_base(Path("/repo"), None)

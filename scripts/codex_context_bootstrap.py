@@ -28,7 +28,8 @@ def first_existing_base(repo: Path, requested: str | None) -> str | None:
     candidates = [requested] if requested else []
     if not requested:
         pr_base = os.environ.get("GITHUB_BASE_REF", "").strip()
-        if not pr_base and shutil.which("gh"):
+        # `gh pr view` resolves its repository from a remote or GH_REPO; without either it can only fail.
+        if not pr_base and shutil.which("gh") and (git_output(repo, ["remote"]) or os.environ.get("GH_REPO")):
             proc = forge.run_cmd(
                 ["gh", "pr", "view", "--json", "baseRefName", "--jq", ".baseRefName"],
                 cwd=repo,
