@@ -18,7 +18,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Callable, Iterable, Literal
 from urllib.parse import urlsplit
 
 import gitnexus_analysis
@@ -43,6 +43,9 @@ MIN_TOKEN_BUDGET = 8_000
 MAX_TOKEN_BUDGET = 32_000
 DEFAULT_TOKEN_BUDGET = MIN_TOKEN_BUDGET
 MAX_GITNEXUS_CHECKS = 20
+# A ranking query costs about as much as 1.6 checks (0.46 s against 0.29 s measured) and checks
+# come in context+impact pairs: two pairs keep a ranked plan cheaper than the unranked one.
+RANKING_CHECKS = 4
 INTENT_GRAPH_EXCLUDED_NAMES = {"Cargo.lock", "go.sum"}
 TaskEvent = Literal["read", "search", "edit", "mention"]
 CRITICAL_AREA_STEPS = (
@@ -1956,13 +1959,20 @@ def build_gitnexus_plan(
     repo_name: str | None = None,
     *,
     intent_mode: bool = False,
+    rank: Callable[[dict[str, int]], dict[str, list[str]] | None] | None = None,
 ) -> tuple[list[dict[str, object]], int, list[dict[str, object]]]:
+    """Required groups first against the full cap, then optional groups one per target in turn:
+    targets whose symbols the diff changed, then production targets, then tests. `rank` names,
+    per file and slot count, the symbols to prefer where an unchanged target holds more
+    candidates than its slots; it and its reserve can only displace unchanged symbols."""
     required_groups: list[list[dict[str, object]]] = []
-    optional_queues: list[list[list[dict[str, object]]]] = []
+    # (0 changed symbols | 1 production | 2 test, path whose order `rank` may decide, groups)
+    optional_queues: list[tuple[int, str, list[list[dict[str, object]]]]] = []
     seen: set[tuple[str, str, str, str]] = set()
     for entry in target_entries:
         entry_optional_groups: list[list[dict[str, object]]] = []
         path = str(entry["path"])
+        tier = 0 if entry.get("changed_symbols") else 2 if entry.get("surface_role") == "test" else 1
         symbols = (
             entry.get("changed_symbols")
             or entry.get("_planner_symbols")
@@ -1993,7 +2003,7 @@ def build_gitnexus_plan(
                     file_item["repo"] = repo_name
                 entry_optional_groups.append([file_item])
             if entry_optional_groups:
-                optional_queues.append(entry_optional_groups)
+                optional_queues.append((tier, "", entry_optional_groups))
             continue
         required_names = unique_ordered(
             name
@@ -2045,14 +2055,8 @@ def build_gitnexus_plan(
             else:
                 entry_optional_groups.append(group)
         if entry_optional_groups:
-            optional_queues.append(entry_optional_groups)
+            optional_queues.append((tier, path if tier else "", entry_optional_groups))
 
-    optional_groups = [
-        queue[index]
-        for index in range(max((len(queue) for queue in optional_queues), default=0))
-        for queue in optional_queues
-        if index < len(queue)
-    ]
     plan: list[dict[str, object]] = []
     omitted_required_checks: list[dict[str, object]] = []
     for group in required_groups:
@@ -2061,16 +2065,42 @@ def build_gitnexus_plan(
             continue
         plan.extend(group)
 
-    omitted_optional_checks = 0
-    if omitted_required_checks:
-        omitted_optional_checks = sum(len(group) for group in optional_groups)
-    else:
-        for group in optional_groups:
-            if len(plan) + len(group) > MAX_GITNEXUS_CHECKS:
-                omitted_optional_checks += len(group)
-                continue
-            plan.extend(group)
-    return plan, omitted_optional_checks, omitted_required_checks
+    turns = [
+        (queue, index)
+        for tier in (0, 1, 2)
+        for index in range(max((len(queue[2]) for queue in optional_queues), default=0))
+        for queue in optional_queues
+        if queue[0] == tier and index < len(queue[2])
+    ]
+
+    def fitting(capacity: int) -> list[tuple[tuple[int, str, list[list[dict[str, object]]]], int]]:
+        """The turns whose group fits, in order; a pair that does not fit is passed over."""
+        size = len(plan)
+        chosen = []
+        for queue, index in turns:
+            if size + len(queue[2][index]) <= capacity:
+                chosen.append((queue, index))
+                size += len(queue[2][index])
+        return chosen
+
+    capacity = 0 if omitted_required_checks else MAX_GITNEXUS_CHECKS
+    optional_checks = sum(len(group) for queue in optional_queues for group in queue[2])
+    if rank and capacity and len(plan) + optional_checks > capacity:
+        ranked_turns = fitting(capacity - RANKING_CHECKS)
+        slots = {
+            path: count
+            for _tier, path, groups in optional_queues
+            if path and 0 < (count := sum(queue[2] is groups for queue, _index in ranked_turns)) < len(groups)
+        }
+        ranked = rank(slots) if slots else None
+        if ranked is not None:
+            capacity -= RANKING_CHECKS
+            position = {(path, name): index for path, names in ranked.items() for index, name in enumerate(names)}
+            for _tier, _path, groups in optional_queues:
+                groups.sort(key=lambda group: position.get((group[0]["file"], group[0]["target"]), len(position)))
+    for queue, index in fitting(capacity):
+        plan.extend(queue[2][index])
+    return plan, optional_checks - sum(item.get("required") is not True for item in plan), omitted_required_checks
 
 
 semantic_summary_section = workflow_index.semantic_summary
@@ -2145,6 +2175,9 @@ def resolved_required_anchor(analysis: dict[str, object], plan: list[dict[str, o
 
 
 def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> list[str]:
+    """One row per resolved symbol: its identity, then callers, callees and upstream impact, each
+    list as GitNexus returned it, grouped by file, and marked where GitNexus cut it at its row
+    limit. File checks and unresolved checks keep the <check> form."""
     analysis = gitnexus.get("analysis")
     if not isinstance(analysis, dict):
         return []
@@ -2158,33 +2191,63 @@ def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> 
         f'output_bytes="{html.escape(str(analysis.get("output_bytes") or 0))}">'
     ]
     entries = analysis.get("entries")
-    if isinstance(entries, list):
-        for entry in entries[:MAX_GITNEXUS_CHECKS]:
-            if not isinstance(entry, dict):
-                continue
-            attrs = " ".join(
-                f'{name}="{html.escape(str(entry.get(name) or ""))}"'
-                for name in ("kind", "file", "target", "direction", "status", "resolved_identity")
+    entries = [
+        entry for entry in (entries if isinstance(entries, list) else [])[:MAX_GITNEXUS_CHECKS]
+        if isinstance(entry, dict)
+    ]
+    impacts = {
+        entry.get("resolved_identity"): entry
+        for entry in entries
+        if entry.get("kind") == "symbol_impact" and entry.get("status") == "resolved"
+    }
+
+    def by_file(facts: object) -> str:
+        names_by_file: dict[str, list[str]] = {}
+        for fact in facts if isinstance(facts, list) else []:
+            if isinstance(fact, dict):
+                path = str(fact.get("file") or "")
+                name = str(fact.get("identity") or "").rsplit(":", 1)[-1]
+                names_by_file.setdefault(path, []).extend([] if name == path else [name])
+        return html.escape("; ".join(
+            f"{path}: {', '.join(names)}" if names else path for path, names in names_by_file.items()
+        )) or "none"
+
+    for entry in entries:
+        resolved = entry.get("status") == "resolved"
+        if resolved and entry.get("kind") == "symbol_impact":
+            continue
+        if resolved and entry.get("kind") == "symbol_context":
+            lines.append(f"{indent}  {html.escape(str(entry.get('resolved_identity')))}")
+            lines.extend(
+                f"{indent}    {key}{' (GitNexus row limit reached; may be incomplete)' if entry.get(f'{key}_limited') else ''}: "
+                f"{by_file(entry.get(key))}"
+                for key in ("callers", "callees")
             )
-            lines.append(f"{indent}  <check {attrs}>")
-            for key in ("callers", "references"):
-                facts = entry.get(key)
-                if isinstance(facts, list):
-                    for fact in facts[:5]:
-                        if isinstance(fact, dict):
-                            lines.append(
-                                f'{indent}    <{key[:-1]} identity="{html.escape(str(fact.get("identity") or ""))}" '
-                                f'file="{html.escape(str(fact.get("file") or ""))}"/>'
-                            )
-            impacted = entry.get("impacted_files")
-            if isinstance(impacted, list):
-                for path in impacted[:5]:
-                    lines.append(f'{indent}    <impacted_file path="{html.escape(str(path))}"/>')
-            if entry.get("diagnostic"):
+            impact = impacts.get(entry.get("resolved_identity"))
+            if impact:
+                impacted = impact.get("impacted_files")
+                lines.append(html.escape(
+                    f"{indent}    upstream impact {impact.get('risk')}, {impact.get('impacted_count')} symbols in: "
+                    f"{', '.join(str(path) for path in impacted) if impacted else 'none'}"
+                ))
+            continue
+        attrs = " ".join(
+            f'{name}="{html.escape(str(entry.get(name) or ""))}"'
+            for name in ("kind", "file", "target", "direction", "status", "resolved_identity")
+        )
+        lines.append(f"{indent}  <check {attrs}>")
+        references = entry.get("references")
+        for fact in references if isinstance(references, list) else []:
+            if isinstance(fact, dict):
                 lines.append(
-                    f"{indent}    <diagnostic>{html.escape(str(entry['diagnostic']))}</diagnostic>"
+                    f'{indent}    <reference identity="{html.escape(str(fact.get("identity") or ""))}" '
+                    f'file="{html.escape(str(fact.get("file") or ""))}"/>'
                 )
-            lines.append(f"{indent}  </check>")
+        if entry.get("diagnostic"):
+            lines.append(
+                f"{indent}    <diagnostic>{html.escape(str(entry['diagnostic']))}</diagnostic>"
+            )
+        lines.append(f"{indent}  </check>")
     lines.append(f"{indent}</gitnexus_analysis>")
     return lines
 
@@ -2645,7 +2708,8 @@ def make_packet(
     ]
     unavailable_targets = [entry for entry in target_entries if entry not in graph_targets]
     plan, omitted_check_count, omitted_required_checks = build_gitnexus_plan(
-        graph_targets, gitnexus_repo_name, intent_mode=mode == "intent")
+        graph_targets, gitnexus_repo_name, intent_mode=mode == "intent",
+        rank=functools.partial(gitnexus_analysis.rank_symbols, gitnexus_status, run_command=run_cmd))
     unavailable_plan, unavailable_omitted, unavailable_required = build_gitnexus_plan(
         unavailable_targets, gitnexus_repo_name, intent_mode=mode == "intent")
     omitted_check_count += unavailable_omitted
@@ -3128,9 +3192,6 @@ def render_required_intake(packet: dict[str, object]) -> str:
     if isinstance(packet_gaps, list) and packet_gaps:
         lines.append("coverage_gaps: " + coverage_gap_text(
             [gap for gap in packet_gaps if isinstance(gap, dict)]))
-    lines.append(
-        "gitnexus_tool_discovery: run tool_search for missing follow-up GitNexus capabilities before declaring context, impact, or detect_changes unavailable."
-    )
     lines.extend(workflow_index.architecture_lines(architecture))
     lines.append("top_targets:")
     for target in targets[:5]:
@@ -3191,7 +3252,6 @@ def render_required_intake(packet: dict[str, object]) -> str:
             "- Cover every required coverage area in the parent session unless the current user turn explicitly asks for delegated agents.",
             "- Satisfy coverage_plan before GitNexus calls, GitHub review comments, review findings, or edits.",
             "- Consume gitnexus_analysis first; gitnexus_required_checks records the already-executed packet plan.",
-            "- If a required GitNexus MCP tool is not loaded, run tool_search for that exact GitNexus capability before falling back or reporting it unavailable.",
             "- Use packet targets plus live base...HEAD, dirty worktree, or intent surface according to packet mode.",
             "- Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",
             "- Use gitnexus_detect_changes after local edits, before commit, or as supplemental graph evidence after the packet surface is fixed.",

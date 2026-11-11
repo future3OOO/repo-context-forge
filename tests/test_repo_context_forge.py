@@ -2512,13 +2512,15 @@ class RepoContextForgeTests(unittest.TestCase):
                 repo, cache_dir, runtime_home, mode="repo")
             self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
             analysis = packet["gitnexus"]["analysis"]
-            self.assertEqual(len(analysis["entries"]), repo_context_forge.MAX_GITNEXUS_CHECKS)
-            self.assertEqual(analysis["omitted_check_count"], 4)
+            ranked_checks = repo_context_forge.MAX_GITNEXUS_CHECKS - repo_context_forge.RANKING_CHECKS
+            self.assertEqual(len(analysis["entries"]), ranked_checks)
+            self.assertEqual(analysis["graph_call_count"], ranked_checks + 1)
+            self.assertEqual(analysis["omitted_check_count"], 8)
             self.assertNotIn("plan_capacity_reached", analysis)
             self.assertTrue(packet["gitnexus"]["required_checks_resolved"])
             self.assertNotIn("blocked", packet)
-            self.assertIn("omitted_checks=4; omissions_blocking=false", result.stdout)
-            self.assertIn('omitted_checks="4" omissions_blocking="false"', result.stdout)
+            self.assertIn("omitted_checks=8; omissions_blocking=false", result.stdout)
+            self.assertIn('omitted_checks="8" omissions_blocking="false"', result.stdout)
 
     def test_public_bootstrap_emits_resolved_graph_analysis(self) -> None:
         self.assertIsNotNone(shutil.which("gitnexus"), "real GitNexus CLI is required")
@@ -4204,7 +4206,8 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("repo=analysis-repo", rendered)
         self.assertIn("expected_head_sha=abc123", rendered)
         self.assertIn("indexed_head_sha=abc123", rendered)
-        self.assertIn("gitnexus_tool_discovery:", rendered)
+        self.assertNotIn("gitnexus_tool_discovery", rendered)
+        self.assertNotIn("tool_search", rendered)
         self.assertIn("architecture_summary:", rendered)
         self.assertIn("- roles | production=1,test=1", rendered)
         self.assertIn(

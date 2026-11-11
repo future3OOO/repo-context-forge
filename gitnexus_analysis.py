@@ -16,6 +16,10 @@ CALL_TIMEOUT_SECONDS = 30
 TOTAL_TIMEOUT_SECONDS = 120
 MAX_OUTPUT_BYTES = 256_000
 MAX_FACTS = 50
+# Containment, not dependency: an owning class is not a caller and a member is not a callee.
+MEMBERSHIP_RELATIONS = {"has_method", "has_property"}
+# `gitnexus context` returns at most this many rows per direction, an arbitrary subset beyond it.
+CONTEXT_ROW_LIMIT = 30
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 ACTIVE_TRANSACTION: ContextVar[tuple[str, TextIO] | None] = ContextVar("active_analysis_transaction", default=None)
@@ -348,8 +352,8 @@ def _references(value: object) -> list[dict[str, str]]:
         return []
     references: list[dict[str, str]] = []
     seen: set[str] = set()
-    for items in value.values():
-        if not isinstance(items, list):
+    for relation, items in value.items():
+        if relation in MEMBERSHIP_RELATIONS or not isinstance(items, list):
             continue
         for item in items:
             if not isinstance(item, dict):
@@ -393,6 +397,58 @@ def result_is_resolved(value: object) -> bool:
     )
 
 
+def rank_symbols(
+    gitnexus_status: dict[str, object],
+    slots: dict[str, int],
+    *,
+    run_command: RunCommand,
+    gitnexus_bin: str | None = None,
+) -> dict[str, list[str]] | None:
+    """Per file, the names of its `slots` symbols with the most CALLS edges, most first.
+
+    One bounded query whose reply grows with the slots, not the symbols. None when no
+    query ran; a query that ran is charged to the analysis `execute` builds next."""
+    binary = gitnexus_bin or shutil.which("gitnexus")
+    if gitnexus_status.get("status") not in {"fresh", "reindexed"} or not binary:
+        return None
+    query = " UNION ALL ".join(
+        'MATCH (n)-[r:CodeRelation]-() WHERE r.type = "CALLS" '
+        f'AND n.filePath = {json.dumps(path, ensure_ascii=False)} AND labels(n)[0] <> "File" '
+        f"RETURN n.filePath AS file, n.name AS name, count(*) AS edges ORDER BY edges DESC, name LIMIT {count}"
+        for path, count in slots.items()
+    )
+    started = time.monotonic()
+    output = ""
+    try:
+        output = run_command(
+            [binary, "cypher", "-r", str(gitnexus_status["repo"]), query],
+            allow_fail=True,
+            suppress_core_dump=True,
+            capture_output_to_file=True,
+            timeout=CALL_TIMEOUT_SECONDS,
+        ).stdout
+        payload = json.loads(output)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError):
+        payload = None
+    gitnexus_status["ranking"] = {
+        "calls": 1,
+        "elapsed_ms": round((time.monotonic() - started) * 1000),
+        "output_bytes": len(output.encode("utf-8")),
+    }
+    table = payload.get("markdown") if isinstance(payload, dict) else None
+    rows = [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in (table.splitlines()[2:] if isinstance(table, str) else [])
+    ]
+    ranked: dict[str, list[str]] = {}
+    for path, name, _edges in sorted(
+        (row for row in rows if len(row) == 3 and row[2].isdigit()),
+        key=lambda row: (-int(row[2]), row[1]),
+    ):
+        ranked.setdefault(path, []).append(name)
+    return ranked
+
+
 def execute(
     plan: list[dict[str, object]],
     gitnexus_status: dict[str, object],
@@ -416,14 +472,17 @@ def execute(
                 "diagnostic": "required intent check was omitted from the GitNexus plan",
             }
         )
+    ranking = gitnexus_status.pop("ranking", None)
+    ranking = ranking if isinstance(ranking, dict) else {"calls": 0, "elapsed_ms": 0, "output_bytes": 0}
+    started -= ranking["elapsed_ms"] / 1000
     analysis: dict[str, object] = {
         "status": "blocked",
         "entries": [],
         "unresolved_checks": unresolved_required_checks,
-        "elapsed_ms": 0,
-        "process_count": 0,
-        "graph_call_count": 0,
-        "output_bytes": 0,
+        "elapsed_ms": ranking["elapsed_ms"],
+        "process_count": ranking["calls"],
+        "graph_call_count": ranking["calls"],
+        "output_bytes": ranking["output_bytes"],
         "estimated_output_tokens": 0,
         "omitted_check_count": omitted_check_count,
     }
@@ -606,7 +665,13 @@ def execute(
         )
         if kind == "symbol_context":
             resolved_symbols[(file_path, member)] = resolved_identity
-            entry["callers"] = _references(payload.get("incoming"))
+            for key, direction in (("callers", "incoming"), ("callees", "outgoing")):
+                relations = payload.get(direction)
+                entry[key] = _references(relations)
+                if isinstance(relations, dict) and CONTEXT_ROW_LIMIT <= sum(
+                    len(items) for items in relations.values() if isinstance(items, list)
+                ):
+                    entry[f"{key}_limited"] = True
         elif kind == "file_context":
             entry["references"] = _references(payload.get("incoming"))
         else:
@@ -614,6 +679,9 @@ def execute(
             entry["impacted_files"] = list(
                 dict.fromkeys(reference["file"] for reference in impacted if reference["file"])
             )[:MAX_FACTS]
+            count = payload.get("impactedCount")
+            entry["impacted_count"] = count if isinstance(count, int) else len(impacted)
+            entry["risk"] = str(payload.get("risk") or "unknown")
 
     analysis["elapsed_ms"] = round((time.monotonic() - started) * 1000)
     analysis["estimated_output_tokens"] = (int(analysis["output_bytes"]) + 3) // 4
