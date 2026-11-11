@@ -35,6 +35,8 @@ DEFAULT_CACHE_DIR = Path.home() / ".cache" / "repo-context-forge"
 CACHE_CHECKOUT_DIRS = ("analysis-worktrees", "analysis-checkouts", "worktrees")
 CACHE_CHECKOUT_TTL_SECONDS = 24 * 60 * 60
 TOOL_CACHE_DIRS = (".soulforge", ".codex", ".gitnexus", workflow_index.INDEX_DIR)
+# Written beside a SoulForge map: the head and candidate tree it was built from.
+MAP_RECEIPT = "repo-context-forge-map"
 TOOL_CACHE_PATHS = (*TOOL_CACHE_DIRS, ".claude/skills/gitnexus")
 TOOL_CACHE_PREFIXES = tuple(f"{name}/" for name in TOOL_CACHE_PATHS)
 # One tool result delivers about 10k tokens (measured on Codex); the intake header
@@ -43,8 +45,8 @@ MIN_TOKEN_BUDGET = 8_000
 MAX_TOKEN_BUDGET = 32_000
 DEFAULT_TOKEN_BUDGET = MIN_TOKEN_BUDGET
 MAX_GITNEXUS_CHECKS = 20
-# A ranking query costs about as much as 1.6 checks (0.46 s against 0.29 s measured) and checks
-# come in context+impact pairs: two pairs keep a ranked plan cheaper than the unranked one.
+# A ranked plan gives up two context+impact pairs. The ranking query cost that much while every
+# check was its own process; the reserve stays so a ranked packet keeps the size it had.
 RANKING_CHECKS = 4
 INTENT_GRAPH_EXCLUDED_NAMES = {"Cargo.lock", "go.sum"}
 TaskEvent = Literal["read", "search", "edit", "mention"]
@@ -726,10 +728,6 @@ def reset_cached_worktree(worktree: Path, cache_dir: Path, *, allow_fail: bool =
     run_git(worktree, ["reset", "--hard", "HEAD"], allow_fail=allow_fail)
     exclusions = [item for path in TOOL_CACHE_DIRS for item in ("-e", f"{path}/")]
     run_git(worktree, ["clean", "-fd", *exclusions], allow_fail=allow_fail)
-    soulforge_cache = worktree / ".soulforge"
-    if os.path.lexists(soulforge_cache):
-        require_cache_path(soulforge_cache, cache_dir)
-        remove_path(soulforge_cache)
 
 
 def overlay_source_worktree(source_repo: Path, analysis_repo: Path) -> None:
@@ -2176,8 +2174,8 @@ def resolved_required_anchor(analysis: dict[str, object], plan: list[dict[str, o
 
 def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> list[str]:
     """One row per resolved symbol: its identity, then callers, callees and upstream impact, each
-    list as GitNexus returned it, grouped by file, and marked where GitNexus cut it at its row
-    limit. File checks and unresolved checks keep the <check> form."""
+    list grouped by file and marked where a row limit may have cut it. File checks and
+    unresolved checks keep the <check> form."""
     analysis = gitnexus.get("analysis")
     if not isinstance(analysis, dict):
         return []
@@ -2219,7 +2217,7 @@ def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> 
         if resolved and entry.get("kind") == "symbol_context":
             lines.append(f"{indent}  {html.escape(str(entry.get('resolved_identity')))}")
             lines.extend(
-                f"{indent}    {key}{' (GitNexus row limit reached; may be incomplete)' if entry.get(f'{key}_limited') else ''}: "
+                f"{indent}    {key}{' (row limit reached; may be incomplete)' if entry.get(f'{key}_limited') else ''}: "
                 f"{by_file(entry.get(key))}"
                 for key in ("callers", "callees")
             )
@@ -2614,6 +2612,19 @@ def make_packet(
     if target_state.cache_key is None:
         raise RuntimeError("packet analysis checkout must be cache-owned")
     require_cache_path(target_state.analysis_repo, cache_dir)
+    # A SoulForge map is rebuilt unless it was built from this head and tree: the build is the
+    # largest step of a bootstrap, and for an unchanged tree it reproduces the map it replaces.
+    soulforge_cache = target_state.analysis_repo / ".soulforge"
+    map_receipt = soulforge_cache / MAP_RECEIPT
+    map_key = f"{target_state.head_sha}:{expected_candidate_tree}".encode()
+    if os.path.lexists(soulforge_cache) and not (
+        map_build == "auto"
+        and not soulforge_cache.is_symlink()
+        and map_receipt.is_file()
+        and map_receipt.read_bytes() == map_key
+    ):
+        require_cache_path(soulforge_cache, cache_dir)
+        remove_path(soulforge_cache)
     gitignore_dirty_before_build = ".gitignore" in dirty_paths(target_state.analysis_repo)
     build_result = build_soulforge_map(
         target_state.analysis_repo,
@@ -2621,6 +2632,8 @@ def make_packet(
         map_build,
         map_timeout_ms,
     )
+    if build_result.attempted and not build_result.warning:
+        map_receipt.write_bytes(map_key)
     can_cleanup_analysis = target_state.analysis_repo.resolve() != target_state.source_repo.resolve()
     if can_cleanup_analysis and (mode == "pr" or not gitignore_dirty_before_build):
         cleanup_soulforge_gitignore_change(target_state.analysis_repo)
@@ -2707,25 +2720,23 @@ def make_packet(
         )
     ]
     unavailable_targets = [entry for entry in target_entries if entry not in graph_targets]
-    plan, omitted_check_count, omitted_required_checks = build_gitnexus_plan(
-        graph_targets, gitnexus_repo_name, intent_mode=mode == "intent",
-        rank=functools.partial(gitnexus_analysis.rank_symbols, gitnexus_status, run_command=run_cmd))
     unavailable_plan, unavailable_omitted, unavailable_required = build_gitnexus_plan(
         unavailable_targets, gitnexus_repo_name, intent_mode=mode == "intent")
-    omitted_check_count += unavailable_omitted
-    for item in unavailable_plan:
-        if item.get("required") is True:
-            omitted_required_checks.append(item)
-        else:
-            omitted_check_count += 1
-    omitted_required_checks.extend(unavailable_required)
-    gitnexus_status = gitnexus_analysis.execute(
-        plan,
-        gitnexus_status,
-        run_command=run_cmd,
-        omitted_check_count=omitted_check_count,
-        omitted_required_checks=omitted_required_checks,
-    )
+    unavailable_checks = [item for item in unavailable_plan if item.get("required") is True]
+    # One graph process ranks the plan's candidates and answers every planned check.
+    with gitnexus_analysis.GraphSession(gitnexus_repo_name) as graph:
+        plan, omitted_check_count, omitted_required_checks = build_gitnexus_plan(
+            graph_targets, gitnexus_repo_name, intent_mode=mode == "intent",
+            rank=functools.partial(gitnexus_analysis.rank_symbols, graph)
+            if index_freshness_status in {"fresh", "reindexed"} else None)
+        gitnexus_status = gitnexus_analysis.execute(
+            plan,
+            gitnexus_status,
+            graph=graph,
+            omitted_check_count=omitted_check_count + unavailable_omitted
+            + len(unavailable_plan) - len(unavailable_checks),
+            omitted_required_checks=[*omitted_required_checks, *unavailable_checks, *unavailable_required],
+        )
     coverage_gaps = [
         {
             "kind": gap.kind,

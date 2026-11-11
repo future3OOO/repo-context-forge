@@ -263,12 +263,7 @@ class RepoContextForgeTests(unittest.TestCase):
         status: dict[str, object],
         **kwargs,
     ) -> dict[str, object]:
-        return repo_context_forge.gitnexus_analysis.execute(
-            plan,
-            status,
-            run_command=repo_context_forge.run_cmd,
-            **kwargs,
-        )
+        return repo_context_forge.gitnexus_analysis.execute(plan, status, **kwargs)
 
     def run_public_bootstrap(
         self, repo: Path, cache_dir: str, runtime_home: str, *,
@@ -1325,12 +1320,15 @@ class RepoContextForgeTests(unittest.TestCase):
                 for child in children:
                     try:
                         command = Path(f"/proc/{child}/cmdline").read_bytes().replace(b"\0", b" ")
-                        if b"gitnexus" not in command or not (
-                            b" context " in command or b" impact " in command):
+                        if b"gitnexus" not in command or b" mcp " not in command:
                             continue
                         os.kill(int(child), signal.SIGSTOP)
-                        if "State:\tT" in Path(f"/proc/{child}/status").read_text():
-                            return int(child)
+                        for _attempt in range(50):  # the stop lands when the child is next scheduled;
+                            # a traced child (strace -f) reports it as a tracing stop, "t"
+                            state = Path(f"/proc/{child}/status").read_text().split("State:\t", 1)[1][:1]
+                            if state in ("T", "t"):
+                                return int(child)
+                            time.sleep(0.001)
                         os.kill(int(child), signal.SIGCONT)
                     except OSError:
                         continue

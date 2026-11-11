@@ -70,8 +70,10 @@ silently switch to sibling worktrees.
 - prompt packets default to an 8k token budget, sized so one tool result
   delivers the packet whole, and compact optional symbol detail before dropping
   required status, target identity, or GitNexus checks.
-- packets execute their bounded GitNexus context/impact plan serially and include
-  normalized, identity-bound semantic answers plus timing and output metrics.
+- packets answer their bounded GitNexus context/impact plan from one GitNexus
+  process and include normalized, identity-bound semantic answers plus timing
+  and output metrics; a SoulForge map is rebuilt only when the head or candidate
+  tree it was built from has changed.
 - packets include workflow-index and architecture summaries, optional SoulForge
   target-head proof, and packet-authoritative GitNexus exact-head status.
 - `gitnexus-merge` merges real GitNexus findings and blocks stale blast-radius
