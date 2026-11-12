@@ -3213,7 +3213,7 @@ def render_required_intake(packet: dict[str, object]) -> str:
                 ("impact", {"uid": "<resolved_identity of a row>", "direction": "upstream", "includeTests": True}, ""),
                 ("cypher",
                  {"query": "MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b {id: '<resolved_identity of a row>'}) RETURN a.id"},
-                 " callers; swap a and b in the pattern for callees"),
+                 " callers; reverse the arrow for callees"),
                 ("detect_changes", {"worktree": packet.get("repo")}, " after edits"),
             )
         )

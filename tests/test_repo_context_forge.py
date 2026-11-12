@@ -4211,7 +4211,7 @@ class RepoContextForgeTests(unittest.TestCase):
             "- mcp__gitnexus__impact "
             '{"repo":"analysis-repo","uid":"<resolved_identity of a row>","direction":"upstream","includeTests":true}\n'
             """- mcp__gitnexus__cypher {"repo":"analysis-repo","query":"MATCH (a)-[:CodeRelation {type: 'CALLS'}]->"""
-            """(b {id: '<resolved_identity of a row>'}) RETURN a.id"} callers; swap a and b in the pattern for callees\n"""
+            """(b {id: '<resolved_identity of a row>'}) RETURN a.id"} callers; reverse the arrow for callees\n"""
             '- mcp__gitnexus__detect_changes {"repo":"analysis-repo","worktree":"/work/service"} after edits\n',
             rendered,
         )
