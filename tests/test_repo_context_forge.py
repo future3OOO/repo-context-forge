@@ -4164,6 +4164,7 @@ class RepoContextForgeTests(unittest.TestCase):
         packet = {
             "schema_version": 1,
             "mode": "pr",
+            "repo": "/work/service",
             "token_budget": 16000,
             "target_state": {"head_sha": "abc123"},
             "semantic_summaries": {"mode": "full_cached", "source_counts": {"llm": 1}},
@@ -4206,6 +4207,16 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertIn("indexed_head_sha=abc123", rendered)
         self.assertNotIn("gitnexus_tool_discovery", rendered)
         self.assertNotIn("tool_search", rendered)
+        self.assertIn(
+            '- callers and callees: mcp__gitnexus__context {"repo":"analysis-repo","name":"<symbol>","file_path":"<file>"}\n'
+            "- upstream impact with tests: mcp__gitnexus__impact "
+            '{"repo":"analysis-repo","uid":"<uid>","direction":"upstream","includeTests":true}\n'
+            "- one relation of a uid: mcp__gitnexus__cypher "
+            """{"repo":"analysis-repo","query":"MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b {id: '<uid>'}) RETURN a.id"}\n"""
+            "- after local edits, before commit, or as supplemental graph evidence after the packet surface is fixed: "
+            'mcp__gitnexus__detect_changes {"repo":"analysis-repo","worktree":"/work/service"}\n',
+            rendered,
+        )
         self.assertIn("architecture_summary:", rendered)
         self.assertIn("- roles | production=1,test=1", rendered)
         self.assertIn(

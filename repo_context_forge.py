@@ -56,7 +56,7 @@ CRITICAL_AREA_STEPS = (
     "Map changed behavior and contracts to verification and no-change surfaces; include production, config, API, persistence, integration, and operator surfaces when present.",
     "State any skipped changed or high-ranked target with the reason it is not relevant.",
     "Cover required surface-impact areas in the parent session unless the current user turn explicitly asks for delegated agents.",
-    "Only after critical-area coverage, run packet-scoped GitNexus checks and use review comments as supplemental evidence.",
+    "Use review comments as supplemental evidence only after critical-area coverage.",
 )
 
 
@@ -3199,6 +3199,24 @@ def render_required_intake(packet: dict[str, object]) -> str:
             f"unresolved={len(unresolved_items)}; "
             f"elapsed_ms={analysis.get('elapsed_ms') or 0}"
         )
+    if gitnexus.get("status") in ("fresh", "reindexed"):
+        # GitNexus's own tool and argument names, as a lead calls them, for what the analysis left open.
+        lines.append(
+            "gitnexus_calls: after coverage_plan, only for what gitnexus_analysis leaves open. Call exactly as printed: "
+            "these tools need no listing or search. <uid> is an identity it prints or context's symbol.uid"
+        )
+        lines.extend(
+            f"- {label}: mcp__gitnexus__{tool} "
+            + json.dumps({"repo": gitnexus.get("repo"), **arguments}, separators=(",", ":"))
+            for label, tool, arguments in (
+                ("callers and callees", "context", {"name": "<symbol>", "file_path": "<file>"}),
+                ("upstream impact with tests", "impact", {"uid": "<uid>", "direction": "upstream", "includeTests": True}),
+                ("one relation of a uid", "cypher",
+                 {"query": "MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b {id: '<uid>'}) RETURN a.id"}),
+                ("after local edits, before commit, or as supplemental graph evidence after the packet surface is fixed",
+                 "detect_changes", {"worktree": packet.get("repo")}),
+            )
+        )
     packet_gaps = packet.get("coverage_gaps")
     if isinstance(packet_gaps, list) and packet_gaps:
         lines.append("coverage_gaps: " + coverage_gap_text(
@@ -3265,7 +3283,6 @@ def render_required_intake(packet: dict[str, object]) -> str:
             "- Consume gitnexus_analysis first; gitnexus_required_checks records the already-executed packet plan.",
             "- Use packet targets plus live base...HEAD, dirty worktree, or intent surface according to packet mode.",
             "- Do not let unscoped gitnexus_detect_changes(compare) choose the target surface.",
-            "- Use gitnexus_detect_changes after local edits, before commit, or as supplemental graph evidence after the packet surface is fixed.",
             "END_REPO_CONTEXT_FORGE_REQUIRED_INTAKE",
             "",
         ]
