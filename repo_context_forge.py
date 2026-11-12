@@ -3200,21 +3200,21 @@ def render_required_intake(packet: dict[str, object]) -> str:
             f"elapsed_ms={analysis.get('elapsed_ms') or 0}"
         )
     if gitnexus.get("status") in ("fresh", "reindexed"):
-        # GitNexus's own tool and argument names, as a lead calls them, for what the analysis left open.
+        # GitNexus's own tool and argument names, as a lead calls them; identities come from the analysis rows.
         lines.append(
-            "gitnexus_calls: after coverage_plan, only for what gitnexus_analysis leaves open. Call exactly as printed: "
-            "these tools need no listing or search. <uid> is an identity it prints or context's symbol.uid"
+            "gitnexus_calls: use these exact forms for follow-up checks, with no tool lookup; fill <...>; "
+            "each result is JSON text at content[0].text"
         )
         lines.extend(
-            f"- {label}: mcp__gitnexus__{tool} "
+            f"- mcp__gitnexus__{tool} "
             + json.dumps({"repo": gitnexus.get("repo"), **arguments}, separators=(",", ":"))
-            for label, tool, arguments in (
-                ("callers and callees", "context", {"name": "<symbol>", "file_path": "<file>"}),
-                ("upstream impact with tests", "impact", {"uid": "<uid>", "direction": "upstream", "includeTests": True}),
-                ("one relation of a uid", "cypher",
-                 {"query": "MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b {id: '<uid>'}) RETURN a.id"}),
-                ("after local edits, before commit, or as supplemental graph evidence after the packet surface is fixed",
-                 "detect_changes", {"worktree": packet.get("repo")}),
+            + note
+            for tool, arguments, note in (
+                ("impact", {"uid": "<resolved_identity of a row>", "direction": "upstream", "includeTests": True}, ""),
+                ("cypher",
+                 {"query": "MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b {id: '<resolved_identity of a row>'}) RETURN a.id"},
+                 " callers; swap a and b in the pattern for callees"),
+                ("detect_changes", {"worktree": packet.get("repo")}, " after edits"),
             )
         )
     packet_gaps = packet.get("coverage_gaps")

@@ -4208,13 +4208,11 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertNotIn("gitnexus_tool_discovery", rendered)
         self.assertNotIn("tool_search", rendered)
         self.assertIn(
-            '- callers and callees: mcp__gitnexus__context {"repo":"analysis-repo","name":"<symbol>","file_path":"<file>"}\n'
-            "- upstream impact with tests: mcp__gitnexus__impact "
-            '{"repo":"analysis-repo","uid":"<uid>","direction":"upstream","includeTests":true}\n'
-            "- one relation of a uid: mcp__gitnexus__cypher "
-            """{"repo":"analysis-repo","query":"MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b {id: '<uid>'}) RETURN a.id"}\n"""
-            "- after local edits, before commit, or as supplemental graph evidence after the packet surface is fixed: "
-            'mcp__gitnexus__detect_changes {"repo":"analysis-repo","worktree":"/work/service"}\n',
+            "- mcp__gitnexus__impact "
+            '{"repo":"analysis-repo","uid":"<resolved_identity of a row>","direction":"upstream","includeTests":true}\n'
+            """- mcp__gitnexus__cypher {"repo":"analysis-repo","query":"MATCH (a)-[:CodeRelation {type: 'CALLS'}]->"""
+            """(b {id: '<resolved_identity of a row>'}) RETURN a.id"} callers; swap a and b in the pattern for callees\n"""
+            '- mcp__gitnexus__detect_changes {"repo":"analysis-repo","worktree":"/work/service"} after edits\n',
             rendered,
         )
         self.assertIn("architecture_summary:", rendered)
