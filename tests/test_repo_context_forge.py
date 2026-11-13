@@ -3413,6 +3413,8 @@ class RepoContextForgeTests(unittest.TestCase):
 
             self.assertFalse((repo / repo_context_forge.workflow_index.INDEX_DIR).exists())
 
+    @unittest.skipUnless(repo_context_forge.find_soulforge_binary(None),
+                         "Integration test requires SoulForge on PATH or in ~/.local/bin")
     def test_make_packet_runs_soulforge_build_outside_source_repo(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
             repo = Path(repo_dir)
