@@ -3418,38 +3418,24 @@ class RepoContextForgeTests(unittest.TestCase):
             repo = Path(repo_dir)
             self.make_git_repo(repo)
             (repo / "src" / "a.py").write_text("print('dirty')\n", encoding="utf-8")
-            original_builder = repo_context_forge.build_soulforge_map
+            packet = repo_context_forge.make_packet(
+                repo,
+                mode="local",
+                base_ref="HEAD",
+                head_ref="HEAD",
+                intent=None,
+                top=5,
+                token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET,
+                cache_dir=Path(cache_dir),
+                soulforge_bin=repo_context_forge.find_soulforge_binary(None),
+                map_build="always",
+                map_timeout_ms=1_000,
+                allow_missing_map=False,
+                gitnexus_repo=None,
+            )
 
-            def fake_builder(
-                analysis_repo: Path,
-                _soulforge_bin: str | None,
-                _build_mode: repo_context_forge.MapBuildMode,
-                _timeout_ms: int,
-            ) -> repo_context_forge.MapBuildResult:
-                with (analysis_repo / ".gitignore").open("a", encoding="utf-8") as gitignore:
-                    gitignore.write(".soulforge\n")
-                return repo_context_forge.MapBuildResult(True, [], 0, "", "", None)
-
-            repo_context_forge.build_soulforge_map = fake_builder
-            try:
-                packet = repo_context_forge.make_packet(
-                    repo,
-                    mode="local",
-                    base_ref="HEAD",
-                    head_ref="HEAD",
-                    intent=None,
-                    top=5,
-                    token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET,
-                    cache_dir=Path(cache_dir),
-                    soulforge_bin=None,
-                    map_build="always",
-                    map_timeout_ms=1,
-                    allow_missing_map=True,
-                    gitnexus_repo=None,
-                )
-            finally:
-                repo_context_forge.build_soulforge_map = original_builder
-
+            self.assertTrue(packet["soulforge"]["build"]["attempted"])
+            self.assertIsNone(packet["soulforge"]["build"]["warning"])
             self.assertEqual((repo / ".gitignore").read_text(encoding="utf-8"), "*.log\n")
             self.assertNotEqual(packet["target_state"]["analysis_repo"], str(repo))
 
