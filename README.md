@@ -73,7 +73,7 @@ silently switch to sibling worktrees.
 - packets answer their bounded GitNexus context/impact plan from one GitNexus
   process and include normalized, identity-bound semantic answers plus timing
   and output metrics; a SoulForge map is rebuilt only when the head or candidate
-  tree it was built from has changed.
+  tree it was built from has changed, unless `--map-build always` is used.
 - packets include workflow-index and architecture summaries, optional SoulForge
   target-head proof, and packet-authoritative GitNexus exact-head status.
 - `gitnexus-merge` merges real GitNexus findings and blocks stale blast-radius
