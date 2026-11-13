@@ -186,6 +186,24 @@ def _accept_fresh(status: dict[str, object]) -> bool:
     return True
 
 
+def receipted_commit(
+    repo_name: str,
+    candidate_tree: str,
+    *,
+    run_command: RunCommand,
+    registry_path: Path = GITNEXUS_REGISTRY,
+) -> str | None:
+    """The indexed commit of `repo_name` while its current index is the one a packet run receipted
+    for `candidate_tree`; None once anything has re-indexed it."""
+    for entry in _read_registry(registry_path):
+        if entry.get("name") == repo_name:
+            commit = str(entry.get("lastCommit") or "")
+            status = _status_from_entry(
+                entry, Path(str(entry.get("path") or "")), commit, candidate_tree, repo_name, run_command)
+            return commit if status["index_fresh"] else None
+    return None
+
+
 def ensure_index(
     analysis_repo: Path,
     expected_head: str,

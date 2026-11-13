@@ -197,6 +197,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--candidate-slot", action="store_true",
         help="index into this pass's candidate slot, leaving the checkout an "
              "earlier intake built resolvable under its own selector")
+    parser.add_argument(
+        "--pass-start-index", nargs=2, metavar=("REPO", "TREE"),
+        help="the pass's first GitNexus repo and the tree it indexed: the change check names it while "
+             "that index is unchanged; implies --candidate-slot")
     parser.add_argument("--enforce-intake", action="store_true")
     parser.add_argument("--allow-stale-pr-head", action="store_true")
     parser.add_argument("--out", type=Path)
@@ -280,8 +284,15 @@ def main(argv: list[str]) -> int:
         allow_missing_map=not args.require_map,
         gitnexus_repo=args.gitnexus_repo,
         gitnexus_mode=args.gitnexus_mode,
-        candidate_slot=args.candidate_slot,
+        candidate_slot=args.candidate_slot or bool(args.pass_start_index),
     )
+    if args.pass_start_index:
+        # The change check compares with the pass's first index while it is still the one receipted
+        # for the first tree and HEAD descends from its commit; otherwise the form names this run's.
+        repo_name, tree = args.pass_start_index
+        commit = forge.gitnexus_analysis.receipted_commit(repo_name, tree, run_command=forge.run_cmd)
+        if commit and is_ancestor(root, commit, "HEAD"):
+            packet["gitnexus"]["baseline_repo"] = repo_name
     return output_packet(packet, args)
 
 

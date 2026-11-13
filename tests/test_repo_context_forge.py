@@ -269,6 +269,7 @@ class RepoContextForgeTests(unittest.TestCase):
         self, repo: Path, cache_dir: str, runtime_home: str, *,
         mode: str, intent: str | None = None, base: str | None = None,
         top: int = 1, gitnexus_mode: str = "auto", candidate_slot: bool = False,
+        pass_start_index: tuple[str, str] | None = None,
     ):
         packet_path = Path(runtime_home) / "packet.json"
         packet_path.unlink(missing_ok=True)
@@ -281,6 +282,8 @@ class RepoContextForgeTests(unittest.TestCase):
         ]
         if candidate_slot:
             command.append("--candidate-slot")
+        if pass_start_index:
+            command.extend(("--pass-start-index", *pass_start_index))
         if intent is not None:
             command.extend(("--intent", intent))
         if base is not None:
@@ -1172,6 +1175,22 @@ class RepoContextForgeTests(unittest.TestCase):
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             result, _packet = self.candidate_lock_run(False, repo, cache_dir, runtime_home)
             self.assertEqual(result.returncode, 0, marker + result.stderr[-400:])
+
+    def test_a_later_packet_compares_with_the_pass_start_index(self) -> None:
+        """A later run bound to the pass's first index prints that index in its change check while the
+        index is still the one receipted for the first tree, and its own index otherwise."""
+        marker = "LATER_CHANGE_CHECK_LOST_THE_PASS_START"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            _result, first = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
+            start = (first["gitnexus"]["repo"], first["gitnexus"]["indexed_candidate_tree"])
+            (repo / "src" / "a.py").write_text("print('edited')\n", encoding="utf-8")
+            for tree, named in ((start[1], start[0]), ("0" * 40, None)):
+                result, later = self.run_public_bootstrap(
+                    repo, cache_dir, runtime_home, mode="local", pass_start_index=(start[0], tree))
+                self.assertEqual(result.returncode, 0, marker + result.stderr[-400:])
+                self.assertEqual(later["gitnexus"].get("baseline_repo"), named, marker)
+                self.assertIn('detect_changes {"repo":"%s"' % (named or later["gitnexus"]["repo"]),
+                              result.stdout, marker)
 
     def test_one_candidate_slot_serves_every_mode_a_pass_reruns_in(self) -> None:
         """A pass reruns in a different mode as its tree goes clean to dirty. The
@@ -3394,43 +3413,31 @@ class RepoContextForgeTests(unittest.TestCase):
 
             self.assertFalse((repo / repo_context_forge.workflow_index.INDEX_DIR).exists())
 
+    @unittest.skipUnless(repo_context_forge.find_soulforge_binary(None),
+                         "Integration test requires SoulForge on PATH or in ~/.local/bin")
     def test_make_packet_runs_soulforge_build_outside_source_repo(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
             repo = Path(repo_dir)
             self.make_git_repo(repo)
             (repo / "src" / "a.py").write_text("print('dirty')\n", encoding="utf-8")
-            original_builder = repo_context_forge.build_soulforge_map
+            packet = repo_context_forge.make_packet(
+                repo,
+                mode="local",
+                base_ref="HEAD",
+                head_ref="HEAD",
+                intent=None,
+                top=5,
+                token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET,
+                cache_dir=Path(cache_dir),
+                soulforge_bin=repo_context_forge.find_soulforge_binary(None),
+                map_build="always",
+                map_timeout_ms=1_000,
+                allow_missing_map=False,
+                gitnexus_repo=None,
+            )
 
-            def fake_builder(
-                analysis_repo: Path,
-                _soulforge_bin: str | None,
-                _build_mode: repo_context_forge.MapBuildMode,
-                _timeout_ms: int,
-            ) -> repo_context_forge.MapBuildResult:
-                with (analysis_repo / ".gitignore").open("a", encoding="utf-8") as gitignore:
-                    gitignore.write(".soulforge\n")
-                return repo_context_forge.MapBuildResult(True, [], 0, "", "", None)
-
-            repo_context_forge.build_soulforge_map = fake_builder
-            try:
-                packet = repo_context_forge.make_packet(
-                    repo,
-                    mode="local",
-                    base_ref="HEAD",
-                    head_ref="HEAD",
-                    intent=None,
-                    top=5,
-                    token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET,
-                    cache_dir=Path(cache_dir),
-                    soulforge_bin=None,
-                    map_build="always",
-                    map_timeout_ms=1,
-                    allow_missing_map=True,
-                    gitnexus_repo=None,
-                )
-            finally:
-                repo_context_forge.build_soulforge_map = original_builder
-
+            self.assertTrue(packet["soulforge"]["build"]["attempted"])
+            self.assertIsNone(packet["soulforge"]["build"]["warning"])
             self.assertEqual((repo / ".gitignore").read_text(encoding="utf-8"), "*.log\n")
             self.assertNotEqual(packet["target_state"]["analysis_repo"], str(repo))
 
@@ -4208,12 +4215,20 @@ class RepoContextForgeTests(unittest.TestCase):
         self.assertNotIn("gitnexus_tool_discovery", rendered)
         self.assertNotIn("tool_search", rendered)
         self.assertIn(
+            "gitnexus_calls: before editing a symbol, impact on it even when a row shows it; after edits, "
+            "detect_changes; use these exact forms, with no tool lookup; fill <...>; "
+            "each result is JSON text at content[0].text\n"
             "- mcp__gitnexus__impact "
             '{"repo":"analysis-repo","uid":"<resolved_identity of a row>","direction":"upstream","includeTests":true}\n'
             """- mcp__gitnexus__cypher {"repo":"analysis-repo","query":"MATCH (a)-[:CodeRelation {type: 'CALLS'}]->"""
             """(b {id: '<resolved_identity of a row>'}) RETURN a.id"} callers; reverse the arrow for callees\n"""
-            '- mcp__gitnexus__detect_changes {"repo":"analysis-repo","worktree":"/work/service"} after edits\n',
+            '- mcp__gitnexus__detect_changes {"repo":"analysis-repo","worktree":"/work/service"}\n',
             rendered,
+        )
+        packet["gitnexus"]["baseline_repo"] = "pass-start-repo"
+        self.assertIn(
+            '- mcp__gitnexus__detect_changes {"repo":"pass-start-repo","worktree":"/work/service"}\n',
+            repo_context_forge.render_required_intake(packet),
         )
         self.assertIn("architecture_summary:", rendered)
         self.assertIn("- roles | production=1,test=1", rendered)

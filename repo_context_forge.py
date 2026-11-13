@@ -2600,13 +2600,12 @@ def make_packet(
     target_state = resolve_target_state(
         repo, mode, base_ref, head_ref, cache_dir, candidate_slot)
     sweep_cache_checkouts(cache_dir)
-    candidate_repo = (
-        target_state.source_repo
-        if mode in {"local", "intent"}
-        else target_state.analysis_repo
-    )
-    expected_candidate_tree = candidate_tree(candidate_repo)
     analysis_candidate_tree = candidate_tree(target_state.analysis_repo)
+    expected_candidate_tree = (
+        candidate_tree(target_state.source_repo)
+        if mode in {"local", "intent"}
+        else analysis_candidate_tree
+    )
     if analysis_candidate_tree != expected_candidate_tree:
         raise RuntimeError("analysis checkout does not match the source candidate tree")
     if target_state.cache_key is None:
@@ -3202,7 +3201,8 @@ def render_required_intake(packet: dict[str, object]) -> str:
     if gitnexus.get("status") in ("fresh", "reindexed"):
         # GitNexus's own tool and argument names, as a lead calls them; identities come from the analysis rows.
         lines.append(
-            "gitnexus_calls: use these exact forms for follow-up checks, with no tool lookup; fill <...>; "
+            "gitnexus_calls: before editing a symbol, impact on it even when a row shows it; after edits, "
+            "detect_changes; use these exact forms, with no tool lookup; fill <...>; "
             "each result is JSON text at content[0].text"
         )
         lines.extend(
@@ -3214,7 +3214,8 @@ def render_required_intake(packet: dict[str, object]) -> str:
                 ("cypher",
                  {"query": "MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b {id: '<resolved_identity of a row>'}) RETURN a.id"},
                  " callers; reverse the arrow for callees"),
-                ("detect_changes", {"worktree": packet.get("repo")}, " after edits"),
+                ("detect_changes", {"repo": gitnexus.get("baseline_repo") or gitnexus.get("repo"),
+                                    "worktree": packet.get("repo")}, ""),
             )
         )
     packet_gaps = packet.get("coverage_gaps")
