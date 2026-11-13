@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import fcntl
+import functools
 import json
+import os
+import select
 import shutil
 import subprocess
+import tempfile
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Callable, Iterator, TextIO
+from typing import Callable, Iterator, Optional, TextIO
 
 
 GITNEXUS_REGISTRY = Path.home() / ".gitnexus" / "registry.json"
@@ -16,8 +20,17 @@ CALL_TIMEOUT_SECONDS = 30
 TOTAL_TIMEOUT_SECONDS = 120
 MAX_OUTPUT_BYTES = 256_000
 MAX_FACTS = 50
+# Containment, not dependency: an owning class is not a caller and a member is not a callee.
+MEMBERSHIP_RELATIONS = {"has_method", "has_property"}
+# `gitnexus context` returns at most this many rows per direction, an arbitrary subset beyond it;
+# a list at the limit is completed from one query over the dependency relations context reads.
+CONTEXT_ROW_LIMIT = 30
+DEPENDENCY_RELATIONS = [
+    "CALLS", "IMPORTS", "EXTENDS", "IMPLEMENTS", "METHOD_OVERRIDES", "OVERRIDES", "METHOD_IMPLEMENTS", "ACCESSES",
+]
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
+Reply = tuple[Optional[dict[str, object]], str]  # a tool call: its JSON answer, or None and the reason
 ACTIVE_TRANSACTION: ContextVar[tuple[str, TextIO] | None] = ContextVar("active_analysis_transaction", default=None)
 
 
@@ -171,6 +184,24 @@ def _accept_fresh(status: dict[str, object]) -> bool:
         return False
     status.update(status="fresh", reindex_attempted=False)
     return True
+
+
+def receipted_commit(
+    repo_name: str,
+    candidate_tree: str,
+    *,
+    run_command: RunCommand,
+    registry_path: Path = GITNEXUS_REGISTRY,
+) -> str | None:
+    """The indexed commit of `repo_name` while its current index is the one a packet run receipted
+    for `candidate_tree`; None once anything has re-indexed it."""
+    for entry in _read_registry(registry_path):
+        if entry.get("name") == repo_name:
+            commit = str(entry.get("lastCommit") or "")
+            status = _status_from_entry(
+                entry, Path(str(entry.get("path") or "")), commit, candidate_tree, repo_name, run_command)
+            return commit if status["index_fresh"] else None
+    return None
 
 
 def ensure_index(
@@ -348,8 +379,8 @@ def _references(value: object) -> list[dict[str, str]]:
         return []
     references: list[dict[str, str]] = []
     seen: set[str] = set()
-    for items in value.values():
-        if not isinstance(items, list):
+    for relation, items in value.items():
+        if relation in MEMBERSHIP_RELATIONS or not isinstance(items, list):
             continue
         for item in items:
             if not isinstance(item, dict):
@@ -393,15 +424,256 @@ def result_is_resolved(value: object) -> bool:
     )
 
 
+class GraphSession:
+    """One `gitnexus mcp` process answering every graph call for one repository.
+
+    Each tool takes the arguments the GitNexus CLI passes for the same command, so an answer
+    is what the CLI prints for that symbol alone. The process starts at the first call. It
+    runs with a private HOME holding only this repository's registry entries: the server
+    writes a reply over its 16 KB bound to a results directory under HOME and prunes that
+    directory, which must not be the user's. Such a reply is read whole from its file."""
+
+    def __init__(self, repo: str, gitnexus_bin: str | None = None) -> None:
+        self.repo = repo
+        self.binary = gitnexus_bin or shutil.which("gitnexus")
+        self.calls = self.processes = self.output_bytes = 0
+        self.started: float | None = None
+        self._process: subprocess.Popen[bytes] | None = None
+        self._home: tempfile.TemporaryDirectory[str] | None = None
+        self._stderr: TextIO | None = None
+        self._pending = b""
+        self._ident = 0
+
+    def __enter__(self) -> GraphSession:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> str:
+        """Stop the process and remove its HOME; what the process wrote to stderr."""
+        process, self._process = self._process, None
+        diagnostic = ""
+        if process and process.stdin and process.stdout and self._stderr:
+            process.stdin.close()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+            self._stderr.seek(self._stderr_start)  # what it wrote once answering, not its start-up banner
+            diagnostic = self._stderr.read().strip()
+            self._stderr.close()
+        if self._home:
+            self._home.cleanup()
+            self._home = None
+        return diagnostic
+
+    def _send(self, method: str, params: dict[str, object]) -> int:
+        process = self._process
+        assert process and process.stdin
+        self._ident += 1
+        message = {"jsonrpc": "2.0", "id": self._ident, "method": method, "params": params}
+        process.stdin.write(json.dumps(message).encode("utf-8") + b"\n")
+        return self._ident
+
+    def _collect(self, wanted: set[int], deadline: float) -> dict[int, dict[str, object]]:
+        """The JSON-RPC replies to `wanted` that arrive before the deadline or the process's end."""
+        process = self._process
+        assert process and process.stdout
+        replies: dict[int, dict[str, object]] = {}
+        try:
+            while wanted - replies.keys():
+                line, newline, rest = self._pending.partition(b"\n")
+                if newline:
+                    self._pending = rest
+                    reply = json.loads(line)
+                    if isinstance(reply, dict) and reply.get("id") in wanted:
+                        replies[reply["id"]] = reply
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                    break
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                self._pending += chunk
+        except (OSError, json.JSONDecodeError):
+            pass
+        return replies
+
+    def _start(self, deadline: float) -> bool:
+        self._home = tempfile.TemporaryDirectory(prefix="rcf-gitnexus-")
+        registry = Path(self._home.name) / ".gitnexus" / "registry.json"
+        registry.parent.mkdir()
+        registry.write_text(json.dumps([
+            entry for entry in _read_registry(Path.home() / ".gitnexus" / "registry.json")
+            if entry.get("name") == self.repo
+        ]), encoding="utf-8")
+        self._stderr = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        self._stderr_start = 0
+        self._pending = b""
+        self._process = subprocess.Popen(
+            # the core-dump guard run_cmd applies to every GitNexus process
+            ["/bin/sh", "-c", 'printf 0 > /proc/self/coredump_filter && exec "$@"', "sh", str(self.binary), "mcp"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr,
+            env={**os.environ, "HOME": self._home.name},
+            bufsize=0,
+        )
+        self.processes += 1
+        self.started = self.started or time.monotonic()
+        client = {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "repo-context-forge", "version": "1"}}
+        try:
+            if not self._collect({self._send("initialize", client)}, deadline):
+                return False
+            self._stderr_start = os.fstat(self._stderr.fileno()).st_size
+            assert self._process.stdin
+            self._process.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+        except OSError:
+            return False
+        return True
+
+    def _answer(self, reply: dict[str, object]) -> Reply:
+        malformed = "GitNexus returned malformed output"
+        result = reply.get("result")
+        content = result.get("content") if isinstance(result, dict) else None
+        text = content[0].get("text") if isinstance(content, list) and content and isinstance(content[0], dict) else None
+        if not isinstance(result, dict) or not isinstance(text, str) or not self._home:
+            return None, malformed
+        if result.get("isError"):
+            return {"error": text.removeprefix("Error: ")}, ""
+        try:
+            payload = json.loads(text)
+            spilled = payload.get("complete_result") if isinstance(payload, dict) else None
+            if spilled is not None:
+                complete = Path(str(spilled)).resolve()
+                if Path(self._home.name).resolve() not in complete.parents:
+                    return None, malformed
+                text = complete.read_text(encoding="utf-8")
+                payload = json.loads(text)
+        except (OSError, json.JSONDecodeError):
+            return None, malformed
+        size = len(text.encode("utf-8"))
+        self.output_bytes += size
+        if size > MAX_OUTPUT_BYTES:
+            return None, "GitNexus check output exceeded the byte limit"
+        if payload == []:  # a cypher query with no rows answers with an empty list
+            payload = {}
+        return (payload, "") if isinstance(payload, dict) else (None, malformed)
+
+    def call_many(self, requests: list[tuple[str, dict[str, object]]], timeout: float) -> list[Reply]:
+        """Send every tool call at once; per request its JSON answer, or None and the reason.
+
+        A structured error is an answer. The server works on the calls together, so a batch
+        costs about its slowest call. A call left unanswered ends the process; the next
+        call starts another."""
+        self.calls += len(requests)
+        deadline = time.monotonic() + timeout
+        sent: list[int] = []
+        replies: dict[int, dict[str, object]] = {}
+        if requests and (self._process or self._start(deadline)):
+            try:
+                for tool, arguments in requests:
+                    sent.append(self._send("tools/call", {"name": tool, "arguments": {**arguments, "repo": self.repo}}))
+            except OSError:
+                pass
+            replies = self._collect(set(sent), deadline)
+        answers = {ident: self._answer(reply) for ident, reply in replies.items()}
+        reason = ""
+        if len(replies) < len(requests):
+            timed_out = time.monotonic() >= deadline
+            stderr = self.close()
+            reason = "GitNexus check timed out" if timed_out else stderr or "GitNexus returned malformed output"
+        sent += [0] * (len(requests) - len(sent))
+        return [answers.get(ident, (None, reason)) for ident in sent]
+
+    def call(self, tool: str, arguments: dict[str, object], timeout: float) -> Reply:
+        return self.call_many([(tool, arguments)], timeout)[0]
+
+
+def _table_rows(payload: dict[str, object] | None) -> list[list[str]] | None:
+    """Rows of a cypher reply's markdown table; None when the query did not answer."""
+    if payload is None or payload.get("error"):
+        return None
+    table = payload.get("markdown")
+    return [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in (table.splitlines()[2:] if isinstance(table, str) else [])
+    ]
+
+
+def rank_symbols(graph: GraphSession, slots: dict[str, int]) -> dict[str, list[str]] | None:
+    """Per file, the names of its `slots` symbols with the most CALLS edges, most first.
+
+    One bounded query whose reply grows with the slots, not the symbols. None when the
+    query did not answer: there is then no ranking to plan from."""
+    query = " UNION ALL ".join(
+        'MATCH (n)-[r:CodeRelation]-() WHERE r.type = "CALLS" '
+        f'AND n.filePath = {json.dumps(path, ensure_ascii=False)} AND labels(n)[0] <> "File" '
+        f"RETURN n.filePath AS file, n.name AS name, count(*) AS edges ORDER BY edges DESC, name LIMIT {count}"
+        for path, count in slots.items()
+    )
+    rows = _table_rows(graph.call("cypher", {"query": query}, CALL_TIMEOUT_SECONDS)[0])
+    if rows is None:
+        return None
+    ranked: dict[str, list[str]] = {}
+    for path, name, _edges in sorted(
+        (row for row in rows if len(row) == 3 and row[2].isdigit()),
+        key=lambda row: (-int(row[2]), row[1]),
+    ):
+        ranked.setdefault(path, []).append(name)
+    return ranked
+
+
+def _relations_query(identity: str, outgoing: bool) -> str:
+    """Every dependency relation of `identity` in one direction, unlimited."""
+    pattern = "(n)-[r:CodeRelation]->(other)" if outgoing else "(other)-[r:CodeRelation]->(n)"
+    return (
+        f"MATCH {pattern} WHERE n.id = {json.dumps(identity, ensure_ascii=False)} "
+        f"AND r.type IN {json.dumps(DEPENDENCY_RELATIONS)} "
+        "RETURN DISTINCT other.id AS id, other.name AS name, other.filePath AS file"
+    )
+
+
+def _all_references(
+    identity: str, outgoing: bool, returned: list[dict[str, str]], payload: dict[str, object] | None,
+) -> tuple[list[dict[str, str]], bool]:
+    """A list GitNexus cut at its row limit, completed from `_relations_query`'s answer: every
+    such relation joined with what GitNexus returned, in a fixed order, and whether the list
+    may still be incomplete. A class's incoming list may be: GitNexus adds callers of its
+    constructor and importers of its file, known here only as far as it returned them."""
+    rows = _table_rows(payload)
+    if rows is None:
+        return returned, True
+    found = {reference["identity"]: reference for reference in returned}
+    found.update({row[0]: {"identity": row[0], "name": row[1], "file": row[2]} for row in rows if len(row) == 3})
+    ordered = sorted(found.values(), key=lambda reference: (reference["file"], reference["identity"]))
+    class_like = not outgoing and identity.split(":", 1)[0] in {"Class", "Interface"}
+    return ordered, class_like
+
+
 def execute(
     plan: list[dict[str, object]],
     gitnexus_status: dict[str, object],
     *,
-    run_command: RunCommand,
+    graph: GraphSession | None = None,
     omitted_check_count: int = 0,
     omitted_required_checks: list[dict[str, object]] | None = None,
     gitnexus_bin: str | None = None,
 ) -> dict[str, object]:
+    """Answer every planned check from `graph`, or from a session of its own when none is given."""
+    if graph is None:
+        with GraphSession(str(gitnexus_status.get("repo") or ""), gitnexus_bin) as session:
+            return execute(
+                plan,
+                gitnexus_status,
+                graph=session,
+                omitted_check_count=omitted_check_count,
+                omitted_required_checks=omitted_required_checks,
+            )
     started = time.monotonic()
     unresolved_required_checks: list[dict[str, object]] = []
     for item in omitted_required_checks or []:
@@ -421,9 +693,9 @@ def execute(
         "entries": [],
         "unresolved_checks": unresolved_required_checks,
         "elapsed_ms": 0,
-        "process_count": 0,
-        "graph_call_count": 0,
-        "output_bytes": 0,
+        "process_count": graph.processes,
+        "graph_call_count": graph.calls,
+        "output_bytes": graph.output_bytes,
         "estimated_output_tokens": 0,
         "omitted_check_count": omitted_check_count,
     }
@@ -431,12 +703,10 @@ def execute(
     if gitnexus_status.get("status") not in {"fresh", "reindexed"}:
         gitnexus_status["required_checks_resolved"] = False
         return gitnexus_status
-    binary = gitnexus_bin or shutil.which("gitnexus")
-    if not binary:
+    if not graph.binary:
         gitnexus_status.update(status="unavailable", required_checks_resolved=False)
         return gitnexus_status
 
-    repo_name = str(gitnexus_status["repo"])
     analysis_repo = Path(str(gitnexus_status.get("expected_repo_path") or ""))
     seen: set[tuple[str, ...]] = set()
     resolved_symbols: dict[tuple[str, str], str] = {}
@@ -458,38 +728,8 @@ def execute(
         entry.update(status="unindexed", diagnostic="GitNexus does not index this file")
         return True
 
-    def graph_reply(entry: dict[str, object], command: list[str]) -> dict[str, object] | None:
-        """One bounded GitNexus call: its JSON reply, or None with the diagnostic recorded.
-
-        A structured error reply is returned as-is so the caller can classify it."""
-        try:
-            proc = run_command(
-                command,
-                allow_fail=True,
-                suppress_core_dump=True,
-                capture_output_to_file=True,
-                timeout=max(0.0, min(CALL_TIMEOUT_SECONDS, TOTAL_TIMEOUT_SECONDS - (time.monotonic() - started))),
-            )
-        except subprocess.TimeoutExpired:
-            entry["diagnostic"] = "GitNexus check timed out"
-            return None
-        analysis["process_count"] = int(analysis["process_count"]) + 1
-        analysis["graph_call_count"] = int(analysis["graph_call_count"]) + 1
-        output_bytes = len(proc.stdout.encode("utf-8")) + len(proc.stderr.encode("utf-8"))
-        analysis["output_bytes"] = int(analysis["output_bytes"]) + output_bytes
-        if output_bytes > MAX_OUTPUT_BYTES:
-            entry["diagnostic"] = "GitNexus check output exceeded the byte limit"
-            return None
-        try:
-            payload = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            payload = None
-        if proc.returncode != 0 or not isinstance(payload, dict) or payload.get("error"):
-            structured = isinstance(payload, dict) and bool(payload.get("error"))
-            diagnostic = str(payload.get("error")) if structured else proc.stderr.strip() or "GitNexus returned malformed output"
-            entry["diagnostic"] = diagnostic[:1000]
-            return payload if structured else None
-        return payload
+    def remaining() -> float:
+        return max(0.0, min(CALL_TIMEOUT_SECONDS, TOTAL_TIMEOUT_SECONDS - (time.monotonic() - started)))
 
     def single_eligible_candidate(payload: dict[str, object], file_path: str, target: str) -> str | None:
         # GitNexus answers "ambiguous" when a name is shared inside one file (a module
@@ -509,6 +749,94 @@ def execute(
             eligible = [uid for uid in eligible if uid.rsplit(":", 1)[-1] == target]
         return eligible[0] if len(eligible) == 1 else None
 
+    limited: list[tuple[dict[str, object], str, str, bool]] = []
+
+    def settle(
+        entry: dict[str, object], kind: str, file_path: str, target: str, direction: str, member: str, reply: Reply,
+    ) -> None:
+        """Check one reply against its planned check and record the entry's facts."""
+
+        def refused(answer: Reply) -> bool:
+            # A structured error reply is kept so an unindexed file can be told from a failure.
+            payload, diagnostic = answer
+            if payload is not None and not payload.get("error"):
+                return False
+            entry["diagnostic"] = (diagnostic if payload is None else str(payload["error"]))[:1000]
+            unindexed_file(entry, payload.get("error") if payload else None)
+            return True
+
+        if refused(reply):
+            return
+        payload = reply[0]
+        assert payload is not None
+        if kind == "symbol_context" and payload.get("status") == "ambiguous":
+            uid = single_eligible_candidate(payload, file_path, member)
+            if uid is None:
+                entry["diagnostic"] = "GitNexus result is ambiguous and no single candidate matches the planned file"
+                return
+            reply = graph.call("context", {"uid": uid, "include_content": False}, remaining())
+            if refused(reply):
+                return
+            payload = reply[0]
+            assert payload is not None
+
+        entity = payload.get("symbol") if kind.endswith("context") else payload.get("target")
+        if not isinstance(entity, dict):
+            entry["diagnostic"] = "GitNexus result has no resolved entity"
+            return
+        resolved_identity = str(entity.get("uid") or entity.get("id") or "")
+        resolved_file = str(entity.get("filePath") or "")
+        resolved_name = str(entity.get("name") or "")
+        expected_file = target if kind == "file_context" else file_path
+        if (
+            not resolved_identity
+            or resolved_file != expected_file
+            or (kind == "file_context" and resolved_identity != f"File:{target}")
+            or (kind != "file_context" and resolved_name != target)
+        ):
+            entry["diagnostic"] = "GitNexus result identity does not match the planned check"
+            return
+        if kind == "symbol_impact":
+            if resolved_identity != resolved_symbols.get((file_path, member)):
+                entry["diagnostic"] = "GitNexus impact identity does not match file-resolved context"
+                return
+            if str(payload.get("direction") or "") != (direction or "upstream"):
+                entry["diagnostic"] = "GitNexus impact direction does not match the planned check"
+                return
+
+        entry.update(
+            status="resolved",
+            resolved_identity=resolved_identity,
+            entity={"name": resolved_name, "file": resolved_file},
+        )
+        if kind == "symbol_context":
+            resolved_symbols[(file_path, member)] = resolved_identity
+            for key, side in (("callers", "incoming"), ("callees", "outgoing")):
+                relations = payload.get(side)
+                entry[key] = _references(relations)
+                if isinstance(relations, dict) and CONTEXT_ROW_LIMIT <= sum(
+                    len(items) for items in relations.values() if isinstance(items, list)
+                ):
+                    limited.append((entry, key, resolved_identity, side == "outgoing"))
+        elif kind == "file_context":
+            entry["references"] = _references(payload.get("incoming"))
+        else:
+            impacted = _references(payload.get("byDepth"))
+            entry["impacted_files"] = list(
+                dict.fromkeys(reference["file"] for reference in impacted if reference["file"])
+            )[:MAX_FACTS]
+            count = payload.get("impactedCount")
+            entry["impacted_count"] = count if isinstance(count, int) else len(impacted)
+            entry["risk"] = str(payload.get("risk") or "unknown")
+
+    def complete(entry: dict[str, object], key: str, identity: str, outgoing: bool, reply: Reply) -> None:
+        returned = entry[key]
+        assert isinstance(returned, list)
+        entry[key], still_limited = _all_references(identity, outgoing, returned, reply[0])
+        if still_limited:
+            entry[f"{key}_limited"] = True
+
+    checks: list[tuple[dict[str, object], str, str, str, str, str]] = []
     for item in plan:
         key = _check_key(item)
         kind, file_path, target, direction = key
@@ -524,98 +852,53 @@ def execute(
             "status": "unresolved",
         }
         entries.append(entry)
-        elapsed = time.monotonic() - started
-        if elapsed >= TOTAL_TIMEOUT_SECONDS:
-            entry["diagnostic"] = "GitNexus total timeout exceeded"
-            unresolved.append(dict(entry))
-            continue
-        if kind == "file_context":
-            command = [binary, "context", "-r", repo_name, "-u", f"File:{target}"]
-        elif kind == "symbol_context":
-            command = [binary, "context", "-r", repo_name, "-f", file_path, target]
-        elif kind == "symbol_impact":
-            expected_identity = resolved_symbols.get((file_path, member))
-            if not expected_identity:
+        checks.append((entry, kind, file_path, target, direction, member))
+
+    # Two batches, each sent at once: every context, then every impact, which needs its
+    # context's identity, together with the queries completing lists cut at the row limit.
+    for impacts in (False, True):
+        requests: list[tuple[Callable[[Reply], None], str, dict[str, object]]] = []
+        for check in checks:
+            entry, kind, file_path, target, direction, member = check
+            if (kind == "symbol_impact") is not impacts:
+                continue
+            identity = resolved_symbols.get((file_path, member))
+            if time.monotonic() - started >= TOTAL_TIMEOUT_SECONDS:
+                entry["diagnostic"] = "GitNexus total timeout exceeded"
+            elif kind == "file_context":
+                requests.append((functools.partial(settle, *check), "context", {"uid": f"File:{target}", "include_content": False}))
+            elif kind == "symbol_context":
+                requests.append((
+                    functools.partial(settle, *check),
+                    "context",
+                    {"name": target, "file_path": file_path, "include_content": False},
+                ))
+            elif kind != "symbol_impact":
+                entry["diagnostic"] = f"unsupported GitNexus check kind: {kind}"
+            elif not identity:
                 entry["diagnostic"] = "GitNexus impact has no file-resolved context identity"
-                unresolved.append(dict(entry))
-                continue
-            command = [
-                binary,
-                "impact",
-                "--uid",
-                expected_identity,
-                "-d",
-                direction or "upstream",
-                "-r",
-                repo_name,
-                "--include-tests",
+            else:
+                requests.append((
+                    functools.partial(settle, *check),
+                    "impact",
+                    {"uid": identity, "direction": direction or "upstream", "includeTests": True},
+                ))
+        if impacts:
+            requests += [
+                (functools.partial(complete, *cut), "cypher", {"query": _relations_query(cut[2], cut[3])})
+                for cut in limited
             ]
-        else:
-            entry["diagnostic"] = f"unsupported GitNexus check kind: {kind}"
-            unresolved.append(dict(entry))
-            continue
-        payload = graph_reply(entry, command)
-        if payload is None or payload.get("error"):
-            if not unindexed_file(entry, payload.get("error") if payload else None):
-                unresolved.append(dict(entry))
-            continue
-        if kind == "symbol_context" and payload.get("status") == "ambiguous":
-            uid = single_eligible_candidate(payload, file_path, member)
-            if uid is None:
-                entry["diagnostic"] = "GitNexus result is ambiguous and no single candidate matches the planned file"
-                unresolved.append(dict(entry))
-                continue
-            payload = graph_reply(entry, [binary, "context", "-r", repo_name, "-u", uid])
-            if payload is None or payload.get("error"):
-                unresolved.append(dict(entry))
-                continue
+        replies = graph.call_many([(tool, arguments) for _finish, tool, arguments in requests], remaining())
+        for (finish, _tool, _arguments), reply in zip(requests, replies):
+            finish(reply)
+    unresolved.extend(dict(entry) for entry in entries if entry["status"] == "unresolved")
 
-        entity = payload.get("symbol") if kind.endswith("context") else payload.get("target")
-        if not isinstance(entity, dict):
-            entry["diagnostic"] = "GitNexus result has no resolved entity"
-            unresolved.append(dict(entry))
-            continue
-        resolved_identity = str(entity.get("uid") or entity.get("id") or "")
-        resolved_file = str(entity.get("filePath") or "")
-        resolved_name = str(entity.get("name") or "")
-        expected_file = target if kind == "file_context" else file_path
-        if (
-            not resolved_identity
-            or resolved_file != expected_file
-            or (kind == "file_context" and resolved_identity != f"File:{target}")
-            or (kind != "file_context" and resolved_name != target)
-        ):
-            entry["diagnostic"] = "GitNexus result identity does not match the planned check"
-            unresolved.append(dict(entry))
-            continue
-        if kind == "symbol_impact":
-            expected_identity = resolved_symbols.get((file_path, member))
-            if not expected_identity or resolved_identity != expected_identity:
-                entry["diagnostic"] = "GitNexus impact identity does not match file-resolved context"
-                unresolved.append(dict(entry))
-                continue
-            if str(payload.get("direction") or "") != (direction or "upstream"):
-                entry["diagnostic"] = "GitNexus impact direction does not match the planned check"
-                unresolved.append(dict(entry))
-                continue
-
-        entry.update(
-            status="resolved",
-            resolved_identity=resolved_identity,
-            entity={"name": resolved_name, "file": resolved_file},
-        )
-        if kind == "symbol_context":
-            resolved_symbols[(file_path, member)] = resolved_identity
-            entry["callers"] = _references(payload.get("incoming"))
-        elif kind == "file_context":
-            entry["references"] = _references(payload.get("incoming"))
-        else:
-            impacted = _references(payload.get("byDepth"))
-            entry["impacted_files"] = list(
-                dict.fromkeys(reference["file"] for reference in impacted if reference["file"])
-            )[:MAX_FACTS]
-
-    analysis["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+    analysis.update(
+        elapsed_ms=round((time.monotonic() - (graph.started or started)) * 1000),
+        process_count=graph.processes,
+        graph_call_count=graph.calls,
+        output_bytes=graph.output_bytes,
+    )
     analysis["estimated_output_tokens"] = (int(analysis["output_bytes"]) + 3) // 4
     analysis["status"] = "resolved" if not unresolved else "blocked"
     gitnexus_status["required_checks_resolved"] = result_is_resolved(analysis)
