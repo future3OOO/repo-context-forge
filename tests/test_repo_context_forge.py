@@ -1199,6 +1199,28 @@ raise SystemExit(output_packet(packet, args))
             _result, edited = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent="Update helper in src/a.py")
             self.assertGreater(edited["gitnexus"]["analysis"]["graph_call_count"], 0, marker)
 
+    def test_packet_impact_form_takes_a_uid_that_names_one_symbol(self) -> None:
+        # BM_IMPACT_UID_FORM: the printed impact form takes a row's identity; filled in, it reaches
+        # that symbol even where a name lookup has several to choose from.
+        marker = "IMPACT_FORM_NOT_UID"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            for name in ("a", "b"):
+                (repo / "src" / f"{name}.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "src"], cwd=repo)
+            repo_context_forge.run_cmd(["git", "commit", "-qm", "two mains"], cwd=repo)
+            result, packet = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent="Update main")
+            form = next((line for line in result.stdout.splitlines() if line.startswith("- mcp__gitnexus__impact ")), "")
+            arguments = json.loads(form.removeprefix("- mcp__gitnexus__impact ") or "{}")
+            self.assertEqual(arguments, {"repo": packet["gitnexus"]["repo"], "uid": "<Function|Method|Class>:<file>:<qualified name>",
+                                         "direction": "<upstream|downstream>", "includeTests": True}, marker + " " + form)
+            uid = "Function:src/b.py:main"
+            with patch.dict(os.environ, {"HOME": runtime_home}), \
+                    repo_context_forge.gitnexus_analysis.GraphSession(arguments.pop("repo")) as graph:
+                answer, reason = graph.call("impact", {**arguments, "uid": uid, "direction": "upstream"}, 20)
+            # GitNexus's failure reply also echoes the uid, so the whole resolved target is asserted.
+            self.assertEqual((reason, (answer or {}).get("error"), (answer or {}).get("target")),
+                             ("", None, {"id": uid, "name": "main", "type": "Function", "filePath": "src/b.py"}), marker)
+
     def test_pass_start_index_selects_the_candidate_slot(self) -> None:
         """--pass-start-index implies --candidate-slot: a later run of the pass analyzes its own checkout
         and index, leaving the first run's as they were, and the packet names no change-check form."""
@@ -4113,7 +4135,8 @@ raise SystemExit(output_packet(packet, args))
             "gitnexus_calls: use these exact forms, with no tool lookup; fill <...>; "
             "each result is JSON text at content[0].text\n"
             "- mcp__gitnexus__impact "
-            '{"repo":"analysis-repo","target":"<symbol name>","direction":"<upstream|downstream>","includeTests":true}\n'
+            '{"repo":"analysis-repo","uid":"<Function|Method|Class>:<file>:<qualified name>",'
+            '"direction":"<upstream|downstream>","includeTests":true}\n'
             """- mcp__gitnexus__cypher {"repo":"analysis-repo","query":"MATCH (a)-[:CodeRelation {type: 'CALLS'}]->"""
             """(b {id: '<resolved_identity of a row>'}) RETURN a.id"} callers; reverse the arrow for callees\n""",
             rendered,
