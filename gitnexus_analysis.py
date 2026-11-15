@@ -727,7 +727,8 @@ def _changed_function_entries(
     graph: GraphSession, ranges_by_file: dict[str, list[tuple[int, int]]], timeout: float,
 ) -> tuple[list[dict[str, object]], int] | None:
     """Two queries whatever the edit's size: GitNexus's symbols of the changed files (codex-skills
-    _quality_gate/snapshot.py's query), then the callers of the changed functions outside tests. One entry per
+    _quality_gate/snapshot.py's query, its file filter as UNWIND: GitNexus 1.5.3 garbles node strings under
+    `n.filePath IN [...]`), then the callers of the changed functions outside tests. One entry per
     changed function, outside tests naming its production callers outside the change and counting its test
     callers; and how many changed outside tests. None when either query did not answer. Their replies are
     parsed, never printed, so they take no byte limit: a 73-file edit's symbols reply is over 300 KB."""
@@ -735,7 +736,7 @@ def _changed_function_entries(
         return [], 0
     kinds = ["File", "Function", "Method", "Class", "Interface", "Struct", "Enum", "Property"]
     nodes = _collected(graph.call("cypher", {"query": (
-        "MATCH (n) WHERE n.filePath IN " + _cypher_strings(list(ranges_by_file)) + " AND ("
+        "UNWIND " + _cypher_strings(list(ranges_by_file)) + " AS f MATCH (n) WHERE n.filePath = f AND ("
         + " OR ".join("n.id STARTS WITH '" + kind + ":'" for kind in kinds) + ") "
         "OPTIONAL MATCH (n)-[r:CodeRelation]->(m) WHERE r.type = 'CALLS' "
         "WITH n, collect(m.id) AS calls RETURN collect({id:n.id, name:n.name, file:n.filePath, "
