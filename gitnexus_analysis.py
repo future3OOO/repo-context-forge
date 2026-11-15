@@ -727,10 +727,10 @@ def _changed_function_entries(
     graph: GraphSession, ranges_by_file: dict[str, list[tuple[int, int]]], timeout: float,
 ) -> tuple[list[dict[str, object]], int] | None:
     """Two queries whatever the edit's size: GitNexus's symbols of the changed files (codex-skills
-    _quality_gate/snapshot.py's query), then the callers of the changed functions among them. One entry per
-    changed function with a production caller outside the change, naming those callers and counting its test
-    callers; and how many functions changed. None when either query did not answer. Their replies are parsed,
-    never printed, so they take no byte limit: a 73-file edit's symbols reply is over 300 KB."""
+    _quality_gate/snapshot.py's query), then the callers of the changed functions outside tests. One entry per
+    changed function, outside tests naming its production callers outside the change and counting its test
+    callers; and how many changed outside tests. None when either query did not answer. Their replies are
+    parsed, never printed, so they take no byte limit: a 73-file edit's symbols reply is over 300 KB."""
     if not ranges_by_file:
         return [], 0
     kinds = ["File", "Function", "Method", "Class", "Interface", "Struct", "Enum", "Property"]
@@ -745,13 +745,13 @@ def _changed_function_entries(
     by_file: dict[str, list[dict[str, object]]] = {}
     for node in nodes:
         by_file.setdefault(str(node.get("file")), []).append(node)
-    changed = {str(node["id"]): str(node["file"]) for path, ranges in ranges_by_file.items()
+    changed = {str(node["id"]): node for path, ranges in ranges_by_file.items()
                for node in changed_functions(by_file.get(path, []), ranges)}
-    if not changed:
-        return [], 0
+    asked = [identity for identity, node in changed.items() if not workflow_index.is_test_path(str(node["file"]))]
     callers = _collected(graph.call("cypher", {"query": (
-        "MATCH (a)-[r:CodeRelation]->(b) WHERE r.type = 'CALLS' AND b.id IN " + _cypher_strings(list(changed))
-        + " RETURN collect(DISTINCT {to:b.id, id:a.id, name:a.name, file:a.filePath}) AS callers")}, timeout, None))
+        "MATCH (a)-[r:CodeRelation]->(b) WHERE r.type = 'CALLS' AND b.id IN " + _cypher_strings(asked)
+        + " RETURN collect(DISTINCT {to:b.id, id:a.id, name:a.name, file:a.filePath}) AS callers")}, timeout, None)
+    ) if asked else []
     if callers is None:
         return None
     production: dict[str, set[tuple[str, str]]] = {}
@@ -762,15 +762,17 @@ def _changed_function_entries(
             tests.setdefault(target, set()).add(identity)
         elif identity not in changed:
             shown = path if identity.startswith("File:") else (
-                str(caller.get("name")) if path == changed[target] else f"{path}:{caller.get('name')}")
+                str(caller.get("name")) if path == changed[target]["file"] else f"{path}:{caller.get('name')}")
             production.setdefault(target, set()).add((path, shown))
     entries = [
-        {"kind": "changed_function", "file": path, "target": identity.rsplit(":", 1)[-1], "status": "resolved",
-         "resolved_identity": identity, "callers": [shown for _path, shown in sorted(production[identity])],
+        {"kind": "changed_function", "file": str(node["file"]), "target": identity.rsplit(":", 1)[-1],
+         "status": "resolved", "resolved_identity": identity, "name": str(node.get("name")),
+         "line": node["startLine"] + 1, "end_line": node["endLine"] + 1,
+         "callers": [shown for _path, shown in sorted(production.get(identity, ()))],
          "test_caller_count": len(tests.get(identity, ()))}
-        for identity, path in changed.items() if identity in production
+        for identity, node in changed.items()
     ]
-    return entries, len(changed)
+    return entries, len(asked)
 
 
 def _all_references(

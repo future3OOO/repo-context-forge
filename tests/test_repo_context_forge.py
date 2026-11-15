@@ -1221,7 +1221,9 @@ raise SystemExit(output_packet(packet, args))
         # code after it, name no enclosing function); each changed function outside tests
         # with a production caller outside the change gets its line, callers named bare in its file and file:name
         # elsewhere, test callers counted; one called only by the change or by tests is left out; staged, unstaged and
-        # untracked edits count; two graph queries for 36 changed functions; the projection carries the same lines.
+        # untracked edits count; pytest *_test.py and Go *_test.go callers count as tests; two graph queries for 37
+        # changed functions; the projection carries the same lines; each target's changed symbols are GitNexus's
+        # changed functions in its file, the test file's included.
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             many = lambda v: "".join(f"def f{i}():\n    return {v}{' + f10()' if i == 9 else ''}\n\n\n" for i in range(11))
             nested = lambda v: (
@@ -1243,6 +1245,13 @@ raise SystemExit(output_packet(packet, args))
             tests = lambda v: ("from pkg.many import f0, f8\n\n\n"
                                f"def test_one():\n    assert f0() == {v}\n\n\ndef test_two():\n    assert f8()\n")
             (repo / "tests" / "test_pkg.py").write_text(tests(1), encoding="utf-8")
+            (repo / "pkg" / "handler_test.py").write_text(
+                "from pkg.many import f0\n\n\ndef test_handler():\n    assert f0()\n", encoding="utf-8")
+            calc = lambda v: f"package calc\n\nfunc Add(a int) int {{\n\treturn a + {v}\n}}\n\nfunc Use() int {{\n\treturn Add(1)\n}}\n"
+            (repo / "calc").mkdir()
+            (repo / "calc" / "calc.go").write_text(calc(1), encoding="utf-8")
+            (repo / "calc" / "calc_test.go").write_text(
+                "package calc\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tAdd(2)\n}\n", encoding="utf-8")
             repo_context_forge.run_cmd(["git", "add", "-A"], cwd=repo)
             repo_context_forge.run_cmd(["git", "commit", "-qm", "functions"], cwd=repo)
             (repo / "pkg" / "many.py").write_text(many(2), encoding="utf-8")
@@ -1254,18 +1263,30 @@ raise SystemExit(output_packet(packet, args))
             (repo / "pkg" / "fresh.py").write_text("def fresh():\n    return 1\n\n\ndef caller():\n    return fresh()\n",
                                                    encoding="utf-8")
             (repo / "tests" / "test_pkg.py").write_text(tests(2), encoding="utf-8")
+            (repo / "calc" / "calc.go").write_text(calc(2), encoding="utf-8")
             result, packet = self.run_public_bootstrap(repo, cache_dir, runtime_home, mode="local")
             analysis = packet["gitnexus"]["analysis"]
             expected = sorted([
-                *(f"Function:pkg/many.py:{name}: pkg/use.py:use{' (+1 test)' if name == 'f0' else ''}" for name in used),
+                *(f"Function:pkg/many.py:{name}: pkg/use.py:use{' (+2 tests)' if name == 'f0' else ''}" for name in used),
                 *(f"Function:pkg/m&amp;{index}.py:f0: g" for index in range(20)),
                 "Function:pkg/nested.py:inner: outer", "Function:pkg/nested.py:wrap: pkg/use.py:use",
+                "Function:calc/calc.go:Add: Use (+1 test)",
             ])
             lines = sorted(line.strip() for line in result.stdout.splitlines() if line.startswith("    Function:"))
             self.assertEqual(lines, expected, "CHANGED_FUNCTION_LINE_WRONG")
             self.assertEqual(sorted(packet["advisorProjection"]["graph"]["references"]), expected, "PROJECTION_NOT_LINES")
-            self.assertEqual((analysis["changed_function_count"], analysis["graph_call_count"]), (36, 2),
+            self.assertEqual((analysis["changed_function_count"], analysis["graph_call_count"]), (37, 2),
                              "GRAPH_WORK_NOT_TWO_QUERIES")
+            changed = {target["path"]: sorted(symbol["uid"] for symbol in target["changed_symbols"])
+                       for target in packet["targets"] if target["changed_symbols"]}
+            self.assertEqual(changed, {
+                "pkg/many.py": sorted(f"Function:pkg/many.py:f{i}" for i in range(11)),
+                "pkg/nested.py": ["Function:pkg/nested.py:body", "Function:pkg/nested.py:inner", "Function:pkg/nested.py:wrap"],
+                **{f"pkg/m&{index}.py": [f"Function:pkg/m&{index}.py:f0"] for index in range(20)},
+                "pkg/fresh.py": ["Function:pkg/fresh.py:caller", "Function:pkg/fresh.py:fresh"],
+                "calc/calc.go": ["Function:calc/calc.go:Add"],
+                "tests/test_pkg.py": ["Function:tests/test_pkg.py:test_one"],
+            }, "TARGET_CHANGED_SYMBOLS_NOT_GITNEXUS")
 
     def test_pass_start_index_selects_the_candidate_slot(self) -> None:
         """--pass-start-index implies --candidate-slot: a later run of the pass analyzes its own checkout
@@ -2881,24 +2902,6 @@ raise SystemExit(output_packet(packet, args))
 
         self.assertFalse(repo_context_forge.symbol_overlaps(symbol, [(1, 9)]))
         self.assertTrue(repo_context_forge.symbol_overlaps(symbol, [(15, 25)]))
-
-    def test_staged_and_untracked_edits_name_their_changed_functions(self) -> None:
-        # Staged-only and untracked files are edits too.
-        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
-            repo = Path(repo_dir)
-            self.make_git_repo(repo)
-            (repo / "src" / "a.py").write_text("def kept():\n    return 1\n\n\ndef staged():\n    return 2\n", encoding="utf-8")
-            repo_context_forge.run_cmd(["git", "add", "src/a.py"], cwd=repo)
-            repo_context_forge.run_cmd(["git", "commit", "-qm", "two"], cwd=repo)
-            (repo / "src" / "a.py").write_text("def kept():\n    return 1\n\n\ndef staged():\n    return 3\n", encoding="utf-8")
-            repo_context_forge.run_cmd(["git", "add", "src/a.py"], cwd=repo)
-            (repo / "src" / "new.py").write_text("def fresh():\n    return 4\n", encoding="utf-8")
-            packet = repo_context_forge.make_packet(
-                repo, mode="local", base_ref="HEAD", head_ref="HEAD", intent=None, top=5,
-                token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET, cache_dir=Path(cache_dir), soulforge_bin=None,
-                map_build="never", map_timeout_ms=1, allow_missing_map=True, gitnexus_repo=None, gitnexus_mode="off")
-            changed = {entry["path"]: [s["name"] for s in entry["changed_symbols"]] for entry in packet["targets"]}
-            self.assertEqual((changed.get("src/a.py"), changed.get("src/new.py")), (["staged"], ["fresh"]), f"EDIT_UNSEEN {changed}")
 
     def test_remove_nested_symbols_prefers_outer_function(self) -> None:
         outer = repo_context_forge.Symbol(

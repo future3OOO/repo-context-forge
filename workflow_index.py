@@ -56,6 +56,7 @@ def is_test_path(path: str) -> bool:
             (
                 ".test.js", ".test.jsx", ".test.mjs", ".test.ts", ".test.tsx",
                 ".spec.js", ".spec.jsx", ".spec.mjs", ".spec.ts", ".spec.tsx",
+                "_test.go", "_test.py",
             )
         )
     )

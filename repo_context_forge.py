@@ -2525,7 +2525,8 @@ def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> 
             lines.extend(rows[str(entry.get("resolved_identity"))])
             continue
         if resolved and entry.get("kind") == "changed_function":
-            lines.append(f"{indent}  {changed_function_line(entry)}")
+            if entry.get("callers"):
+                lines.append(f"{indent}  {changed_function_line(entry)}")
             continue
         attrs = " ".join(
             f'{name}="{html.escape(str(entry.get(name) or ""))}"'
@@ -2794,7 +2795,8 @@ def build_advisor_projection(packet: dict[str, object]) -> dict[str, object]:
     analysis = analysis if isinstance(analysis, dict) else {}
     entries = [entry for entry in analysis.get("entries") or [] if isinstance(entry, dict)]
     # The advisor reads an edit's changed-function lines as the packet prints them; a begin packet has none.
-    references = [changed_function_line(entry) for entry in entries if entry.get("kind") == "changed_function"]
+    references = [changed_function_line(entry) for entry in entries
+                  if entry.get("kind") == "changed_function" and entry.get("callers")]
     unresolved = analysis.get("unresolved_checks")
     unresolved = unresolved if isinstance(unresolved, list) else []
     required_omissions = [
@@ -3015,10 +3017,10 @@ def make_packet(
         )
     ]
     unavailable_targets = [entry for entry in target_entries if entry not in graph_targets]
-    # An edit asks the graph only who calls the functions it changed outside tests.
+    # An edit asks the graph which functions it changed and who calls those outside tests.
     changed_ranges = {
         str(entry["path"]): entry["changed_ranges"] for entry in graph_targets
-        if entry.get("surface_role") != "test" and entry.get("changed_ranges")
+        if entry.get("changed_ranges")
     } if is_edit(mode, source_git_state) else None
     unavailable_plan, unavailable_omitted, unavailable_required = build_gitnexus_plan(
         unavailable_targets, gitnexus_repo_name, intent_mode=mode == "intent") if changed_ranges is None else ([], 0, [])
@@ -3041,6 +3043,18 @@ def make_packet(
             omitted_required_checks=[*omitted_required_checks, *unavailable_checks, *unavailable_required],
             changed_ranges=changed_ranges,
         )
+    if changed_ranges is not None:
+        # A target's changed symbols are GitNexus's changed functions, the ones its caller lines come from;
+        # the touched index symbols make_target_entries ranked it by go.
+        changed_by_file: dict[str, list[dict[str, object]]] = {}
+        for item in (gitnexus_status.get("analysis") or {}).get("entries") or []:
+            if item.get("kind") == "changed_function":
+                changed_by_file.setdefault(str(item["file"]), []).append({
+                    "name": item["name"], "kind": str(item["resolved_identity"]).split(":", 1)[0].lower(),
+                    "line": item["line"], "end_line": item["end_line"], "signature": None,
+                    "uid": item["resolved_identity"]})
+        for entry in target_entries:
+            entry["changed_symbols"] = changed_by_file.get(str(entry["path"]), [])
     coverage_gaps = [
         {
             "kind": gap.kind,
