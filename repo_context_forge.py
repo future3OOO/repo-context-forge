@@ -3495,7 +3495,8 @@ def render_required_intake(packet: dict[str, object]) -> str:
             + json.dumps({"repo": gitnexus.get("repo"), **arguments}, separators=(",", ":"))
             + note
             for tool, arguments, note in (
-                ("impact", {"target": "<symbol name>", "direction": "<upstream|downstream>", "includeTests": True}, ""),
+                ("impact", {"uid": "<Function|Method|Class>:<file>:<qualified name>",
+                            "direction": "<upstream|downstream>", "includeTests": True}, ""),
                 ("cypher",
                  {"query": "MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b {id: '<resolved_identity of a row>'}) RETURN a.id"},
                  " callers; reverse the arrow for callees"),
