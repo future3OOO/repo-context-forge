@@ -49,6 +49,7 @@ MAX_GITNEXUS_CHECKS = 20
 # check was its own process; the reserve stays so a ranked packet keeps the size it had.
 RANKING_CHECKS = 4
 INTENT_GRAPH_EXCLUDED_NAMES = {"Cargo.lock", "go.sum"}
+CALLABLE_KINDS = ("function", "method")
 TaskEvent = Literal["read", "search", "edit", "mention"]
 CRITICAL_AREA_STEPS = (
     "State the task or PR contract from the user request, PR title/body when available, and packet targets.",
@@ -442,10 +443,13 @@ def selected_files(git_state: GitState, scope: Scope) -> list[str]:
 
 
 def is_edit(mode: Mode, git_state: GitState) -> bool:
-    """A local packet of a dirty tree or a pr packet of a branch with changes: one that edits files."""
-    if mode == "local":
-        return bool(git_state.staged_files or git_state.unstaged_files or git_state.untracked_files)
-    return mode == "pr" and bool(git_state.pr_files)
+    """A local packet of a dirty tree or a pr packet of a branch with changes: one that edits files
+    other than tool caches, which target selection ignores too."""
+    files = (
+        [*git_state.staged_files, *git_state.unstaged_files, *git_state.untracked_files] if mode == "local"
+        else git_state.pr_files if mode == "pr" else []
+    )
+    return any(not is_generated_or_cache_path(path) for path in files)
 
 
 def diff_ranges_for_file(
@@ -511,13 +515,13 @@ def changed_functions(symbols: list[Symbol], ranges: list[tuple[int, int]]) -> l
             open_symbols.pop()
         owner = next((outer.name + "." for outer in reversed(open_symbols) if outer.kind == "class"), "")
         qualified[id(symbol)] = owner + symbol.name
-        parent = next((outer for outer in reversed(open_symbols) if outer.kind == "function"), None)
-        if symbol.kind == "function" and parent is not None:
+        parent = next((outer for outer in reversed(open_symbols) if outer.kind in CALLABLE_KINDS), None)
+        if symbol.kind in CALLABLE_KINDS and parent is not None:
             nested.setdefault(id(parent), []).append(symbol)
         open_symbols.append(symbol)
     changed = []
     for symbol in ordered:
-        if symbol.kind != "function":
+        if symbol.kind not in CALLABLE_KINDS:
             continue
         start, own = symbol.line, False
         for inner in nested.get(id(symbol), []):
@@ -2521,16 +2525,16 @@ def gitnexus_symbol_rows(entries: list[dict[str, object]], indent: str) -> dict[
                 path = str(fact.get("file") or "")
                 name = str(fact.get("identity") or "").rsplit(":", 1)[-1]
                 names_by_file.setdefault(path, []).extend([] if name == path else [name])
-        return html.escape("; ".join(
+        return "; ".join(
             f"{path}: {', '.join(names)}" if names else path for path, names in names_by_file.items()
-        )) or "none"
+        ) or "none"
 
     rows: dict[str, list[str]] = {}
     for entry in entries:
         if entry.get("kind") != "symbol_context" or entry.get("status") != "resolved":
             continue
         identity = str(entry.get("resolved_identity"))
-        row = [f"{indent}{html.escape(identity)}"]
+        row = [f"{indent}{identity}"]
         row.extend(
             f"{indent}  {key}{' (row limit reached; may be incomplete)' if entry.get(f'{key}_limited') else ''}: "
             f"{by_file(entry.get(key))}"
@@ -2539,11 +2543,11 @@ def gitnexus_symbol_rows(entries: list[dict[str, object]], indent: str) -> dict[
         impact = impacts.get(identity)
         if impact:
             impacted = impact.get("impacted_files")
-            row.append(html.escape(
+            row.append(
                 f"{indent}  upstream impact {impact.get('risk')}, {impact.get('impacted_count')} symbols in: "
                 f"{', '.join(str(path) for path in impacted) if impacted else 'none'}"
-            ))
-        rows[identity] = row
+            )
+        rows[identity] = [html.escape(line) for line in row]
     return rows
 
 
