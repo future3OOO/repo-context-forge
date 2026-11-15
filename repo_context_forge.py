@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import fcntl
 import functools
 import hashlib
@@ -440,6 +441,13 @@ def selected_files(git_state: GitState, scope: Scope) -> list[str]:
     )
 
 
+def is_edit(mode: Mode, git_state: GitState) -> bool:
+    """A local packet of a dirty tree or a pr packet of a branch with changes: one that edits files."""
+    if mode == "local":
+        return bool(git_state.staged_files or git_state.unstaged_files or git_state.untracked_files)
+    return mode == "pr" and bool(git_state.pr_files)
+
+
 def diff_ranges_for_file(
     repo: Path,
     base_ref: str,
@@ -448,7 +456,8 @@ def diff_ranges_for_file(
     head_ref: str = "HEAD",
 ) -> list[tuple[int, int]]:
     if scope == "dirty":
-        diff_args = ["diff", "--unified=0", "--", path]
+        # Staged and unstaged edits alike: the working tree against HEAD.
+        diff_args = ["diff", "--unified=0", "HEAD", "--", path]
     else:
         diff_args = ["diff", "--unified=0", f"{base_ref}...{head_ref}", "--", path]
     diff = run_git(repo, diff_args, allow_fail=True)
@@ -472,6 +481,51 @@ def parse_unified_diff_new_ranges(diff: str) -> list[tuple[int, int]]:
 
 def symbol_overlaps(symbol: Symbol, ranges: list[tuple[int, int]]) -> bool:
     return any(symbol.line <= end and symbol.end_line >= start for start, end in ranges)
+
+
+def changed_functions(symbols: list[Symbol], ranges: list[tuple[int, int]]) -> list[tuple[Symbol, str]]:
+    """The innermost indexed function or method holding each changed line, named as GitNexus names it: by its
+    innermost enclosing class only (Job.run, Inner.deep; a function nested in a function is bare). A function
+    counts when a changed line lies in it outside its nested functions, so an outer function's own edit counts
+    beside its inner one's; class-level lines name none."""
+    if not ranges:
+        return []
+    merged: list[list[int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    ends = [end for _start, end in merged]
+
+    def touched(start: int, end: int) -> bool:
+        index = bisect.bisect_left(ends, start)
+        return start <= end and index < len(merged) and merged[index][0] <= end
+
+    ordered = sorted(symbols, key=lambda symbol: (symbol.line, -symbol.end_line))
+    open_symbols: list[Symbol] = []
+    qualified: dict[int, str] = {}
+    nested: dict[int, list[Symbol]] = {}
+    for symbol in ordered:
+        while open_symbols and open_symbols[-1].end_line < symbol.line:
+            open_symbols.pop()
+        owner = next((outer.name + "." for outer in reversed(open_symbols) if outer.kind == "class"), "")
+        qualified[id(symbol)] = owner + symbol.name
+        parent = next((outer for outer in reversed(open_symbols) if outer.kind == "function"), None)
+        if symbol.kind == "function" and parent is not None:
+            nested.setdefault(id(parent), []).append(symbol)
+        open_symbols.append(symbol)
+    changed = []
+    for symbol in ordered:
+        if symbol.kind != "function":
+            continue
+        start, own = symbol.line, False
+        for inner in nested.get(id(symbol), []):
+            own = own or touched(start, inner.line - 1)
+            start = max(start, inner.end_line + 1)
+        if own or touched(start, symbol.end_line):
+            changed.append((symbol, qualified[id(symbol)]))
+    return changed
 
 
 def remove_nested_symbols(symbols: list[Symbol]) -> list[Symbol]:
@@ -1783,13 +1837,14 @@ def target_files_for_mode(
             for path in soul_map.related_files_for_paths(changed, related_limit)
             if not is_reference_only_path(path, reference_prefixes)
         ]
-        return unique_ordered([*changed, *related])[:top]
+        # Every changed file stays a target, so each changed function gets its row; related files fill to top.
+        return unique_ordered([*changed, *related])[:max(top, len(changed))]
     if mode == "local":
         return [
             path
             for path in selected_files(source_git_state, "all")
             if not is_generated_or_cache_path(path)
-        ][:top]
+        ]
     if mode == "repo":
         return [
             entry.path
@@ -1828,8 +1883,8 @@ def rank_target_entry(
     role = file_role(path)
     changed_file = path in source_git_state.pr_files
     dirty_file = mode != "pr" and path in selected_files(source_git_state, "dirty")
-    changed_symbols = entry.get("changed_symbols")
-    symbol_list = changed_symbols if isinstance(changed_symbols, list) else []
+    touched = entry.get("_touched_symbols", entry.get("changed_symbols"))
+    symbol_list = touched if isinstance(touched, list) else []
     cochanges = entry.get("cochanges")
     graph_neighbors = entry.get("graph_neighbors")
     pagerank = entry.get("pagerank")
@@ -2089,6 +2144,7 @@ def make_target_entries(
     else:
         intent = None
         intent_resolution = workflow_index.IntentResolution((), (), (), ())
+    edited = is_edit(mode, source_git_state)
     relevance_by_symbol = {
         (item.path, item.line, item.name): item.score
         for item in intent_resolution.symbol_relevance
@@ -2127,20 +2183,19 @@ def make_target_entries(
             if mode not in {"intent", "repo"}
             else []
         )
+        if mode == "local" and path in source_git_state.untracked_files:
+            ranges = [(1, 10**9)]  # all of a new file is changed
         symbols = symbols_by_path[path]
-        changed_symbols = remove_nested_symbols(
-            [symbol for symbol in symbols if symbol_overlaps(symbol, ranges)]
-        )
+        touched_symbols = remove_nested_symbols([symbol for symbol in symbols if symbol_overlaps(symbol, ranges)])
+        changed = changed_functions(symbols, ranges)
+        changed_symbols = [symbol for symbol, _qualified in changed]
         intent_required_symbols = [
             symbol
             for symbol in symbols
             if (path, symbol.line, symbol.name) in required_symbol_keys
         ]
-        intent_symbols = [
-            *intent_required_symbols,
-            *(symbol for symbol in symbols if symbol not in intent_required_symbols),
-        ]
-        planner_symbols = sorted(
+        # An edit's plan asks only about its changed functions, so it ranks no planner symbols.
+        planner_symbols = [] if edited else sorted(
             symbols,
             key=lambda symbol: (
                 -relevance_by_symbol.get((path, symbol.line, symbol.name), 0),
@@ -2160,7 +2215,10 @@ def make_target_entries(
             intent_names_file or path in directory_owner_paths
         )
         file_evidence = file_evidence_by_path.get(path)
-        display_symbols = changed_symbols[:12] if changed_symbols else intent_symbols[:12]
+        display_symbols = changed_symbols[:12] if changed_symbols else [
+            *intent_required_symbols,
+            *(symbol for symbol in symbols if symbol not in intent_required_symbols),
+        ][:12]
         dirty_kinds = []
         if path in source_git_state.staged_files:
             dirty_kinds.append("staged")
@@ -2179,7 +2237,9 @@ def make_target_entries(
             "pagerank": map_file.pagerank if map_file else None,
             "symbol_count": map_file.symbol_count if map_file else None,
             "line_count": map_file.line_count if map_file else None,
-            "changed_symbols": [symbol.__dict__ for symbol in changed_symbols],
+            "changed_symbols": [{**symbol.__dict__, "qualified_name": qualified} for symbol, qualified in changed],
+            # Ranking keeps reading the outermost touched symbols (a test class's span, a class-only edit).
+            "_touched_symbols": [symbol.__dict__ for symbol in touched_symbols],
             "symbols": [symbol.__dict__ for symbol in display_symbols],
             "_planner_symbols": [symbol.__dict__ for symbol in planner_symbols],
             "intent_required_symbols": [
@@ -2216,17 +2276,42 @@ def apply_soulforge_render(target_entries: list[dict[str, object]], paths: list[
             unrendered += 1
 
 
+def symbol_checks(path: str, qualified_name: str, repo_name: str | None) -> list[dict[str, object]]:
+    """The context and upstream impact checks of one symbol."""
+    name = qualified_name.rsplit(".", 1)[-1]
+    checks: list[dict[str, object]] = [
+        {"kind": "symbol_context", "target": name, "file": path},
+        {"kind": "symbol_impact", "target": name, "file": path, "direction": "upstream"},
+    ]
+    for check in checks:
+        if qualified_name != name:
+            check["qualified_target"] = qualified_name
+        if repo_name:
+            check["repo"] = repo_name
+    return checks
+
+
 def build_gitnexus_plan(
     target_entries: list[dict[str, object]],
     repo_name: str | None = None,
     *,
     intent_mode: bool = False,
     rank: Callable[[dict[str, int]], dict[str, list[str]] | None] | None = None,
+    edited: bool = False,
 ) -> tuple[list[dict[str, object]], int, list[dict[str, object]]]:
     """Required groups first against the full cap, then optional groups one per target in turn:
     targets whose symbols the diff changed, then production targets, then tests. `rank` names,
     per file and slot count, the symbols to prefer where an unchanged target holds more
-    candidates than its slots; it and its reserve can only displace unchanged symbols."""
+    candidates than its slots; it and its reserve can only displace unchanged symbols.
+    For an edit, the plan is the context and impact of every changed function outside tests, uncapped."""
+    if edited:
+        return [
+            item
+            for entry in target_entries
+            if entry.get("surface_role") != "test"
+            for symbol in entry.get("changed_symbols") or []
+            for item in symbol_checks(str(entry["path"]), str(symbol["qualified_name"]), repo_name)
+        ], 0, []
     required_groups: list[list[dict[str, object]]] = []
     # (0 changed symbols | 1 production | 2 test, path whose order `rank` may decide, groups)
     optional_queues: list[tuple[int, str, list[list[dict[str, object]]]]] = []
@@ -2287,23 +2372,7 @@ def build_gitnexus_plan(
                 continue
             planned_symbols.append((name, False))
         for qualified_name, required in planned_symbols:
-            name = qualified_name.rsplit(".", 1)[-1]
-            context_item: dict[str, object] = {
-                "kind": "symbol_context",
-                "target": name,
-                "file": path,
-            }
-            impact_item: dict[str, object] = {
-                "kind": "symbol_impact",
-                "target": name,
-                "file": path,
-                "direction": "upstream",
-            }
-            if qualified_name != name:
-                context_item["qualified_target"] = impact_item["qualified_target"] = qualified_name
-            if repo_name:
-                context_item["repo"] = repo_name
-                impact_item["repo"] = repo_name
+            context_item, impact_item = symbol_checks(path, qualified_name, repo_name)
             context_key = ("symbol_context", path, qualified_name, "")
             impact_key = ("symbol_impact", path, qualified_name, "upstream")
             if context_key in seen and impact_key in seen:
@@ -2436,27 +2505,9 @@ def resolved_required_anchor(analysis: dict[str, object], plan: list[dict[str, o
     )
 
 
-def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> list[str]:
-    """One row per resolved symbol: its identity, then callers, callees and upstream impact, each
-    list grouped by file and marked where a row limit may have cut it. File checks and
-    unresolved checks keep the <check> form."""
-    analysis = gitnexus.get("analysis")
-    if not isinstance(analysis, dict):
-        return []
-    omissions_blocking = _omissions_are_blocking(analysis)
-    lines = [
-        f'{indent}<gitnexus_analysis status="{html.escape(str(analysis.get("status") or "unknown"))}" '
-        f'graph_calls="{html.escape(str(analysis.get("graph_call_count") or 0))}" '
-        f'omitted_checks="{html.escape(str(analysis.get("omitted_check_count") or 0))}" '
-        f'omissions_blocking="{str(omissions_blocking).lower()}" '
-        f'elapsed_ms="{html.escape(str(analysis.get("elapsed_ms") or 0))}" '
-        f'output_bytes="{html.escape(str(analysis.get("output_bytes") or 0))}">'
-    ]
-    entries = analysis.get("entries")
-    entries = [
-        entry for entry in (entries if isinstance(entries, list) else [])[:MAX_GITNEXUS_CHECKS]
-        if isinstance(entry, dict)
-    ]
+def gitnexus_symbol_rows(entries: list[dict[str, object]], indent: str) -> dict[str, list[str]]:
+    """Per resolved symbol identity, the row the packet prints: the identity, then callers, callees and
+    upstream impact, each list grouped by file and marked where a row limit may have cut it."""
     impacts = {
         entry.get("resolved_identity"): entry
         for entry in entries
@@ -2474,24 +2525,52 @@ def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> 
             f"{path}: {', '.join(names)}" if names else path for path, names in names_by_file.items()
         )) or "none"
 
+    rows: dict[str, list[str]] = {}
+    for entry in entries:
+        if entry.get("kind") != "symbol_context" or entry.get("status") != "resolved":
+            continue
+        identity = str(entry.get("resolved_identity"))
+        row = [f"{indent}{html.escape(identity)}"]
+        row.extend(
+            f"{indent}  {key}{' (row limit reached; may be incomplete)' if entry.get(f'{key}_limited') else ''}: "
+            f"{by_file(entry.get(key))}"
+            for key in ("callers", "callees")
+        )
+        impact = impacts.get(identity)
+        if impact:
+            impacted = impact.get("impacted_files")
+            row.append(html.escape(
+                f"{indent}  upstream impact {impact.get('risk')}, {impact.get('impacted_count')} symbols in: "
+                f"{', '.join(str(path) for path in impacted) if impacted else 'none'}"
+            ))
+        rows[identity] = row
+    return rows
+
+
+def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> list[str]:
+    """One row per resolved symbol: its identity, then callers, callees and upstream impact, each
+    list grouped by file and marked where a row limit may have cut it. File checks and
+    unresolved checks keep the <check> form."""
+    analysis = gitnexus.get("analysis")
+    if not isinstance(analysis, dict):
+        return []
+    omissions_blocking = _omissions_are_blocking(analysis)
+    lines = [
+        f'{indent}<gitnexus_analysis status="{html.escape(str(analysis.get("status") or "unknown"))}" '
+        f'graph_calls="{html.escape(str(analysis.get("graph_call_count") or 0))}" '
+        f'omitted_checks="{html.escape(str(analysis.get("omitted_check_count") or 0))}" '
+        f'omissions_blocking="{str(omissions_blocking).lower()}" '
+        f'elapsed_ms="{html.escape(str(analysis.get("elapsed_ms") or 0))}" '
+        f'output_bytes="{html.escape(str(analysis.get("output_bytes") or 0))}">'
+    ]
+    entries = [entry for entry in analysis.get("entries") or [] if isinstance(entry, dict)]
+    rows = gitnexus_symbol_rows(entries, f"{indent}  ")
     for entry in entries:
         resolved = entry.get("status") == "resolved"
         if resolved and entry.get("kind") == "symbol_impact":
             continue
         if resolved and entry.get("kind") == "symbol_context":
-            lines.append(f"{indent}  {html.escape(str(entry.get('resolved_identity')))}")
-            lines.extend(
-                f"{indent}    {key}{' (row limit reached; may be incomplete)' if entry.get(f'{key}_limited') else ''}: "
-                f"{by_file(entry.get(key))}"
-                for key in ("callers", "callees")
-            )
-            impact = impacts.get(entry.get("resolved_identity"))
-            if impact:
-                impacted = impact.get("impacted_files")
-                lines.append(html.escape(
-                    f"{indent}    upstream impact {impact.get('risk')}, {impact.get('impacted_count')} symbols in: "
-                    f"{', '.join(str(path) for path in impacted) if impacted else 'none'}"
-                ))
+            lines.extend(rows[str(entry.get("resolved_identity"))])
             continue
         attrs = " ".join(
             f'{name}="{html.escape(str(entry.get(name) or ""))}"'
@@ -2758,15 +2837,14 @@ def build_advisor_projection(packet: dict[str, object]) -> dict[str, object]:
     gitnexus = gitnexus if isinstance(gitnexus, dict) else {}
     analysis = gitnexus.get("analysis")
     analysis = analysis if isinstance(analysis, dict) else {}
-    entries = analysis.get("entries")
-    entries = entries if isinstance(entries, list) else []
-    references = []
-    for index, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            continue
-        reference = f"gitnexus.analysis.entries[{index}]"
-        entry["reference"] = reference
-        references.append(reference)
+    entries = [entry for entry in analysis.get("entries") or [] if isinstance(entry, dict)]
+    # The advisor reads the edit's changed functions outside tests, each row as the packet prints it: an
+    # edit's plan holds exactly those checks, under the identities GitNexus resolved for them.
+    edited = any(
+        isinstance(target, dict) and target.get("surface_role") != "test" and target.get("changed_symbols")
+        for target in packet.get("targets") or []
+    )
+    references = ["\n".join(row) for row in gitnexus_symbol_rows(entries, "").values()] if edited else []
     unresolved = analysis.get("unresolved_checks")
     unresolved = unresolved if isinstance(unresolved, list) else []
     required_omissions = [
@@ -2987,8 +3065,10 @@ def make_packet(
         )
     ]
     unavailable_targets = [entry for entry in target_entries if entry not in graph_targets]
+    # A packet of an edit asks the graph about the edit's changed functions only.
+    edited = is_edit(mode, source_git_state)
     unavailable_plan, unavailable_omitted, unavailable_required = build_gitnexus_plan(
-        unavailable_targets, gitnexus_repo_name, intent_mode=mode == "intent")
+        unavailable_targets, gitnexus_repo_name, intent_mode=mode == "intent", edited=edited)
     unavailable_checks = [item for item in unavailable_plan if item.get("required") is True]
     # One graph process ranks the plan's candidates and answers every planned check.
     with gitnexus_analysis.GraphSession(
@@ -2998,7 +3078,7 @@ def make_packet(
         plan, omitted_check_count, omitted_required_checks = build_gitnexus_plan(
             graph_targets, gitnexus_repo_name, intent_mode=mode == "intent",
             rank=functools.partial(gitnexus_analysis.rank_symbols, graph)
-            if index_freshness_status in {"fresh", "reindexed"} else None)
+            if index_freshness_status in {"fresh", "reindexed"} else None, edited=edited)
         gitnexus_status = gitnexus_analysis.execute(
             plan,
             gitnexus_status,
@@ -3111,7 +3191,7 @@ def make_packet(
         warnings.append("source checkout status changed during context generation")
 
     packet_target_entries = [
-        {key: value for key, value in entry.items() if key != "_planner_symbols"}
+        {key: value for key, value in entry.items() if key not in {"_planner_symbols", "_touched_symbols"}}
         for entry in target_entries
     ]
     packet = {
