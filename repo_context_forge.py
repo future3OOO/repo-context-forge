@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import bisect
 import fcntl
 import functools
 import hashlib
@@ -49,7 +48,6 @@ MAX_GITNEXUS_CHECKS = 20
 # check was its own process; the reserve stays so a ranked packet keeps the size it had.
 RANKING_CHECKS = 4
 INTENT_GRAPH_EXCLUDED_NAMES = {"Cargo.lock", "go.sum"}
-CALLABLE_KINDS = ("function", "method")
 TaskEvent = Literal["read", "search", "edit", "mention"]
 CRITICAL_AREA_STEPS = (
     "State the task or PR contract from the user request, PR title/body when available, and packet targets.",
@@ -485,51 +483,6 @@ def parse_unified_diff_new_ranges(diff: str) -> list[tuple[int, int]]:
 
 def symbol_overlaps(symbol: Symbol, ranges: list[tuple[int, int]]) -> bool:
     return any(symbol.line <= end and symbol.end_line >= start for start, end in ranges)
-
-
-def changed_functions(symbols: list[Symbol], ranges: list[tuple[int, int]]) -> list[tuple[Symbol, str]]:
-    """The innermost indexed function or method holding each changed line, named as GitNexus names it: by its
-    innermost enclosing class only (Job.run, Inner.deep; a function nested in a function is bare). A function
-    counts when a changed line lies in it outside its nested functions, so an outer function's own edit counts
-    beside its inner one's; class-level lines name none."""
-    if not ranges:
-        return []
-    merged: list[list[int]] = []
-    for start, end in sorted(ranges):
-        if merged and start <= merged[-1][1] + 1:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-    ends = [end for _start, end in merged]
-
-    def touched(start: int, end: int) -> bool:
-        index = bisect.bisect_left(ends, start)
-        return start <= end and index < len(merged) and merged[index][0] <= end
-
-    ordered = sorted(symbols, key=lambda symbol: (symbol.line, -symbol.end_line))
-    open_symbols: list[Symbol] = []
-    qualified: dict[int, str] = {}
-    nested: dict[int, list[Symbol]] = {}
-    for symbol in ordered:
-        while open_symbols and open_symbols[-1].end_line < symbol.line:
-            open_symbols.pop()
-        owner = next((outer.name + "." for outer in reversed(open_symbols) if outer.kind == "class"), "")
-        qualified[id(symbol)] = owner + symbol.name
-        parent = next((outer for outer in reversed(open_symbols) if outer.kind in CALLABLE_KINDS), None)
-        if symbol.kind in CALLABLE_KINDS and parent is not None:
-            nested.setdefault(id(parent), []).append(symbol)
-        open_symbols.append(symbol)
-    changed = []
-    for symbol in ordered:
-        if symbol.kind not in CALLABLE_KINDS:
-            continue
-        start, own = symbol.line, False
-        for inner in nested.get(id(symbol), []):
-            own = own or touched(start, inner.line - 1)
-            start = max(start, inner.end_line + 1)
-        if own or touched(start, symbol.end_line):
-            changed.append((symbol, qualified[id(symbol)]))
-    return changed
 
 
 def remove_nested_symbols(symbols: list[Symbol]) -> list[Symbol]:
@@ -1887,8 +1840,8 @@ def rank_target_entry(
     role = file_role(path)
     changed_file = path in source_git_state.pr_files
     dirty_file = mode != "pr" and path in selected_files(source_git_state, "dirty")
-    touched = entry.get("_touched_symbols", entry.get("changed_symbols"))
-    symbol_list = touched if isinstance(touched, list) else []
+    changed_symbols = entry.get("changed_symbols")
+    symbol_list = changed_symbols if isinstance(changed_symbols, list) else []
     cochanges = entry.get("cochanges")
     graph_neighbors = entry.get("graph_neighbors")
     pagerank = entry.get("pagerank")
@@ -2190,9 +2143,9 @@ def make_target_entries(
         if mode == "local" and path in source_git_state.untracked_files:
             ranges = [(1, 10**9)]  # all of a new file is changed
         symbols = symbols_by_path[path]
-        touched_symbols = remove_nested_symbols([symbol for symbol in symbols if symbol_overlaps(symbol, ranges)])
-        changed = changed_functions(symbols, ranges)
-        changed_symbols = [symbol for symbol, _qualified in changed]
+        changed_symbols = remove_nested_symbols(
+            [symbol for symbol in symbols if symbol_overlaps(symbol, ranges)]
+        )
         intent_required_symbols = [
             symbol
             for symbol in symbols
@@ -2241,9 +2194,7 @@ def make_target_entries(
             "pagerank": map_file.pagerank if map_file else None,
             "symbol_count": map_file.symbol_count if map_file else None,
             "line_count": map_file.line_count if map_file else None,
-            "changed_symbols": [{**symbol.__dict__, "qualified_name": qualified} for symbol, qualified in changed],
-            # Ranking keeps reading the outermost touched symbols (a test class's span, a class-only edit).
-            "_touched_symbols": [symbol.__dict__ for symbol in touched_symbols],
+            "changed_symbols": [symbol.__dict__ for symbol in changed_symbols],
             "symbols": [symbol.__dict__ for symbol in display_symbols],
             "_planner_symbols": [symbol.__dict__ for symbol in planner_symbols],
             "intent_required_symbols": [
@@ -2301,21 +2252,11 @@ def build_gitnexus_plan(
     *,
     intent_mode: bool = False,
     rank: Callable[[dict[str, int]], dict[str, list[str]] | None] | None = None,
-    edited: bool = False,
 ) -> tuple[list[dict[str, object]], int, list[dict[str, object]]]:
     """Required groups first against the full cap, then optional groups one per target in turn:
     targets whose symbols the diff changed, then production targets, then tests. `rank` names,
     per file and slot count, the symbols to prefer where an unchanged target holds more
-    candidates than its slots; it and its reserve can only displace unchanged symbols.
-    For an edit, the plan is the context and impact of every changed function outside tests, uncapped."""
-    if edited:
-        return [
-            item
-            for entry in target_entries
-            if entry.get("surface_role") != "test"
-            for symbol in entry.get("changed_symbols") or []
-            for item in symbol_checks(str(entry["path"]), str(symbol["qualified_name"]), repo_name)
-        ], 0, []
+    candidates than its slots; it and its reserve can only displace unchanged symbols."""
     required_groups: list[list[dict[str, object]]] = []
     # (0 changed symbols | 1 production | 2 test, path whose order `rank` may decide, groups)
     optional_queues: list[tuple[int, str, list[list[dict[str, object]]]]] = []
@@ -2551,10 +2492,17 @@ def gitnexus_symbol_rows(entries: list[dict[str, object]], indent: str) -> dict[
     return rows
 
 
+def changed_function_line(entry: dict[str, object]) -> str:
+    """`<uid>: <production callers outside the change> (+N tests)`, escaped as the packet prints it."""
+    count = entry.get("test_caller_count") or 0
+    tests = f" (+{count} test{'' if count == 1 else 's'})" if count else ""
+    return html.escape(f"{entry.get('resolved_identity')}: {', '.join(map(str, entry.get('callers') or []))}{tests}")
+
+
 def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> list[str]:
     """One row per resolved symbol: its identity, then callers, callees and upstream impact, each
-    list grouped by file and marked where a row limit may have cut it. File checks and
-    unresolved checks keep the <check> form."""
+    list grouped by file and marked where a row limit may have cut it; an edit's line per changed
+    function. File checks and unresolved checks keep the <check> form."""
     analysis = gitnexus.get("analysis")
     if not isinstance(analysis, dict):
         return []
@@ -2575,6 +2523,9 @@ def render_gitnexus_analysis_lines(gitnexus: dict[str, object], indent: str) -> 
             continue
         if resolved and entry.get("kind") == "symbol_context":
             lines.extend(rows[str(entry.get("resolved_identity"))])
+            continue
+        if resolved and entry.get("kind") == "changed_function":
+            lines.append(f"{indent}  {changed_function_line(entry)}")
             continue
         attrs = " ".join(
             f'{name}="{html.escape(str(entry.get(name) or ""))}"'
@@ -2842,13 +2793,8 @@ def build_advisor_projection(packet: dict[str, object]) -> dict[str, object]:
     analysis = gitnexus.get("analysis")
     analysis = analysis if isinstance(analysis, dict) else {}
     entries = [entry for entry in analysis.get("entries") or [] if isinstance(entry, dict)]
-    # The advisor reads the edit's changed functions outside tests, each row as the packet prints it: an
-    # edit's plan holds exactly those checks, under the identities GitNexus resolved for them.
-    edited = any(
-        isinstance(target, dict) and target.get("surface_role") != "test" and target.get("changed_symbols")
-        for target in packet.get("targets") or []
-    )
-    references = ["\n".join(row) for row in gitnexus_symbol_rows(entries, "").values()] if edited else []
+    # The advisor reads an edit's changed-function lines as the packet prints them; a begin packet has none.
+    references = [changed_function_line(entry) for entry in entries if entry.get("kind") == "changed_function"]
     unresolved = analysis.get("unresolved_checks")
     unresolved = unresolved if isinstance(unresolved, list) else []
     required_omissions = [
@@ -3069,10 +3015,13 @@ def make_packet(
         )
     ]
     unavailable_targets = [entry for entry in target_entries if entry not in graph_targets]
-    # A packet of an edit asks the graph about the edit's changed functions only.
-    edited = is_edit(mode, source_git_state)
+    # An edit asks the graph only who calls the functions it changed outside tests.
+    changed_ranges = {
+        str(entry["path"]): entry["changed_ranges"] for entry in graph_targets
+        if entry.get("surface_role") != "test" and entry.get("changed_ranges")
+    } if is_edit(mode, source_git_state) else None
     unavailable_plan, unavailable_omitted, unavailable_required = build_gitnexus_plan(
-        unavailable_targets, gitnexus_repo_name, intent_mode=mode == "intent", edited=edited)
+        unavailable_targets, gitnexus_repo_name, intent_mode=mode == "intent") if changed_ranges is None else ([], 0, [])
     unavailable_checks = [item for item in unavailable_plan if item.get("required") is True]
     # One graph process ranks the plan's candidates and answers every planned check.
     with gitnexus_analysis.GraphSession(
@@ -3082,7 +3031,7 @@ def make_packet(
         plan, omitted_check_count, omitted_required_checks = build_gitnexus_plan(
             graph_targets, gitnexus_repo_name, intent_mode=mode == "intent",
             rank=functools.partial(gitnexus_analysis.rank_symbols, graph)
-            if index_freshness_status in {"fresh", "reindexed"} else None, edited=edited)
+            if index_freshness_status in {"fresh", "reindexed"} else None) if changed_ranges is None else ([], 0, [])
         gitnexus_status = gitnexus_analysis.execute(
             plan,
             gitnexus_status,
@@ -3090,6 +3039,7 @@ def make_packet(
             omitted_check_count=omitted_check_count + unavailable_omitted
             + len(unavailable_plan) - len(unavailable_checks),
             omitted_required_checks=[*omitted_required_checks, *unavailable_checks, *unavailable_required],
+            changed_ranges=changed_ranges,
         )
     coverage_gaps = [
         {
@@ -3195,7 +3145,7 @@ def make_packet(
         warnings.append("source checkout status changed during context generation")
 
     packet_target_entries = [
-        {key: value for key, value in entry.items() if key not in {"_planner_symbols", "_touched_symbols"}}
+        {key: value for key, value in entry.items() if key != "_planner_symbols"}
         for entry in target_entries
     ]
     packet = {
