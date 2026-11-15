@@ -199,9 +199,12 @@ registry/local index generation, and present index storage.
 
 Every normal and blocker machine packet contains one `advisorProjection` with
 `schemaVersion: 1`. It carries canonical source/base provenance, expected and indexed
-candidate trees (or named gaps), whole target records, the printed GitNexus row of each
-changed function outside tests (none outside an edit), required omissions, optional
-omission count, and coverage gaps; it does not replace legacy evidence. Stale, unavailable,
+candidate trees (or named gaps), whole target records, the edit packet's printed lines
+(none outside an edit), required omissions, optional omission count, and coverage gaps;
+it does not replace legacy evidence. An edit packet asks GitNexus two queries, its
+symbols for the changed files and the callers of the changed functions among them, and
+prints one line per changed function outside tests that has production callers outside
+the change: `<uid>: <those callers> (+N tests)`, `(+1 test)` for one and nothing for none. Stale, unavailable,
 malformed, ambiguous, or identity-mismatched results produce one blocker instead of a
 successful packet. The bootstrap's optional `--packet-json-out PATH` atomically writes
 the same machine packet while normal prompt stdout remains unchanged. A blocker is

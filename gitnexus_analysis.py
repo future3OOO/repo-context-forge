@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import fcntl
 import functools
 import json
@@ -13,6 +14,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, Iterator, Optional, TextIO
+
+import workflow_index
 
 
 GITNEXUS_REGISTRY = Path.home() / ".gitnexus" / "registry.json"
@@ -537,7 +540,7 @@ class GraphSession:
             return False
         return True
 
-    def _answer(self, reply: dict[str, object]) -> Reply:
+    def _answer(self, reply: dict[str, object], limit: int | None) -> Reply:
         malformed = "GitNexus returned malformed output"
         result = reply.get("result")
         content = result.get("content") if isinstance(result, dict) else None
@@ -559,22 +562,23 @@ class GraphSession:
             return None, malformed
         size = len(text.encode("utf-8"))
         self.output_bytes += size
-        if size > MAX_OUTPUT_BYTES:
+        if limit is not None and size > limit:
             return None, "GitNexus check output exceeded the byte limit"
         if payload == []:  # a cypher query with no rows answers with an empty list
             payload = {}
         return (payload, "") if isinstance(payload, dict) else (None, malformed)
 
-    def call_many(self, requests: list[tuple[str, dict[str, object]]], timeout: float) -> list[Reply]:
+    def call_many(self, requests: list[tuple[str, dict[str, object]]], timeout: float,
+                  limit: int | None = MAX_OUTPUT_BYTES) -> list[Reply]:
         """Send every tool call at once; per request its JSON answer, or None and the reason.
 
         A structured error is an answer. The server works on the calls together, so a batch
         costs about its slowest call. A call left unanswered ends the process; the next
-        call starts another."""
+        call starts another. A reply over `limit` bytes is refused; None reads any size."""
         keys = [json.dumps([tool, arguments], sort_keys=True) for tool, arguments in requests]
         asked = [index for index, key in enumerate(keys) if key not in self._answers]
         if len(asked) < len(requests):
-            fresh = self.call_many([requests[index] for index in asked], timeout) if asked else []
+            fresh = self.call_many([requests[index] for index in asked], timeout, limit) if asked else []
             answered = dict(zip(asked, fresh))
             return [answered.get(index, (self._answers.get(key), "")) for index, key in enumerate(keys)]
         self.calls += len(requests)
@@ -588,7 +592,7 @@ class GraphSession:
             except OSError:
                 pass
             replies = self._collect(set(sent), deadline)
-        answers = {ident: self._answer(reply) for ident, reply in replies.items()}
+        answers = {ident: self._answer(reply, limit) for ident, reply in replies.items()}
         if self._store:
             for ident, (tool, arguments) in zip(sent, requests):
                 if (answer := answers.get(ident, (None, ""))[0]) is not None:
@@ -602,8 +606,9 @@ class GraphSession:
         sent += [0] * (len(requests) - len(sent))
         return [answers.get(ident, (None, reason)) for ident in sent]
 
-    def call(self, tool: str, arguments: dict[str, object], timeout: float) -> Reply:
-        return self.call_many([(tool, arguments)], timeout)[0]
+    def call(self, tool: str, arguments: dict[str, object], timeout: float,
+             limit: int | None = MAX_OUTPUT_BYTES) -> Reply:
+        return self.call_many([(tool, arguments)], timeout, limit)[0]
 
 
 def _table_rows(payload: dict[str, object] | None) -> list[list[str]] | None:
@@ -650,6 +655,126 @@ def _relations_query(identity: str, outgoing: bool) -> str:
     )
 
 
+def _cypher_strings(values: list[str]) -> str:
+    """A cypher list of `values` with every word start \\u-escaped: GitNexus's read-only scanner also
+    reads string contents, so a path such as copy.py must not read as a write keyword."""
+    return "[" + ",".join(
+        '"' + "".join("\\u%04x" % ord(char) if char.isascii() and (char.isalpha() or char == "_")
+                      and (index == 0 or not (value[index - 1].isalnum() or value[index - 1] == "_"))
+                      else json.dumps(char)[1:-1] for index, char in enumerate(value)) + '"'
+        for value in values) + "]"
+
+
+def _collected(reply: Reply) -> list[dict[str, object]] | None:
+    """The one collected list a cypher query returns (empty when it matched nothing), or None when it
+    did not answer."""
+    payload = reply[0]
+    if payload is None or payload.get("error"):
+        return None
+    try:
+        cell = str(payload["markdown"]).splitlines()[2][1:-1].strip() if payload else ""
+        nodes = json.loads(cell) if cell else []
+    except (KeyError, IndexError, ValueError):
+        return None
+    return [node for node in nodes if isinstance(node, dict)] if isinstance(nodes, list) else None
+
+
+def changed_functions(nodes: list[dict[str, object]], ranges: list[tuple[int, int]]) -> list[dict[str, object]]:
+    """Of one file's GitNexus nodes (0-based lines), the functions and methods holding a changed line
+    (1-based `ranges`) outside the functions nested in them, so an outer function's own edit counts
+    beside its inner one's; class and property lines name none."""
+    merged: list[list[int]] = []
+    for start, end in sorted(ranges):
+        if merged and start - 1 <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], end - 1)
+        else:
+            merged.append([start - 1, end - 1])
+    ends = [end for _start, end in merged]
+
+    def touched(start: int, end: int) -> bool:
+        index = bisect.bisect_left(ends, start)
+        return start <= end and index < len(merged) and merged[index][0] <= end
+
+    functions = sorted(
+        (node for node in nodes if str(node.get("id")).startswith(("Function:", "Method:"))
+         and isinstance(node.get("startLine"), int) and isinstance(node.get("endLine"), int)),
+        key=lambda node: (node["startLine"], -node["endLine"]),
+    )
+    open_functions: list[dict[str, object]] = []
+    nested: dict[str, list[dict[str, object]]] = {}
+    for node in functions:
+        while open_functions and (
+            open_functions[-1]["endLine"] < node["endLine"]
+            or (open_functions[-1]["startLine"], open_functions[-1]["endLine"])
+            == (node["startLine"], node["endLine"])
+        ):
+            open_functions.pop()
+        if open_functions:
+            nested.setdefault(str(open_functions[-1]["id"]), []).append(node)
+        open_functions.append(node)
+    changed = []
+    for node in functions if merged else []:
+        start, own = node["startLine"], False
+        for inner in nested.get(str(node["id"]), []):
+            own = own or touched(start, inner["startLine"] - 1)
+            start = max(start, inner["endLine"] + 1)
+        if own or touched(start, node["endLine"]):
+            changed.append(node)
+    return changed
+
+
+def _changed_function_entries(
+    graph: GraphSession, ranges_by_file: dict[str, list[tuple[int, int]]], timeout: float,
+) -> tuple[list[dict[str, object]], int] | None:
+    """Two queries whatever the edit's size: GitNexus's symbols of the changed files (codex-skills
+    _quality_gate/snapshot.py's query), then the callers of the changed functions outside tests. One entry per
+    changed function, outside tests naming its production callers outside the change and counting its test
+    callers; and how many changed outside tests. None when either query did not answer. Their replies are
+    parsed, never printed, so they take no byte limit: a 73-file edit's symbols reply is over 300 KB."""
+    if not ranges_by_file:
+        return [], 0
+    kinds = ["File", "Function", "Method", "Class", "Interface", "Struct", "Enum", "Property"]
+    nodes = _collected(graph.call("cypher", {"query": (
+        "MATCH (n) WHERE n.filePath IN " + _cypher_strings(list(ranges_by_file)) + " AND ("
+        + " OR ".join("n.id STARTS WITH '" + kind + ":'" for kind in kinds) + ") "
+        "OPTIONAL MATCH (n)-[r:CodeRelation]->(m) WHERE r.type = 'CALLS' "
+        "WITH n, collect(m.id) AS calls RETURN collect({id:n.id, name:n.name, file:n.filePath, "
+        "startLine:n.startLine, endLine:n.endLine, calls:calls}) AS symbols")}, timeout, None))
+    if nodes is None:
+        return None
+    by_file: dict[str, list[dict[str, object]]] = {}
+    for node in nodes:
+        by_file.setdefault(str(node.get("file")), []).append(node)
+    changed = {str(node["id"]): node for path, ranges in ranges_by_file.items()
+               for node in changed_functions(by_file.get(path, []), ranges)}
+    asked = [identity for identity, node in changed.items() if not workflow_index.is_test_path(str(node["file"]))]
+    callers = _collected(graph.call("cypher", {"query": (
+        "MATCH (a)-[r:CodeRelation]->(b) WHERE r.type = 'CALLS' AND b.id IN " + _cypher_strings(asked)
+        + " RETURN collect(DISTINCT {to:b.id, id:a.id, name:a.name, file:a.filePath}) AS callers")}, timeout, None)
+    ) if asked else []
+    if callers is None:
+        return None
+    production: dict[str, set[tuple[str, str]]] = {}
+    tests: dict[str, set[str]] = {}
+    for caller in callers:
+        target, identity, path = str(caller.get("to")), str(caller.get("id")), str(caller.get("file") or "")
+        if workflow_index.is_test_path(path):
+            tests.setdefault(target, set()).add(identity)
+        elif identity not in changed:
+            shown = path if identity.startswith("File:") else (
+                str(caller.get("name")) if path == changed[target]["file"] else f"{path}:{caller.get('name')}")
+            production.setdefault(target, set()).add((path, shown))
+    entries = [
+        {"kind": "changed_function", "file": str(node["file"]), "target": identity.rsplit(":", 1)[-1],
+         "status": "resolved", "resolved_identity": identity, "name": str(node.get("name")),
+         "line": node["startLine"] + 1, "end_line": node["endLine"] + 1,
+         "callers": [shown for _path, shown in sorted(production.get(identity, ()))],
+         "test_caller_count": len(tests.get(identity, ()))}
+        for identity, node in changed.items()
+    ]
+    return entries, len(asked)
+
+
 def _all_references(
     identity: str, outgoing: bool, returned: list[dict[str, str]], payload: dict[str, object] | None,
 ) -> tuple[list[dict[str, str]], bool]:
@@ -675,8 +800,10 @@ def execute(
     omitted_check_count: int = 0,
     omitted_required_checks: list[dict[str, object]] | None = None,
     gitnexus_bin: str | None = None,
+    changed_ranges: dict[str, list[tuple[int, int]]] | None = None,
 ) -> dict[str, object]:
-    """Answer every planned check from `graph`, or from a session of its own when none is given."""
+    """Answer every planned check from `graph`, or from a session of its own when none is given. An edit
+    passes its changed lines per file outside tests as `changed_ranges` instead of a plan."""
     if graph is None:
         with GraphSession(str(gitnexus_status.get("repo") or ""), gitnexus_bin) as session:
             return execute(
@@ -685,6 +812,7 @@ def execute(
                 graph=session,
                 omitted_check_count=omitted_check_count,
                 omitted_required_checks=omitted_required_checks,
+                changed_ranges=changed_ranges,
             )
     started = time.monotonic()
     unresolved_required_checks: list[dict[str, object]] = []
@@ -742,6 +870,15 @@ def execute(
 
     def remaining() -> float:
         return max(0.0, min(CALL_TIMEOUT_SECONDS, TOTAL_TIMEOUT_SECONDS - (time.monotonic() - started)))
+
+    if changed_ranges is not None:
+        found = _changed_function_entries(graph, changed_ranges, remaining())
+        if found is None:
+            unresolved.append({"kind": "changed_functions", "file": ", ".join(changed_ranges), "target": "callers",
+                               "status": "unresolved", "diagnostic": "GitNexus did not answer the changed-function queries"})
+        else:
+            entries.extend(found[0])
+            analysis["changed_function_count"] = found[1]
 
     def single_eligible_candidate(payload: dict[str, object], file_path: str, target: str) -> str | None:
         # GitNexus answers "ambiguous" when a name is shared inside one file (a module

@@ -1215,39 +1215,78 @@ raise SystemExit(output_packet(packet, args))
             self.assertEqual((reason, (answer or {}).get("error"), (answer or {}).get("target")),
                              ("", None, {"id": uid, "name": "main", "type": "Function", "filePath": "src/b.py"}), marker)
 
-    def test_every_changed_function_outside_tests_gets_its_row(self) -> None:
-        # BM_ALL_CHANGED: 22 changed production files, one with 11 changed functions, one with a nested function and a
-        # nested-class method beside same-named peers, and a changed test: every changed production function has its
-        # row, as the packet prints it, in the packet and the projection, and nothing else is asked.
+    def test_edit_packet_names_production_callers_of_changed_functions(self) -> None:
+        # BM_CALLERS_UNIT, BM_INNERMOST: GitNexus's spans own each changed line by the innermost function or method
+        # holding it (an outer function's own edit counts; class lines, and a hunk from a nested body into the module
+        # code after it, name no enclosing function); each changed function outside tests
+        # with a production caller outside the change gets its line, callers named bare in its file and file:name
+        # elsewhere, test callers counted; one called only by the change or by tests is left out; staged, unstaged and
+        # untracked edits count; pytest *_test.py and Go *_test.go callers count as tests; two graph queries for 37
+        # changed functions; the projection carries the same lines; each target's changed symbols are GitNexus's
+        # changed functions in its file, the test file's included.
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
-            body = lambda count, value: "".join(f"def f{i}():\n    return {value}\n\n\n" for i in range(count))
-            nested = lambda value: (f"def outer():\n    def inner():\n        return {value}\n    return inner\n\n\n"
-                                    f"class Job:\n    class Step:\n        def run(self):\n            return {value}\n\n\n"
-                                    "class Peer:\n    def inner(self):\n        return 0\n\n    def run(self):\n        return 0\n")
+            many = lambda v: "".join(f"def f{i}():\n    return {v}{' + f10()' if i == 9 else ''}\n\n\n" for i in range(11))
+            nested = lambda v: (
+                f"def outer():\n    def inner():\n        return {v}\n    return inner()\n\n\n"
+                f"def wrap():\n    x = {v}\n\n    def helper():\n        return 1\n    return helper() + x\n\n\n"
+                f"class Job:\n    LIMIT = {v}\n\n    def run(self):\n        return 0\n\n\n"
+                f"def shell():\n    def body():\n        return {v}\nTAIL = {v}\n")
             (repo / "pkg").mkdir()
-            (repo / "pkg" / "many.py").write_text(body(11, 1), encoding="utf-8")
+            (repo / "pkg" / "many.py").write_text(many(1), encoding="utf-8")
             (repo / "pkg" / "nested.py").write_text(nested(1), encoding="utf-8")
             for index in range(20):
-                (repo / "pkg" / f"m&{index}.py").write_text(body(1, 1), encoding="utf-8")
+                (repo / "pkg" / f"m&{index}.py").write_text(
+                    "def f0():\n    return 1\n\n\ndef g():\n    return f0()\n", encoding="utf-8")
+            used = [f"f{i}" for i in range(10) if i != 8]
+            (repo / "pkg" / "use.py").write_text(
+                f"from pkg.many import {', '.join(used)}\nfrom pkg.nested import shell, wrap\n\n\n"
+                f"def use():\n    return {' + '.join(f'{name}()' for name in used)} + wrap() + shell()\n", encoding="utf-8")
             (repo / "tests").mkdir()
-            (repo / "tests" / "test_pkg.py").write_text("def test_one():\n    assert 1\n", encoding="utf-8")
+            tests = lambda v: ("from pkg.many import f0, f8\n\n\n"
+                               f"def test_one():\n    assert f0() == {v}\n\n\ndef test_two():\n    assert f8()\n")
+            (repo / "tests" / "test_pkg.py").write_text(tests(1), encoding="utf-8")
+            (repo / "pkg" / "handler_test.py").write_text(
+                "from pkg.many import f0\n\n\ndef test_handler():\n    assert f0()\n", encoding="utf-8")
+            calc = lambda v: f"package calc\n\nfunc Add(a int) int {{\n\treturn a + {v}\n}}\n\nfunc Use() int {{\n\treturn Add(1)\n}}\n"
+            (repo / "calc").mkdir()
+            (repo / "calc" / "calc.go").write_text(calc(1), encoding="utf-8")
+            (repo / "calc" / "calc_test.go").write_text(
+                "package calc\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tAdd(2)\n}\n", encoding="utf-8")
             repo_context_forge.run_cmd(["git", "add", "-A"], cwd=repo)
             repo_context_forge.run_cmd(["git", "commit", "-qm", "functions"], cwd=repo)
-            (repo / "pkg" / "many.py").write_text(body(11, 2), encoding="utf-8")
+            (repo / "pkg" / "many.py").write_text(many(2), encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "pkg/many.py"], cwd=repo)
             (repo / "pkg" / "nested.py").write_text(nested(2), encoding="utf-8")
             for index in range(20):
-                (repo / "pkg" / f"m&{index}.py").write_text(body(1, 2), encoding="utf-8")
-            (repo / "tests" / "test_pkg.py").write_text("def test_one():\n    assert 2\n", encoding="utf-8")
+                (repo / "pkg" / f"m&{index}.py").write_text(
+                    "def f0():\n    return 2\n\n\ndef g():\n    return f0()\n", encoding="utf-8")
+            (repo / "pkg" / "fresh.py").write_text("def fresh():\n    return 1\n\n\ndef caller():\n    return fresh()\n",
+                                                   encoding="utf-8")
+            (repo / "tests" / "test_pkg.py").write_text(tests(2), encoding="utf-8")
+            (repo / "calc" / "calc.go").write_text(calc(2), encoding="utf-8")
             result, packet = self.run_public_bootstrap(repo, cache_dir, runtime_home, mode="local")
-            expected = ({f"Function:pkg/many.py:f{i}" for i in range(11)} | {f"Function:pkg/m&amp;{i}.py:f0" for i in range(20)}
-                        | {"Function:pkg/nested.py:inner", "Function:pkg/nested.py:Step.run"})
-            rows = {line.strip() for line in result.stdout.splitlines() if line.startswith("    Function:")}
-            checked = {(entry["kind"], entry.get("resolved_identity")) for entry in packet["gitnexus"]["analysis"]["entries"]}
-            references = {row.splitlines()[0] for row in packet["advisorProjection"]["graph"]["references"]}
-            self.assertEqual((rows, references), (expected, expected), "CHANGED_FUNCTION_ROW_MISSING")
-            self.assertEqual(checked, {(kind, uid.replace("&amp;", "&")) for uid in expected
-                                       for kind in ("symbol_context", "symbol_impact")},
-                             "GRAPH_CALL_OUTSIDE_CHANGED_FUNCTIONS")
+            analysis = packet["gitnexus"]["analysis"]
+            expected = sorted([
+                *(f"Function:pkg/many.py:{name}: pkg/use.py:use{' (+2 tests)' if name == 'f0' else ''}" for name in used),
+                *(f"Function:pkg/m&amp;{index}.py:f0: g" for index in range(20)),
+                "Function:pkg/nested.py:inner: outer", "Function:pkg/nested.py:wrap: pkg/use.py:use",
+                "Function:calc/calc.go:Add: Use (+1 test)",
+            ])
+            lines = sorted(line.strip() for line in result.stdout.splitlines() if line.startswith("    Function:"))
+            self.assertEqual(lines, expected, "CHANGED_FUNCTION_LINE_WRONG")
+            self.assertEqual(sorted(packet["advisorProjection"]["graph"]["references"]), expected, "PROJECTION_NOT_LINES")
+            self.assertEqual((analysis["changed_function_count"], analysis["graph_call_count"]), (37, 2),
+                             "GRAPH_WORK_NOT_TWO_QUERIES")
+            changed = {target["path"]: sorted(symbol["uid"] for symbol in target["changed_symbols"])
+                       for target in packet["targets"] if target["changed_symbols"]}
+            self.assertEqual(changed, {
+                "pkg/many.py": sorted(f"Function:pkg/many.py:f{i}" for i in range(11)),
+                "pkg/nested.py": ["Function:pkg/nested.py:body", "Function:pkg/nested.py:inner", "Function:pkg/nested.py:wrap"],
+                **{f"pkg/m&{index}.py": [f"Function:pkg/m&{index}.py:f0"] for index in range(20)},
+                "pkg/fresh.py": ["Function:pkg/fresh.py:caller", "Function:pkg/fresh.py:fresh"],
+                "calc/calc.go": ["Function:calc/calc.go:Add"],
+                "tests/test_pkg.py": ["Function:tests/test_pkg.py:test_one"],
+            }, "TARGET_CHANGED_SYMBOLS_NOT_GITNEXUS")
 
     def test_pass_start_index_selects_the_candidate_slot(self) -> None:
         """--pass-start-index implies --candidate-slot: a later run of the pass analyzes its own checkout
@@ -2374,11 +2413,6 @@ raise SystemExit(output_packet(packet, args))
                 repo, cache_dir, runtime_home, mode="pr", base="HEAD~1",
                 intent="reconfirm")
             analysis = packet["gitnexus"]["analysis"]
-            actual_handler_entries = {
-                (entry["kind"], entry.get("resolved_identity"))
-                for entry in analysis["entries"]
-                if entry["target"] == "actual_handler"
-            }
             self.assertEqual(
                 (
                     result.returncode,
@@ -2388,18 +2422,9 @@ raise SystemExit(output_packet(packet, args))
                         for entry in analysis["unresolved_checks"]
                     ),
                     packet["gitnexus"]["required_checks_resolved"],
-                    actual_handler_entries,
+                    analysis["changed_function_count"],  # actual_handler only: no def inside a string
                 ),
-                (
-                    0,
-                    "resolved",
-                    [],
-                    True,
-                    {
-                        ("symbol_context", "Function:src/a.py:actual_handler"),
-                        ("symbol_impact", "Function:src/a.py:actual_handler"),
-                    },
-                ),
+                (0, "resolved", [], True, 1),
             )
 
     def test_public_bootstrap_resolves_nested_file_context_by_exact_identity(self) -> None:
@@ -2877,40 +2902,6 @@ raise SystemExit(output_packet(packet, args))
 
         self.assertFalse(repo_context_forge.symbol_overlaps(symbol, [(1, 9)]))
         self.assertTrue(repo_context_forge.symbol_overlaps(symbol, [(15, 25)]))
-
-    def test_changed_functions_are_the_innermost_owners_of_changed_lines(self) -> None:
-        # BM_INNERMOST: each changed line belongs to the innermost function or method holding it, named as GitNexus
-        # names it (innermost class only); an outer function's own edit counts beside its inner one's; class-only
-        # lines name none; ranges that change nothing name nothing.
-        symbol = lambda name, kind, line, end: repo_context_forge.Symbol(name, kind, line, end, None, False)
-        symbols = [symbol("Job", "class", 1, 30), symbol("run", "function", 3, 12), symbol("visit", "function", 6, 8),
-                   symbol("Task", "class", 31, 40), symbol("run", "function", 33, 38), symbol("helper", "function", 42, 45),
-                   symbol("Box", "class", 46, 50), symbol("go", "method", 47, 49)]
-        named = lambda ranges: [qualified for _symbol, qualified in repo_context_forge.changed_functions(symbols, ranges)]
-        self.assertEqual(named([(4, 4), (7, 7)]), ["Job.run", "Job.visit"], "OUTER_EDIT_LOST")
-        self.assertEqual(named([(7, 7)]), ["Job.visit"], "NOT_INNERMOST")
-        self.assertEqual(named([(2, 2), (31, 32)]), [], "CLASS_LINE_NAMED_A_FUNCTION")
-        self.assertEqual(named([]), [], "NO_RANGE_NAMED_A_FUNCTION")
-        self.assertEqual(named([(48, 48)]), ["Box.go"], "METHOD_KIND_UNSEEN")
-        self.assertEqual(named([(10, 35), (43, 43)]), ["Job.run", "Task.run", "helper"], "SAME_NAMES_MERGED")
-
-    def test_staged_and_untracked_edits_name_their_changed_functions(self) -> None:
-        # BM_INNERMOST (working tree): staged-only and untracked files are edits too.
-        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
-            repo = Path(repo_dir)
-            self.make_git_repo(repo)
-            (repo / "src" / "a.py").write_text("def kept():\n    return 1\n\n\ndef staged():\n    return 2\n", encoding="utf-8")
-            repo_context_forge.run_cmd(["git", "add", "src/a.py"], cwd=repo)
-            repo_context_forge.run_cmd(["git", "commit", "-qm", "two"], cwd=repo)
-            (repo / "src" / "a.py").write_text("def kept():\n    return 1\n\n\ndef staged():\n    return 3\n", encoding="utf-8")
-            repo_context_forge.run_cmd(["git", "add", "src/a.py"], cwd=repo)
-            (repo / "src" / "new.py").write_text("def fresh():\n    return 4\n", encoding="utf-8")
-            packet = repo_context_forge.make_packet(
-                repo, mode="local", base_ref="HEAD", head_ref="HEAD", intent=None, top=5,
-                token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET, cache_dir=Path(cache_dir), soulforge_bin=None,
-                map_build="never", map_timeout_ms=1, allow_missing_map=True, gitnexus_repo=None, gitnexus_mode="off")
-            changed = {entry["path"]: [s["qualified_name"] for s in entry["changed_symbols"]] for entry in packet["targets"]}
-            self.assertEqual((changed.get("src/a.py"), changed.get("src/new.py")), (["staged"], ["fresh"]), f"EDIT_UNSEEN {changed}")
 
     def test_remove_nested_symbols_prefers_outer_function(self) -> None:
         outer = repo_context_forge.Symbol(
@@ -4018,7 +4009,7 @@ raise SystemExit(output_packet(packet, args))
                     symbol["name"]
                     for symbol in by_path["tests/test_service.py"]["changed_symbols"]
                 ],
-                ["test_body", "after"],  # innermost owners; the class still drives ranking below
+                ["ServiceTests", "after"],
             )
             self.assertIn(
                 "broad_test_container",
