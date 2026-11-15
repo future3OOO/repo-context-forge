@@ -867,15 +867,9 @@ raise SystemExit(output_packet(packet, args))
             (0, 1, expected_tree, expected_tree),
             "ADVISOR_PROJECTION_V1_CONTRACT_BROKEN",
         )
-        graph_references = projection.get("graph", {}).get("references", [])
-        packet_references = {
-            entry.get("reference")
-            for entry in packet["gitnexus"]["analysis"]["entries"]
-        }
-        self.assertTrue(
-            graph_references and set(graph_references) <= packet_references,
-            "ADVISOR_PROJECTION_V1_CONTRACT_BROKEN",
-        )
+        # An intent packet changes no function, so the advisor gets no rows.
+        self.assertEqual((projection.get("graph", {}).get("references"), bool(packet["gitnexus"]["analysis"]["entries"])),
+                         ([], True), "ADVISOR_PROJECTION_V1_CONTRACT_BROKEN")
 
     def test_public_bootstrap_pr_mode_ignores_unrelated_source_dirt(self) -> None:
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
@@ -1221,6 +1215,40 @@ raise SystemExit(output_packet(packet, args))
             self.assertEqual((reason, (answer or {}).get("error"), (answer or {}).get("target")),
                              ("", None, {"id": uid, "name": "main", "type": "Function", "filePath": "src/b.py"}), marker)
 
+    def test_every_changed_function_outside_tests_gets_its_row(self) -> None:
+        # BM_ALL_CHANGED: 22 changed production files, one with 11 changed functions, one with a nested function and a
+        # nested-class method beside same-named peers, and a changed test: every changed production function has its
+        # row, as the packet prints it, in the packet and the projection, and nothing else is asked.
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            body = lambda count, value: "".join(f"def f{i}():\n    return {value}\n\n\n" for i in range(count))
+            nested = lambda value: (f"def outer():\n    def inner():\n        return {value}\n    return inner\n\n\n"
+                                    f"class Job:\n    class Step:\n        def run(self):\n            return {value}\n\n\n"
+                                    "class Peer:\n    def inner(self):\n        return 0\n\n    def run(self):\n        return 0\n")
+            (repo / "pkg").mkdir()
+            (repo / "pkg" / "many.py").write_text(body(11, 1), encoding="utf-8")
+            (repo / "pkg" / "nested.py").write_text(nested(1), encoding="utf-8")
+            for index in range(20):
+                (repo / "pkg" / f"m&{index}.py").write_text(body(1, 1), encoding="utf-8")
+            (repo / "tests").mkdir()
+            (repo / "tests" / "test_pkg.py").write_text("def test_one():\n    assert 1\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "-A"], cwd=repo)
+            repo_context_forge.run_cmd(["git", "commit", "-qm", "functions"], cwd=repo)
+            (repo / "pkg" / "many.py").write_text(body(11, 2), encoding="utf-8")
+            (repo / "pkg" / "nested.py").write_text(nested(2), encoding="utf-8")
+            for index in range(20):
+                (repo / "pkg" / f"m&{index}.py").write_text(body(1, 2), encoding="utf-8")
+            (repo / "tests" / "test_pkg.py").write_text("def test_one():\n    assert 2\n", encoding="utf-8")
+            result, packet = self.run_public_bootstrap(repo, cache_dir, runtime_home, mode="local")
+            expected = ({f"Function:pkg/many.py:f{i}" for i in range(11)} | {f"Function:pkg/m&amp;{i}.py:f0" for i in range(20)}
+                        | {"Function:pkg/nested.py:inner", "Function:pkg/nested.py:Step.run"})
+            rows = {line.strip() for line in result.stdout.splitlines() if line.startswith("    Function:")}
+            checked = {(entry["kind"], entry.get("resolved_identity")) for entry in packet["gitnexus"]["analysis"]["entries"]}
+            references = {row.splitlines()[0] for row in packet["advisorProjection"]["graph"]["references"]}
+            self.assertEqual((rows, references), (expected, expected), "CHANGED_FUNCTION_ROW_MISSING")
+            self.assertEqual(checked, {(kind, uid.replace("&amp;", "&")) for uid in expected
+                                       for kind in ("symbol_context", "symbol_impact")},
+                             "GRAPH_CALL_OUTSIDE_CHANGED_FUNCTIONS")
+
     def test_pass_start_index_selects_the_candidate_slot(self) -> None:
         """--pass-start-index implies --candidate-slot: a later run of the pass analyzes its own checkout
         and index, leaving the first run's as they were, and the packet names no change-check form."""
@@ -1448,8 +1476,8 @@ raise SystemExit(output_packet(packet, args))
                      packet["gitnexus"]["analysis"]["omitted_check_count"],
                      repo_context_forge.porcelain_status(repo),
                      repo_context_forge.run_git(repo, ["write-tree"])),
-                    (0, expected_tree, expected_tree,
-                     int(name in {"hidden", "deletion", "rename"}), status, index_tree),
+                    # An edit plans only its changed functions: these edits change none, so nothing is omitted.
+                    (0, expected_tree, expected_tree, 0, status, index_tree),
                     "CANDIDATE_GRAPH_OMISSION_ERASED")
 
     def test_public_local_bootstrap_aligns_generated_candidate_exclusions(self) -> None:
@@ -2393,8 +2421,8 @@ raise SystemExit(output_packet(packet, args))
             repo_context_forge.run_git(repo, ["add", "docs/ARCHITECTURE.md"])
             repo_context_forge.run_git(repo, ["commit", "-m", "nested architecture"])
 
-            result, packet = self.run_public_bootstrap(
-                repo, cache_dir, runtime_home, mode="pr", base="HEAD~1")
+            result, packet = self.run_public_intent_bootstrap(
+                repo, cache_dir, runtime_home, intent="Update docs/ARCHITECTURE.md")
             self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
             self.assertNotIn("blocked", packet)
             self.assertTrue(packet["gitnexus"]["required_checks_resolved"])
@@ -2849,6 +2877,40 @@ raise SystemExit(output_packet(packet, args))
 
         self.assertFalse(repo_context_forge.symbol_overlaps(symbol, [(1, 9)]))
         self.assertTrue(repo_context_forge.symbol_overlaps(symbol, [(15, 25)]))
+
+    def test_changed_functions_are_the_innermost_owners_of_changed_lines(self) -> None:
+        # BM_INNERMOST: each changed line belongs to the innermost function or method holding it, named as GitNexus
+        # names it (innermost class only); an outer function's own edit counts beside its inner one's; class-only
+        # lines name none; ranges that change nothing name nothing.
+        symbol = lambda name, kind, line, end: repo_context_forge.Symbol(name, kind, line, end, None, False)
+        symbols = [symbol("Job", "class", 1, 30), symbol("run", "function", 3, 12), symbol("visit", "function", 6, 8),
+                   symbol("Task", "class", 31, 40), symbol("run", "function", 33, 38), symbol("helper", "function", 42, 45),
+                   symbol("Box", "class", 46, 50), symbol("go", "method", 47, 49)]
+        named = lambda ranges: [qualified for _symbol, qualified in repo_context_forge.changed_functions(symbols, ranges)]
+        self.assertEqual(named([(4, 4), (7, 7)]), ["Job.run", "Job.visit"], "OUTER_EDIT_LOST")
+        self.assertEqual(named([(7, 7)]), ["Job.visit"], "NOT_INNERMOST")
+        self.assertEqual(named([(2, 2), (31, 32)]), [], "CLASS_LINE_NAMED_A_FUNCTION")
+        self.assertEqual(named([]), [], "NO_RANGE_NAMED_A_FUNCTION")
+        self.assertEqual(named([(48, 48)]), ["Box.go"], "METHOD_KIND_UNSEEN")
+        self.assertEqual(named([(10, 35), (43, 43)]), ["Job.run", "Task.run", "helper"], "SAME_NAMES_MERGED")
+
+    def test_staged_and_untracked_edits_name_their_changed_functions(self) -> None:
+        # BM_INNERMOST (working tree): staged-only and untracked files are edits too.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "a.py").write_text("def kept():\n    return 1\n\n\ndef staged():\n    return 2\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "src/a.py"], cwd=repo)
+            repo_context_forge.run_cmd(["git", "commit", "-qm", "two"], cwd=repo)
+            (repo / "src" / "a.py").write_text("def kept():\n    return 1\n\n\ndef staged():\n    return 3\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "src/a.py"], cwd=repo)
+            (repo / "src" / "new.py").write_text("def fresh():\n    return 4\n", encoding="utf-8")
+            packet = repo_context_forge.make_packet(
+                repo, mode="local", base_ref="HEAD", head_ref="HEAD", intent=None, top=5,
+                token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET, cache_dir=Path(cache_dir), soulforge_bin=None,
+                map_build="never", map_timeout_ms=1, allow_missing_map=True, gitnexus_repo=None, gitnexus_mode="off")
+            changed = {entry["path"]: [s["qualified_name"] for s in entry["changed_symbols"]] for entry in packet["targets"]}
+            self.assertEqual((changed.get("src/a.py"), changed.get("src/new.py")), (["staged"], ["fresh"]), f"EDIT_UNSEEN {changed}")
 
     def test_remove_nested_symbols_prefers_outer_function(self) -> None:
         outer = repo_context_forge.Symbol(
@@ -3956,7 +4018,7 @@ raise SystemExit(output_packet(packet, args))
                     symbol["name"]
                     for symbol in by_path["tests/test_service.py"]["changed_symbols"]
                 ],
-                ["ServiceTests", "after"],
+                ["test_body", "after"],  # innermost owners; the class still drives ranking below
             )
             self.assertIn(
                 "broad_test_container",
