@@ -108,6 +108,9 @@ class MapBuildResult:
     stderr: str
     warning: str | None
     reason: str | None = None
+    # SoulForge's ranked paths when a render ran or a stored one still applies, else why not.
+    render_paths: list[str] | None = None
+    render_warning: str | None = None
 
 
 # Every SoulForge map column this module reads, by table. A present table missing a
@@ -1006,7 +1009,13 @@ def build_soulforge_map(
     soulforge_bin: str | None,
     build_mode: MapBuildMode,
     timeout_ms: int,
+    *,
+    mentioned: Iterable[str] = (),
+    edited: Iterable[str] = (),
 ) -> MapBuildResult:
+    """Keep the map current and rank it for the task. A binary with `--headless --render-map` builds,
+    refreshes and ranks in one process with no model turn; one without builds through a headless
+    prompt and ranks nothing. A fresh map reuses the stored render of identical inputs."""
     db_path = repo / ".soulforge" / "repomap.db"
     if build_mode == "never":
         return MapBuildResult(False, [], None, "", "", None)
@@ -1014,34 +1023,41 @@ def build_soulforge_map(
     soul_map = SoulForgeMap(repo)
     if build_mode == "auto" and db_path.exists():
         reason = soul_map.stale_reason(run_git(repo, ["rev-parse", "HEAD"], allow_fail=True))
-        if reason is None:
-            return MapBuildResult(False, [], None, "", "", None)
+    fresh = build_mode == "auto" and db_path.exists() and reason is None
     if not soulforge_bin:
-        return MapBuildResult(
-            False,
-            [],
-            None,
-            "",
-            "",
-            "SoulForge binary not found; pass --soulforge-bin or install soulforge",
-            reason,
-        )
-
-    command = [
-        soulforge_bin,
-        "--headless",
-        "--quiet",
-        "--no-render",
-        "--timeout",
-        str(timeout_ms),
-        "Reply exactly: OK",
-    ]
+        if fresh:
+            return MapBuildResult(False, [], None, "", "", None, render_warning="SoulForge binary not found")
+        return MapBuildResult(False, [], None, "", "", "SoulForge binary not found; pass --soulforge-bin or install soulforge",
+                              reason)
+    mentioned, edited = list(mentioned), list(edited)
+    identity = soulforge_identity(repo, soulforge_bin)
+    stored = soul_map.stored_render()
+    if fresh and stored.get("key") == soul_map.render_key(identity, mentioned, edited):
+        return MapBuildResult(False, [], None, "", "", None, render_paths=list(stored["paths"]))
+    # A binary without the flag would take `--render-map` as a prompt and spend a model turn.
+    if stored.get("identity") == identity:
+        supported = stored.get("supported", True)
+    else:
+        probe = run_cmd([soulforge_bin, "--help"], allow_fail=True)
+        supported = "--render-map" in probe.stdout + probe.stderr
+    if fresh and not supported:
+        if stored.get("identity") != identity:
+            soul_map.store_render(identity, "", [], supported=False)
+        return MapBuildResult(False, [], None, "", "", None, render_warning="binary has no --render-map")
+    if supported:
+        command = [soulforge_bin, "--headless", "--render-map",
+                   *(item for path in mentioned for item in ("--mention", path)),
+                   *(item for path in edited for item in ("--edited", path))]
+    else:
+        command = [soulforge_bin, "--headless", "--quiet", "--no-render", "--timeout", str(timeout_ms),
+                   "Reply exactly: OK"]
     if reason == soul_map.SOURCE_SET_CHANGED:
         # SoulForge's incremental rescan refuses to drop more than 80% of its indexed files
         # (measured), so a changed path set is rebuilt from scratch, as every bootstrap did
         # before maps were retained.
         for stale_file in db_path.parent.glob(f"{db_path.name}*"):
             stale_file.unlink()
+    soul_map.render_path.unlink(missing_ok=True)
     proc = run_cmd(command, cwd=repo, allow_fail=True)
     warning = None
     if proc.returncode != 0:
@@ -1050,12 +1066,44 @@ def build_soulforge_map(
         warning = (warning + "; " if warning else "") + f"map DB not found at {db_path}"
     elif proc.returncode == 0:
         soul_map.write_sources()
-    return MapBuildResult(True, command, proc.returncode, proc.stdout, proc.stderr, warning, reason)
+    paths, render_warning = None, None if supported else "binary has no --render-map"
+    if not supported:
+        soul_map.store_render(identity, "", [], supported=False)
+    if supported:
+        try:
+            document = json.loads(proc.stdout) if not warning else None
+        except ValueError:
+            document = None
+        if isinstance(document, dict) and isinstance(document.get("paths"), list):
+            paths = [str(path) for path in document["paths"]]
+            soul_map.store_render(identity, soul_map.render_key(identity, mentioned, edited), paths)
+        else:
+            render_warning = warning or "render output has no paths"
+    if fresh:
+        return MapBuildResult(False, command, proc.returncode, "", proc.stderr, None, None, paths, render_warning)
+    return MapBuildResult(True, command, proc.returncode, "" if supported else proc.stdout, proc.stderr,
+                          warning, reason, paths, render_warning)
+
+
+def soulforge_identity(repo: Path, soulforge_bin: str) -> list[str]:
+    """What a render depends on besides the map and its inputs: the binary, the bundle a `dist`
+    launcher runs, and SoulForge's effective configuration (global and project config.json)."""
+    binary = Path(shutil.which(soulforge_bin) or soulforge_bin).resolve()
+    identity = [os.environ.get("SOULFORGE_NO_REPOMAP", "")]
+    for path in (binary, binary.parent / "index.js", Path.home() / ".soulforge" / "config.json",
+                 repo / ".soulforge" / "config.json"):
+        try:
+            stat = path.stat()
+            identity.append(f"{path}:{stat.st_size}:{stat.st_mtime_ns}")
+        except OSError:
+            identity.append(f"{path}:-")
+    return identity
 
 
 class SoulForgeMap:
     SOURCE_SET_CHANGED = "source files were added or removed since the map was built"
     SOURCES_FILE = "soulforge-map-sources"
+    RENDER_FILE = "soulforge-render.json"
 
     def __init__(
         self,
@@ -1068,6 +1116,8 @@ class SoulForgeMap:
         # The source path set the map was built from: an added or deleted file changes
         # neither HEAD nor any indexed mtime, so it is the third freshness input.
         self.sources_path = repo / workflow_index.INDEX_DIR / self.SOURCES_FILE
+        # The last render's paths, keyed by everything they depend on; any SoulForge run removes it.
+        self.render_path = repo / workflow_index.INDEX_DIR / self.RENDER_FILE
         self._graph: tuple[dict[str, int], dict[int, str], list[tuple[int, int, float]]] | None = None
         self._schema_verified = False
         self._read_error: str | None = None
@@ -1140,6 +1190,22 @@ class SoulForgeMap:
             }
         except ValueError:
             return None
+
+    def render_key(self, identity: list[str], mentioned: list[str], edited: list[str]) -> str:
+        """The binary and configuration, the personalization inputs, and the map's source record."""
+        sources = self.sources_path.read_text(encoding="utf-8") if self.sources_path.is_file() else None
+        return hashlib.sha256(json.dumps([identity, mentioned, edited, sources]).encode()).hexdigest()
+
+    def stored_render(self) -> dict[str, object]:
+        try:
+            stored = json.loads(self.render_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return stored if isinstance(stored, dict) and isinstance(stored.get("paths"), list) else {}
+
+    def store_render(self, identity: list[str], key: str, paths: list[str], *, supported: bool = True) -> None:
+        self.render_path.parent.mkdir(parents=True, exist_ok=True)
+        self.render_path.write_text(json.dumps({"identity": identity, "key": key, "paths": paths, "supported": supported}), encoding="utf-8")
 
     def stale_reason(self, head_sha: str) -> str | None:
         """Why an existing map no longer describes the checkout, or None when it does:
@@ -1643,31 +1709,6 @@ class SoulForgeMap:
             ).fetchall()
         return [{"path": str(row["path"]), "count": int(row["count"])} for row in rows]
 
-    def render(
-        self, soulforge_bin: str, *, mentioned: Iterable[str], edited: Iterable[str],
-    ) -> tuple[dict[str, object] | None, list[str], str | None]:
-        """SoulForge's own ranked map for this checkout (`--headless --render-map`, Empryo >= the
-        fork's render-map PR): the parsed {paths, content, stats} document, the command, and the
-        reason when unavailable. A binary without the flag would treat it as a prompt and spend a
-        model turn, so support is checked through `--help` first."""
-        probe = run_cmd([soulforge_bin, "--help"], allow_fail=True)
-        if "--render-map" not in probe.stdout + probe.stderr:
-            return None, [], "binary has no --render-map"
-        command = [soulforge_bin, "--headless", "--render-map"]
-        for flag, paths in (("--mention", mentioned), ("--edited", edited)):
-            for path in paths:
-                command += [flag, path]
-        proc = run_cmd(command, cwd=self.repo, allow_fail=True)
-        if proc.returncode != 0:
-            return None, command, f"SoulForge exited with {proc.returncode}"
-        try:
-            document = json.loads(proc.stdout)
-        except ValueError:
-            return None, command, "render output is not JSON"
-        if not isinstance(document, dict) or not isinstance(document.get("paths"), list):
-            return None, command, "render output has no paths"
-        return document, command, None
-
     def symbol_calls(self, path: str, symbol: Symbol) -> dict[str, list[dict[str, str]]]:
         """Callers and callees of `symbol` in `path`, from the calls table. The map's symbol is the
         same-named one whose line lies in `symbol`'s span: the native index starts a decorated
@@ -1820,7 +1861,6 @@ def rank_target_entry(
         score += 300
     if isinstance(graph_neighbors, list) and graph_neighbors:
         signals.append("graph_neighbor")
-        reasons.append("has import/reference graph neighbors in SoulForge map")
         score += 90
     if isinstance(cochanges, list) and cochanges:
         signals.append("cochange_partner")
@@ -2162,15 +2202,15 @@ def make_target_entries(
     return sorted(target_entries, key=target_entry_sort_key)
 
 
-def apply_soulforge_render(target_entries: list[dict[str, object]], document: dict[str, object]) -> None:
+def apply_soulforge_render(target_entries: list[dict[str, object]], paths: list[str]) -> None:
     """SoulForge's ranking onto the packet's target entries: `render_rank` is the file's index in
     the render's paths; files it did not render follow, in their current order."""
-    paths = [str(path) for path in document["paths"]]
+    ranks = {path: rank for rank, path in reversed(list(enumerate(paths)))}
     unrendered = len(paths)
     for entry in target_entries:
         path = str(entry["path"])
-        if path in paths:
-            entry["render_rank"] = paths.index(path)
+        if path in ranks:
+            entry["render_rank"] = ranks[path]
         else:
             entry["render_rank"] = unrendered
             unrendered += 1
@@ -2841,23 +2881,33 @@ def make_packet(
         raise RuntimeError("packet analysis checkout must be cache-owned")
     require_cache_path(target_state.analysis_repo, cache_dir)
     gitignore_dirty_before_build = ".gitignore" in dirty_paths(target_state.analysis_repo)
-    build_result = build_soulforge_map(
-        target_state.analysis_repo,
-        soulforge_bin,
-        map_build,
-        map_timeout_ms,
-    )
-    can_cleanup_analysis = target_state.analysis_repo.resolve() != target_state.source_repo.resolve()
-    if can_cleanup_analysis and (mode == "pr" or not gitignore_dirty_before_build):
-        cleanup_soulforge_gitignore_change(target_state.analysis_repo)
     native_index = workflow_index.WorkflowIndex(target_state.analysis_repo, file_role)
     native_index.ensure_current(
         source_worktree_files(target_state.analysis_repo),
         head_sha=target_state.head_sha,
         dirty_overlay=target_state.target_dirty,
         summary_for_symbol=synthetic_symbol_summary,
-        reuse=not target_state.source_dirty and not target_state.target_dirty,
+        tree=expected_candidate_tree,
     )
+    source_git_state = read_git_state(target_state.source_repo, base_ref, head_ref)
+    reference_only = reference_only_prefixes(target_state.source_repo)
+    intent_resolution = (
+        native_index.resolve_intent(intent or "")
+        if mode == "intent" else workflow_index.IntentResolution((), (), (), ())
+    )
+    # Intent and local packets rank their targets with SoulForge's render of the task's files.
+    ranked = mode in {"intent", "local"}
+    build_result = build_soulforge_map(
+        target_state.analysis_repo,
+        soulforge_bin,
+        map_build,
+        map_timeout_ms,
+        mentioned=[item.path for item in intent_resolution.file_evidence if item.exact_file] if mode == "intent" else [],
+        edited=selected_files(source_git_state, "dirty") if ranked else [],
+    )
+    can_cleanup_analysis = target_state.analysis_repo.resolve() != target_state.source_repo.resolve()
+    if can_cleanup_analysis and (mode == "pr" or not gitignore_dirty_before_build):
+        cleanup_soulforge_gitignore_change(target_state.analysis_repo)
     soul_map = SoulForgeMap(target_state.analysis_repo, native_index)
     # Standalone analyze stays SoulForge-strict; Codex bootstrap explicitly opts into native fallback.
     if not soul_map.available and not allow_missing_map:
@@ -2870,13 +2920,6 @@ def make_packet(
         build_result,
         soul_map,
         cache_dir,
-    )
-
-    source_git_state = read_git_state(target_state.source_repo, base_ref, head_ref)
-    reference_only = reference_only_prefixes(target_state.source_repo)
-    intent_resolution = (
-        native_index.resolve_intent(intent or "")
-        if mode == "intent" else workflow_index.IntentResolution((), (), (), ())
     )
     excluded_required = tuple(match for match in intent_resolution.required_symbols if is_reference_only_path(match.path, reference_only))
     if excluded_required:
@@ -2913,19 +2956,16 @@ def make_packet(
         intent_resolution=intent_resolution,
     )
     render_state: dict[str, object] = {"attempted": False, "command": [], "warning": None}
-    if mode in {"intent", "local"} and map_build != "never" and soul_map.available and soulforge_bin:
+    if ranked and map_build != "never":
         render_state["attempted"] = True
-        mentioned = [item.path for item in intent_resolution.file_evidence if item.exact_file] if mode == "intent" else []
-        document, render_state["command"], render_warning = soul_map.render(
-            soulforge_bin, mentioned=mentioned, edited=selected_files(source_git_state, "dirty"))
-        if document is None:
-            render_state["warning"] = f"SoulForge render unavailable: {render_warning}"
+        if "--render-map" in build_result.command:
+            render_state["command"] = build_result.command
+        if build_result.render_paths is None:
+            render_state["warning"] = "SoulForge render unavailable: " + (
+                build_result.render_warning or ("SoulForge binary not found" if soul_map.available else "no map"))
         else:
-            apply_soulforge_render(target_entries, document)
+            apply_soulforge_render(target_entries, build_result.render_paths)
             target_entries.sort(key=target_entry_sort_key)
-    elif mode in {"intent", "local"} and map_build != "never":
-        render_state["warning"] = "SoulForge render unavailable: " + (
-            "no map" if not soul_map.available else "SoulForge binary not found")
     target_entries = apply_task_state_to_entries(target_entries, task_state)
     coverage_plan = build_coverage_plan(target_entries)
     gitnexus_status = gitnexus_analysis.ensure_index(
@@ -2951,7 +2991,10 @@ def make_packet(
         unavailable_targets, gitnexus_repo_name, intent_mode=mode == "intent")
     unavailable_checks = [item for item in unavailable_plan if item.get("required") is True]
     # One graph process ranks the plan's candidates and answers every planned check.
-    with gitnexus_analysis.GraphSession(gitnexus_repo_name) as graph:
+    with gitnexus_analysis.GraphSession(
+            gitnexus_repo_name, store=target_state.analysis_repo / workflow_index.INDEX_DIR / "gitnexus-answers.json",
+            generation=str(gitnexus_status.get("index_generation") or ""),
+    ) as graph:
         plan, omitted_check_count, omitted_required_checks = build_gitnexus_plan(
             graph_targets, gitnexus_repo_name, intent_mode=mode == "intent",
             rank=functools.partial(gitnexus_analysis.rank_symbols, graph)
@@ -3442,10 +3485,9 @@ def render_required_intake(packet: dict[str, object]) -> str:
             f"elapsed_ms={analysis.get('elapsed_ms') or 0}"
         )
     if gitnexus.get("status") in ("fresh", "reindexed"):
-        # GitNexus's own tool and argument names, as a lead calls them; identities come from the analysis rows.
+        # GitNexus's own tool and argument names, as a lead calls them; when to call is the lead's rules'.
         lines.append(
-            "gitnexus_calls: before editing a symbol, impact on it even when a row shows it; after edits, "
-            "detect_changes; use these exact forms, with no tool lookup; fill <...>; "
+            "gitnexus_calls: use these exact forms, with no tool lookup; fill <...>; "
             "each result is JSON text at content[0].text"
         )
         lines.extend(
@@ -3453,12 +3495,10 @@ def render_required_intake(packet: dict[str, object]) -> str:
             + json.dumps({"repo": gitnexus.get("repo"), **arguments}, separators=(",", ":"))
             + note
             for tool, arguments, note in (
-                ("impact", {"uid": "<resolved_identity of a row>", "direction": "upstream", "includeTests": True}, ""),
+                ("impact", {"target": "<symbol name>", "direction": "<upstream|downstream>", "includeTests": True}, ""),
                 ("cypher",
                  {"query": "MATCH (a)-[:CodeRelation {type: 'CALLS'}]->(b {id: '<resolved_identity of a row>'}) RETURN a.id"},
                  " callers; reverse the arrow for callees"),
-                ("detect_changes", {"repo": gitnexus.get("baseline_repo") or gitnexus.get("repo"),
-                                    "worktree": packet.get("repo")}, ""),
             )
         )
     packet_gaps = packet.get("coverage_gaps")

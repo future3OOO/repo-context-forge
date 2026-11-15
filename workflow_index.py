@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import html
 import os
 import re
@@ -143,6 +144,7 @@ class WorkflowIndex:
         head_sha: str,
         dirty_overlay: bool = False,
         summary_for_symbol: SummaryForSymbol,
+        tree: str = "",
     ) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
@@ -203,6 +205,7 @@ class WorkflowIndex:
                         ("schema_version", str(SCHEMA_VERSION)),
                         ("head_sha", head_sha),
                         ("dirty_overlay", str(dirty_overlay).lower()),
+                        ("tree", tree),
                     ],
                 )
             os.replace(temporary_path, self.db_path)
@@ -248,13 +251,15 @@ class WorkflowIndex:
             result["warning"] = self._read_warning
         return result
 
-    def is_reusable(self, head_sha: str) -> bool:
+    def is_reusable(self, tree: str, head_sha: str, dirty_overlay: bool) -> bool:
+        """The index was built from exactly `tree`, the candidate tree of the checkout's files, at
+        this head and overlay state."""
         status = self.status()
-        return (
-            status.get("available") is True
-            and status.get("head_sha") == head_sha
-            and status.get("dirty_overlay") is False
-        )
+        if not tree or status.get("available") is not True or (status.get("head_sha"), status.get("dirty_overlay")) != (
+                head_sha, dirty_overlay):
+            return False
+        with self._open() as conn:
+            return conn.execute("SELECT value FROM metadata WHERE key = 'tree'").fetchone() == (tree,)
 
     def ensure_current(
         self,
@@ -263,15 +268,16 @@ class WorkflowIndex:
         head_sha: str,
         dirty_overlay: bool,
         summary_for_symbol: SummaryForSymbol,
-        reuse: bool,
+        tree: str,
     ) -> None:
-        if reuse and self.is_reusable(head_sha):
+        if self.is_reusable(tree, head_sha, dirty_overlay):
             return
         self.build(
             paths,
             head_sha=head_sha,
             dirty_overlay=dirty_overlay,
             summary_for_symbol=summary_for_symbol,
+            tree=tree,
         )
 
     def ranked_files(self, limit: int) -> list[IndexedFile]:
@@ -484,10 +490,9 @@ class WorkflowIndex:
             if summary_text == synthetic_symbol_summary(str(path), str(name), str(kind)):
                 summary_text = " ".join(identifier_words(str(name))) or str(name)
             haystack = f"{name}".lower() + " " + summary_text.lower()
-            matched = tuple(
-                term for term in terms
-                if re.search(rf"\b{re.escape(term)}\b", haystack)
-            )
+            # A term is all word characters, so `\bterm\b` matches exactly when it is a whole word.
+            words = set(re.findall(r"\w+", haystack))
+            matched = tuple(term for term in terms if term in words)
             if matched:
                 relevance.append(IntentSymbolRelevance(
                     path=str(path),
@@ -516,11 +521,12 @@ class WorkflowIndex:
             path = str(path)
             matched_terms = []
             score = float(base_score)
+            words = set(re.findall(r"\w+", str(search_terms)))
             for token, singular in forms:
-                if re.search(rf"\b{re.escape(token)}\b", str(search_terms)):
+                if token in words:
                     matched_terms.append(token)
                     score += 45
-                elif singular and re.search(rf"\b{re.escape(singular)}\b", str(search_terms)):
+                elif singular and singular in words:
                     matched_terms.append(token)
                     score += 35
             exact_file = path in exact_files
@@ -719,6 +725,9 @@ class WorkflowIndex:
                         string_spans.append((token.start, token.end))
             except (IndentationError, tokenize.TokenError):
                 pass
+        # Tokens arrive in source order and never overlap, so the one span that could hold a
+        # position is the last to start at or before it.
+        span_starts = [start for start, _end in string_spans]
         for line_number, raw_line in enumerate(lines, start=1):
             line = raw_line.rstrip("\r\n")
             for kind, pattern in patterns:
@@ -726,7 +735,8 @@ class WorkflowIndex:
                 if not match:
                     continue
                 match_start = (line_number, match.start(1))
-                if any(start <= match_start < end for start, end in string_spans):
+                span = bisect.bisect_right(span_starts, match_start) - 1
+                if span >= 0 and match_start < string_spans[span][1]:
                     continue
                 if kind == "arrow" and not WorkflowIndex._is_arrow_initializer(
                     content, offset + match.end() - 1

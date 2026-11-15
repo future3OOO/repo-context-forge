@@ -1179,21 +1179,40 @@ raise SystemExit(output_packet(packet, args))
             result, _packet = self.candidate_lock_run(False, repo, cache_dir, runtime_home)
             self.assertEqual(result.returncode, 0, marker + result.stderr[-400:])
 
-    def test_a_later_packet_compares_with_the_pass_start_index(self) -> None:
-        """A later run bound to the pass's first index prints that index in its change check while the
-        index is still the one receipted for the first tree, and its own index otherwise."""
-        marker = "LATER_CHANGE_CHECK_LOST_THE_PASS_START"
+    def test_an_unchanged_index_answers_a_rerun_without_graph_calls(self) -> None:
+        # BM_GRAPH_RESULT_REUSE: a rerun of the same candidate and index asks GitNexus nothing and
+        # carries the same rows; an edit re-indexes and asks again.
+        marker = "GRAPH_ANSWERS_NOT_REUSED"
+        with self.public_intent_repo() as (repo, cache_dir, runtime_home):
+            (repo / "src" / "a.py").write_text("def helper():\n    return 1\n\n\ndef caller():\n    return helper()\n",
+                                               encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "commit", "-qam", "calls"], cwd=repo)
+            settle = lambda value: (sorted((settle(item) for item in value), key=json.dumps) if isinstance(value, list)
+                                    else {key: settle(item) for key, item in value.items()} if isinstance(value, dict) else value)
+            rows = lambda packet: settle(packet["gitnexus"]["analysis"]["entries"])  # GitNexus lists come in any order
+            _result, first = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent="Update caller in src/a.py")
+            _result, again = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent="Update caller in src/a.py")
+            self.assertGreater(first["gitnexus"]["analysis"]["graph_call_count"], 0, "fixture precondition")
+            self.assertEqual((again["gitnexus"]["analysis"]["graph_call_count"], rows(again)), (0, rows(first)), marker)
+            (repo / "src" / "a.py").write_text("def helper():\n    return 2\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "commit", "-qam", "edit"], cwd=repo)
+            _result, edited = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home, intent="Update helper in src/a.py")
+            self.assertGreater(edited["gitnexus"]["analysis"]["graph_call_count"], 0, marker)
+
+    def test_pass_start_index_selects_the_candidate_slot(self) -> None:
+        """--pass-start-index implies --candidate-slot: a later run of the pass analyzes its own checkout
+        and index, leaving the first run's as they were, and the packet names no change-check form."""
+        marker = "PASS_START_INDEX_LOST_THE_CANDIDATE_SLOT"
         with self.public_intent_repo() as (repo, cache_dir, runtime_home):
             _result, first = self.run_public_intent_bootstrap(repo, cache_dir, runtime_home)
             start = (first["gitnexus"]["repo"], first["gitnexus"]["indexed_candidate_tree"])
             (repo / "src" / "a.py").write_text("print('edited')\n", encoding="utf-8")
-            for tree, named in ((start[1], start[0]), ("0" * 40, None)):
-                result, later = self.run_public_bootstrap(
-                    repo, cache_dir, runtime_home, mode="local", pass_start_index=(start[0], tree))
-                self.assertEqual(result.returncode, 0, marker + result.stderr[-400:])
-                self.assertEqual(later["gitnexus"].get("baseline_repo"), named, marker)
-                self.assertIn('detect_changes {"repo":"%s"' % (named or later["gitnexus"]["repo"]),
-                              result.stdout, marker)
+            result, later = self.run_public_bootstrap(
+                repo, cache_dir, runtime_home, mode="local", pass_start_index=start)
+            self.assertEqual(result.returncode, 0, marker + result.stderr[-400:])
+            self.assertNotEqual(later["target_state"]["analysis_repo"], first["target_state"]["analysis_repo"], marker)
+            self.assertNotEqual(later["gitnexus"]["repo"], start[0], marker)
+            self.assertNotIn("mcp__gitnexus__detect_changes", result.stdout, marker)
 
     def test_one_candidate_slot_serves_every_mode_a_pass_reruns_in(self) -> None:
         """A pass reruns in a different mode as its tree goes clean to dirty. The
@@ -3603,12 +3622,35 @@ raise SystemExit(output_packet(packet, args))
                 head_sha=head_sha,
                 dirty_overlay=False,
                 summary_for_symbol=repo_context_forge.synthetic_symbol_summary,
-                reuse=True,
+                tree=repo_context_forge.candidate_tree(repo),
             )
 
             symbol = native_index.file_symbols("src/a.py", 1)[0]
             self.assertEqual((symbol.line, symbol.end_line), (1, 2))
             self.assertEqual(native_index.status()["schema_version"], 8)
+
+    def test_workflow_index_reuses_an_unchanged_dirty_candidate(self) -> None:
+        # BM_NATIVE_TREE_REUSE: a rerun of the same dirty candidate reuses the index; an edit rebuilds it.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_git_repo(repo)
+            (repo / "src" / "a.py").write_text("def dirty_one():\n    return 1\n", encoding="utf-8")
+
+            def packet() -> tuple[dict[str, object], int]:
+                result = repo_context_forge.make_packet(
+                    repo, mode="local", base_ref="HEAD", head_ref="HEAD", intent=None, top=5,
+                    token_budget=repo_context_forge.DEFAULT_TOKEN_BUDGET, cache_dir=Path(cache_dir),
+                    soulforge_bin=None, map_build="never", map_timeout_ms=1, allow_missing_map=True,
+                    gitnexus_repo=None, gitnexus_mode="off")
+                return result, Path(result["workflow_index"]["db_path"]).stat().st_ino
+
+            first, built = packet()
+            again, reused = packet()
+            self.assertEqual((reused, again["workflow_index"]), (built, first["workflow_index"]), "DIRTY_INDEX_REBUILT")
+            (repo / "src" / "a.py").write_text("def dirty_two():\n    return 2\n", encoding="utf-8")
+            edited, rebuilt = packet()
+            self.assertNotEqual(rebuilt, built, "EDITED_INDEX_REUSED")
+            self.assertIn("dirty_two", json.dumps(edited["targets"]), "EDITED_INDEX_REUSED")
 
     def test_workflow_index_corrupt_database_fails_closed_for_all_readers(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir:
@@ -4068,21 +4110,15 @@ raise SystemExit(output_packet(packet, args))
         self.assertNotIn("gitnexus_tool_discovery", rendered)
         self.assertNotIn("tool_search", rendered)
         self.assertIn(
-            "gitnexus_calls: before editing a symbol, impact on it even when a row shows it; after edits, "
-            "detect_changes; use these exact forms, with no tool lookup; fill <...>; "
+            "gitnexus_calls: use these exact forms, with no tool lookup; fill <...>; "
             "each result is JSON text at content[0].text\n"
             "- mcp__gitnexus__impact "
-            '{"repo":"analysis-repo","uid":"<resolved_identity of a row>","direction":"upstream","includeTests":true}\n'
+            '{"repo":"analysis-repo","target":"<symbol name>","direction":"<upstream|downstream>","includeTests":true}\n'
             """- mcp__gitnexus__cypher {"repo":"analysis-repo","query":"MATCH (a)-[:CodeRelation {type: 'CALLS'}]->"""
-            """(b {id: '<resolved_identity of a row>'}) RETURN a.id"} callers; reverse the arrow for callees\n"""
-            '- mcp__gitnexus__detect_changes {"repo":"analysis-repo","worktree":"/work/service"}\n',
+            """(b {id: '<resolved_identity of a row>'}) RETURN a.id"} callers; reverse the arrow for callees\n""",
             rendered,
         )
-        packet["gitnexus"]["baseline_repo"] = "pass-start-repo"
-        self.assertIn(
-            '- mcp__gitnexus__detect_changes {"repo":"pass-start-repo","worktree":"/work/service"}\n',
-            repo_context_forge.render_required_intake(packet),
-        )
+        self.assertNotIn("detect_changes", rendered.split("architecture_summary:")[0])
         self.assertIn("architecture_summary:", rendered)
         self.assertIn("- roles | production=1,test=1", rendered)
         self.assertIn(
@@ -4600,6 +4636,14 @@ raise SystemExit(output_packet(packet, args))
         repo_context_forge.run_cmd(["git", "add", "tools/b.py"], cwd=root)
         repo_context_forge.run_cmd(["git", "commit", "-q", "-m", "importer"], cwd=root)
 
+    def incomplete_map(self, repo: Path) -> Path:
+        """The map a successful headless prompt leaves with the map disabled: a schema, no cochanges_head."""
+        repo_context_forge.run_cmd(
+            [self.real_soulforge(), "--headless", "--quiet", "--no-render", "--timeout", "1", "Reply exactly: OK"],
+            cwd=repo, env={**os.environ, "SOULFORGE_NO_REPOMAP": "1"}, allow_fail=True)
+        repo_context_forge.SoulForgeMap(repo).write_sources()  # as the build that exited 0 records it
+        return repo / ".soulforge" / "repomap.db"
+
     def build_real_map(self, repo: Path, build_mode: str = "always") -> tuple[str, Path, repo_context_forge.MapBuildResult]:
         """Build `repo`'s map with the real SoulForge binary; returns (binary, db_path, result)."""
         binary = self.real_soulforge()
@@ -4892,8 +4936,7 @@ raise SystemExit(output_packet(packet, args))
             repo = Path(repo_dir)
             self.make_import_repo(repo)
             head = repo_context_forge.run_git(repo, ["rev-parse", "HEAD"])
-            with patch.dict(os.environ, {"SOULFORGE_NO_REPOMAP": "1"}):
-                binary, db_path, _ = self.build_real_map(repo)
+            binary, db_path = self.real_soulforge(), self.incomplete_map(repo)
             self.assertEqual(
                 self.map_rows(db_path, "SELECT (SELECT COUNT(*) FROM files), "
                                        "(SELECT COUNT(*) FROM sqlite_master WHERE name = 'meta')"),
@@ -4953,8 +4996,8 @@ raise SystemExit(output_packet(packet, args))
             self.make_git_repo(repo)
             binary = self.real_soulforge()
             state = repo_context_forge.ensure_repo_analysis_checkout(repo, "HEAD", Path(cache_dir))
-            with patch.dict(os.environ, {"SOULFORGE_NO_REPOMAP": "1"}):
-                build = repo_context_forge.build_soulforge_map(state.analysis_repo, binary, "always", 1)
+            self.incomplete_map(state.analysis_repo)
+            build = repo_context_forge.build_soulforge_map(state.analysis_repo, binary, "never", 1)
             metadata = repo_context_forge.soulforge_target_metadata(
                 state, build, repo_context_forge.SoulForgeMap(state.analysis_repo), Path(cache_dir))
             self.assertEqual(metadata["status"], "stale", "STALE_STATUS_MISSING")
@@ -5042,6 +5085,79 @@ raise SystemExit(output_packet(packet, args))
             self.assertTrue(next(entry for entry in packet["targets"] if entry["path"] == "tools/leaf.py")["intent_required_file"],
                             "RENDER_ORDER_NOT_APPLIED: required mark lost")
 
+    def test_render_map_is_the_build_and_identical_inputs_reuse_it(self) -> None:
+        # BM_RENDER_IS_THE_BUILD: one SoulForge process builds and ranks; a fresh map with identical
+        # inputs starts none; a changed mention renders again; a changed SoulForge config re-probes
+        # support and ranks as the binary itself does under that config.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
+            repo, binary = Path(repo_dir), self.real_soulforge()
+            self.make_calls_repo(repo)
+            commands: list[list[str]] = []
+            original = repo_context_forge.run_cmd
+
+            def recording(args, **kwargs):
+                commands.append(list(args))
+                return original(args, **kwargs)
+
+            def soulforge_runs(intent: str) -> tuple[dict[str, object], list[list[str]]]:
+                commands.clear()
+                repo_context_forge.run_cmd = recording
+                try:
+                    packet = self.packet_with_real_map(repo, cache_dir, intent)
+                finally:
+                    repo_context_forge.run_cmd = original
+                return packet, [command[1:] for command in commands if command[0] == binary]
+
+            ranks = lambda packet: {entry["path"]: entry.get("render_rank") for entry in packet["targets"]}
+            first, runs = soulforge_runs("update tools/leaf.py")
+            self.assertEqual(runs, [["--help"], ["--headless", "--render-map", "--mention", "tools/leaf.py"]],
+                             "RENDER_NOT_THE_BUILD")
+            self.assertTrue(all(rank is not None for rank in ranks(first).values()), "RENDER_NOT_THE_BUILD")
+            second, runs = soulforge_runs("update tools/leaf.py")
+            self.assertEqual((runs, ranks(second)), ([], ranks(first)), "IDENTICAL_RENDER_NOT_REUSED")
+            third, runs = soulforge_runs("update src/a.py")
+            self.assertEqual(runs, [["--headless", "--render-map", "--mention", "src/a.py"]], "CHANGED_MENTION_NOT_RENDERED")
+            analysis_repo = Path(third["target_state"]["analysis_repo"])
+            (analysis_repo / ".soulforge" / "config.json").write_text('{"repoMapTokenBudget": 20}', encoding="utf-8")
+            fourth, runs = soulforge_runs("update src/a.py")
+            self.assertEqual(runs, [["--help"], ["--headless", "--render-map", "--mention", "src/a.py"]],
+                             "CHANGED_CONFIG_NOT_RENDERED")
+            rendered = self.real_render(analysis_repo, "--mention", "src/a.py")["paths"]
+            self.assertEqual({path: rank for path, rank in ranks(fourth).items() if path in rendered},
+                             {path: rendered.index(path) for path in ranks(fourth) if path in rendered},
+                             "CHANGED_CONFIG_NOT_RENDERED")
+            self.assertNotEqual(rendered, self.real_render(analysis_repo, "--mention", "src/a.py", "--map-budget", "4000")["paths"],
+                                "fixture precondition: the config budget changes nothing")
+
+    def test_render_ranks_only_intent_and_local_packets_with_a_map(self) -> None:
+        # BM_UNRANKED_MODES: a repo-mode packet is not ranked by the render and does not warn about it;
+        # an intent packet whose map was not built ranks nothing and says why.
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
+            repo = Path(repo_dir)
+            self.make_calls_repo(repo)
+            packet = self.packet_with_real_map(repo, cache_dir, "", mode="repo")
+            self.assertTrue(packet["targets"] and packet["soulforge"]["stats"]["available"], "fixture precondition")
+            self.assertEqual((packet["soulforge"]["render"]["attempted"], [w for w in packet["warnings"] if "render" in w],
+                              [entry.get("render_rank") for entry in packet["targets"] if entry.get("render_rank") is not None]),
+                             (False, [], []), "UNRANKED_MODE_RANKED")
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home(), \
+                patch.dict(os.environ, {"SOULFORGE_NO_REPOMAP": "1"}):
+            repo = Path(repo_dir)
+            self.make_calls_repo(repo)
+            packet = self.packet_with_real_map(repo, cache_dir, "update tools/leaf.py")
+            self.assertTrue(packet["targets"], "fixture precondition")
+            self.assertTrue(all(entry.get("render_rank") is None for entry in packet["targets"]), "MAPLESS_PACKET_RANKED")
+            self.assertTrue(any(w.startswith("SoulForge render unavailable: ") for w in packet["warnings"]),
+                            f"MAPLESS_PACKET_RANKED: {packet['warnings']}")
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir:
+            repo = Path(repo_dir)
+            self.make_calls_repo(repo)
+            packet = self.packet_with_real_map(repo, cache_dir, "update tools/leaf.py", soulforge_bin=None)
+            self.assertFalse(packet["soulforge"]["stats"]["available"], "fixture precondition: a map exists")
+            self.assertEqual(([entry.get("render_rank") for entry in packet["targets"] if entry.get("render_rank") is not None],
+                              [w for w in packet["warnings"] if w.startswith("SoulForge render unavailable")]),
+                             ([], ["SoulForge render unavailable: no map"]), "MAPLESS_PACKET_RANKED")
+
     def test_local_targets_pass_dirty_files_as_edited(self) -> None:
         # BM_RENDER_MENTION (edited half): dirty files reach the render as --edited.
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
@@ -5089,6 +5205,18 @@ raise SystemExit(output_packet(packet, args))
                               f"RENDER_UNSUPPORTED_NOT_HANDLED {binary}")
                 self.assertNotIn("--render-map", packet["soulforge"]["render"]["command"],
                                  "RENDER_UNSUPPORTED_NOT_HANDLED: render attempted")
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as cache_dir, self.soulforge_home():
+            # BM_LEGACY_COLD_BUILD: with no map, the legacy binary builds it through the headless prompt.
+            repo = Path(repo_dir)
+            self.make_calls_repo(repo)
+            packet = self.packet_with_real_map(repo, cache_dir, "update tools/leaf.py", soulforge_bin=legacy)
+            build = packet["soulforge"]["build"]
+            self.assertEqual((build["attempted"], build["command"][1:], build["returncode"]),
+                             (True, ["--headless", "--quiet", "--no-render", "--timeout", "1", "Reply exactly: OK"], 0),
+                             f"LEGACY_COLD_BUILD_CHANGED: {build}")
+            self.assertTrue(packet["soulforge"]["stats"]["available"], "LEGACY_COLD_BUILD_CHANGED: no map")
+            self.assertIn("SoulForge render unavailable: binary has no --render-map", packet["warnings"],
+                          "LEGACY_COLD_BUILD_CHANGED")
 
     def test_killed_render_falls_back_then_recovers(self) -> None:
         # BM_RENDER_FAILED
