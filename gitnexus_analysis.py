@@ -186,24 +186,6 @@ def _accept_fresh(status: dict[str, object]) -> bool:
     return True
 
 
-def receipted_commit(
-    repo_name: str,
-    candidate_tree: str,
-    *,
-    run_command: RunCommand,
-    registry_path: Path = GITNEXUS_REGISTRY,
-) -> str | None:
-    """The indexed commit of `repo_name` while its current index is the one a packet run receipted
-    for `candidate_tree`; None once anything has re-indexed it."""
-    for entry in _read_registry(registry_path):
-        if entry.get("name") == repo_name:
-            commit = str(entry.get("lastCommit") or "")
-            status = _status_from_entry(
-                entry, Path(str(entry.get("path") or "")), commit, candidate_tree, repo_name, run_command)
-            return commit if status["index_fresh"] else None
-    return None
-
-
 def ensure_index(
     analysis_repo: Path,
     expected_head: str,
@@ -433,7 +415,8 @@ class GraphSession:
     writes a reply over its 16 KB bound to a results directory under HOME and prunes that
     directory, which must not be the user's. Such a reply is read whole from its file."""
 
-    def __init__(self, repo: str, gitnexus_bin: str | None = None) -> None:
+    def __init__(self, repo: str, gitnexus_bin: str | None = None, *, store: Path | None = None,
+                 generation: str = "") -> None:
         self.repo = repo
         self.binary = gitnexus_bin or shutil.which("gitnexus")
         self.calls = self.processes = self.output_bytes = 0
@@ -443,6 +426,20 @@ class GraphSession:
         self._stderr: TextIO | None = None
         self._pending = b""
         self._ident = 0
+        # Answers already given for this index generation: an index answers a request the same way
+        # until it is rebuilt, so a rerun of an unchanged candidate asks nothing again.
+        self._store = store if generation and self.binary else None
+        binary = Path(self.binary).resolve() if self._store else None
+        self._store_key = [repo, generation, f"{binary}:{binary.stat().st_mtime_ns}"] if binary else []
+        self._answers: dict[str, dict[str, object]] = {}
+        self._answers_added = False
+        if self._store:
+            try:
+                stored = json.loads(self._store.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                stored = None
+            if isinstance(stored, dict) and stored.get("key") == self._store_key and isinstance(stored.get("answers"), dict):
+                self._answers = stored["answers"]
 
     def __enter__(self) -> GraphSession:
         return self
@@ -452,6 +449,10 @@ class GraphSession:
 
     def close(self) -> str:
         """Stop the process and remove its HOME; what the process wrote to stderr."""
+        if self._store and self._answers_added:
+            self._store.parent.mkdir(parents=True, exist_ok=True)
+            self._store.write_text(json.dumps({"key": self._store_key, "answers": self._answers}), encoding="utf-8")
+            self._answers_added = False
         process, self._process = self._process, None
         diagnostic = ""
         if process and process.stdin and process.stdout and self._stderr:
@@ -570,6 +571,12 @@ class GraphSession:
         A structured error is an answer. The server works on the calls together, so a batch
         costs about its slowest call. A call left unanswered ends the process; the next
         call starts another."""
+        keys = [json.dumps([tool, arguments], sort_keys=True) for tool, arguments in requests]
+        asked = [index for index, key in enumerate(keys) if key not in self._answers]
+        if len(asked) < len(requests):
+            fresh = self.call_many([requests[index] for index in asked], timeout) if asked else []
+            answered = dict(zip(asked, fresh))
+            return [answered.get(index, (self._answers.get(key), "")) for index, key in enumerate(keys)]
         self.calls += len(requests)
         deadline = time.monotonic() + timeout
         sent: list[int] = []
@@ -582,6 +589,11 @@ class GraphSession:
                 pass
             replies = self._collect(set(sent), deadline)
         answers = {ident: self._answer(reply) for ident, reply in replies.items()}
+        if self._store:
+            for ident, (tool, arguments) in zip(sent, requests):
+                if (answer := answers.get(ident, (None, ""))[0]) is not None:
+                    self._answers[json.dumps([tool, arguments], sort_keys=True)] = answer
+                    self._answers_added = True
         reason = ""
         if len(replies) < len(requests):
             timed_out = time.monotonic() >= deadline
