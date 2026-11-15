@@ -1051,10 +1051,10 @@ def build_soulforge_map(
     else:
         command = [soulforge_bin, "--headless", "--quiet", "--no-render", "--timeout", str(timeout_ms),
                    "Reply exactly: OK"]
-    if reason == soul_map.SOURCE_SET_CHANGED:
+    if build_mode == "always" or reason == soul_map.SOURCE_SET_CHANGED:
         # SoulForge's incremental rescan refuses to drop more than 80% of its indexed files
         # (measured), so a changed path set is rebuilt from scratch, as every bootstrap did
-        # before maps were retained.
+        # before maps were retained; `always` asks for that build.
         for stale_file in db_path.parent.glob(f"{db_path.name}*"):
             stale_file.unlink()
     soul_map.render_path.unlink(missing_ok=True)

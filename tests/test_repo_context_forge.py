@@ -5400,6 +5400,21 @@ raise SystemExit(output_packet(packet, args))
             self.build_real_map(repo)
             result = self.build_real_map(repo)[2]
             self.assertEqual((result.attempted, result.returncode), (True, 0), "ALWAYS_MODE_SKIPPED")
+            # 9 of 10 indexed files replaced: SoulForge's incremental rescan refuses to drop >= 80% of its
+            # files, so only a from-scratch build forgets them.
+            for index in range(8):
+                (repo / "src" / f"p{index}.py").write_text(f"P = {index}\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "src"], cwd=repo)
+            repo_context_forge.run_cmd(["git", "commit", "-qm", "more"], cwd=repo)
+            self.build_real_map(repo)
+            repo_context_forge.run_cmd(["git", "rm", "-rq", "src"], cwd=repo)
+            (repo / "lib").mkdir()
+            (repo / "lib" / "z.py").write_text("Z = 1\n", encoding="utf-8")
+            repo_context_forge.run_cmd(["git", "add", "lib"], cwd=repo)
+            repo_context_forge.run_cmd(["git", "commit", "-qm", "replace"], cwd=repo)
+            _binary, db_path, result = self.build_real_map(repo)
+            self.assertEqual((result.returncode, self.map_rows(db_path, "SELECT path FROM files ORDER BY path")),
+                             (0, [(".gitignore",), ("lib/z.py",)]), "ALWAYS_MODE_KEPT_DELETED_FILES")
 
     def test_killed_soulforge_child_is_reported_and_rebuilt(self) -> None:
         # BM_KEEP_CHILD_KILL_REPORTED: the child dies while build_soulforge_map waits.
